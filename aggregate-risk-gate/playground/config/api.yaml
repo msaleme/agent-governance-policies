@@ -1,0 +1,31 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# Modifications Copyright (c) 2026 msaleme. Licensed under the MIT License.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      address: http://backend
+      routes:
+        - config:
+            destinationPath: /anything/echo/
+  policies:
+    - policyRef:
+        name: aggregate-risk-gate-v1-0-impl # Generated implementation extension name
+      config:
+        budgetScope: agent
+        scopeHeader: x-agent-id
+        aggregateBudget: 3000
+        window: rolling-24h
+        contribution: fixed-weight
+        fixedWeight: 800
+        spendAmountField: params.amount
+        estimatedTokens: 500
+        ledgerEndpoint: ""
+        mode: block
+        onDeny: rpc-error
+        resultHeader: x-aggregate-risk-gate

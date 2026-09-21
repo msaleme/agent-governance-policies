@@ -1,0 +1,3 @@
+This directory contains non-secret common configuration for integration tests.
+
+`registration.yaml` is deliberately untracked and must be supplied only by a locally registered Flex Gateway test identity. Do not commit, copy between projects, or share a registration certificate/private key. The Docker runtime suite is an evidence gate: if that local identity is unavailable, record runtime verification as blocked rather than substituting a self-signed certificate or asserting a runtime pass.

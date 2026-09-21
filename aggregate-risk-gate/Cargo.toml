@@ -1,0 +1,37 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# Modifications Copyright (c) 2026 msaleme. Licensed under the MIT License.
+[package]
+name = "aggregate_risk_gate"
+version = "1.0.0"
+rust-version = "1.89.0"
+edition = "2018"
+resolver = "2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[package.metadata.anypoint]
+group_id = "REPLACE_WITH_YOUR_ANYPOINT_ORG_ID"
+definition_asset_id = "aggregate-risk-gate"
+implementation_asset_id = "aggregate-risk-gate-flex"
+
+[dependencies]
+# enable_stop_iteration exposes into_headers_body_state, so a single filter can
+# both inspect the body and stamp/modify headers on the same request/response.
+pdk = { version = "=1.10.0", features = ["enable_stop_iteration"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+anyhow = "1.0"
+
+[dev-dependencies]
+pdk-test = { version = "=1.10.0" }
+pdk-unit = { version = "=1.10.0", features = ["enable_stop_iteration", "experimental"] }
+httpmock = "0.6"
+reqwest = "0.11"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+opt-level = 'z'
+strip = "debuginfo"

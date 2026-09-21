@@ -1,0 +1,16 @@
+# Rust build output
+/target
+**/target
+
+# Cargo lock is committed per-policy (kept). Do NOT ignore Cargo.lock.
+
+# PDK / Flex Gateway local identity material — NEVER commit
+**/registration.yaml
+**/certificate.yaml
+**/*.pem
+**/.pdk
+playground/config/custom-policies/*.wasm
+
+# Local editor / OS noise
+.DS_Store
+*.swp

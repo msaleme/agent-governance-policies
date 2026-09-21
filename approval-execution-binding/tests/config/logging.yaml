@@ -1,0 +1,11 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+# Modifications Copyright (c) 2026 msaleme. Licensed under the MIT License.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Configuration
+metadata:
+  name: logging-config
+spec:
+  logging:
+    runtimeLogs:
+      logLevel: debug

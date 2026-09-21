@@ -1,0 +1,191 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: Approval-to-Execution Binding
+    category: Security
+    description: >-
+      Verifies that a governed MCP/A2A JSON-RPC execution is the SAME action the
+      accompanying approval record actually approved — not a superficially similar
+      one. An Agent Fabric approval and its execution are almost always separated
+      by time and by hops (a supervising broker approves; a downstream broker
+      executes several calls later), and nothing at the gateway normally proves
+      the two are the same action. This policy closes that gap by checking six
+      independent predicates against the approval record on every governed
+      execution: P1 the approved and executed action/tool match; P2 the approved
+      and executed argument bytes match; P3 where an argument is carried by
+      reference, the dereferenced bytes match what was committed (P3 takes
+      precedence over P2 whenever a reference is involved); P4 the approval is
+      still valid at this instant; P5 the approval was attested by a party other
+      than the one now executing, using a key this gateway recognizes; and P6
+      (opt-in) the approval authorizes at most one execution. Any predicate named
+      in requiredPredicates that fails denies the call; an empty requiredPredicates
+      list is rejected at startup, since a binding that checks nothing is not a
+      binding. Predicate semantics and canonical form follow the Approval Binding
+      Vectors (ABV) v0.1 conformance corpus (github.com/msaleme/approval-binding-vectors)
+      — a protocol-neutral spec for exactly this question, with its own positive
+      controls and negative vectors. Honesty boundary: this corpus (and this
+      policy) tests whether the RECORD proves the executed action is the approved
+      one; it does not and cannot prove that approving the action was itself wise,
+      and P5's separate attester is what keeps the check from being a document an
+      actor wrote about itself. Deploys as an inbound policy on MCP/A2A instances,
+      after mcp-support and access-control, before the call reaches the upstream
+      tool.
+    metadata/capabilities/injectionPoint: inbound
+    metadata/interfaceScope: api,resource
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    approvalSource:
+      type: string
+      default: header
+      enum:
+        - header
+        - rpc-param
+        - sidecar
+      description: >-
+        Where the approval envelope rides. "header" (implemented) — a single
+        JSON object in the request header named by approvalHeader. "rpc-param"
+        (implemented) — a single JSON object under the top-level request-body
+        member named by approvalRpcField, sibling to the JSON-RPC envelope
+        (jsonrpc/id/method/params). "sidecar" — fetching the approval record from
+        an external attestation service keyed off the request is NOT implemented
+        in this build; selecting it fails policy startup with a clear error
+        rather than silently no-op-ing, so a misconfiguration cannot be mistaken
+        for an armed binding.
+    approvalHeader:
+      type: string
+      default: x-approval
+      description: >-
+        Header name carrying the JSON-encoded approval envelope when
+        approvalSource=header. The envelope shape is
+        {"approval":{"scope":{"action":...,"arguments_digest":...},"authority":...,
+        "not_after":...,"nonce":...},"attestations":[{"claim":"approval",
+        "authority":...,"mac":...}],"dereferenced":{"<uri>":"<sha256-hex>",...}} —
+        the ABV v0.1 neutral record's approval/attestations members plus an
+        optional dereferenced-bytes digest map for P3.
+    approvalRpcField:
+      type: string
+      default: approvalBinding
+      description: >-
+        Top-level JSON-RPC request-body member carrying the approval envelope
+        (same shape as approvalHeader's value) when approvalSource=rpc-param.
+        Chosen to avoid colliding with jsonrpc/id/method/params.
+    executorHeader:
+      type: string
+      default: client_id
+      description: >-
+        Header carrying the identity of the party about to execute, as already
+        verified by an upstream identity/auth policy earlier in the chain (this
+        policy trusts the chain's authentication, the same way llm-token-rate-limit
+        elsewhere in this gateway keys its budget off
+        #[attributes.headers['client_id']]). Used only for P5: an approval
+        attested by this same identity is not a separate attestation.
+    requiredPredicates:
+      type: array
+      default: [P1, P2, P3, P4, P5]
+      items:
+        type: string
+        enum:
+          - P1
+          - P2
+          - P3
+          - P4
+          - P5
+          - P6
+      description: >-
+        Predicates that MUST hold for the execution to be allowed; any that
+        fails denies the call in block mode (or logs a would-deny verdict in
+        monitor mode). P6 (single use) is a profile choice, not a universal
+        rule — reusable approvals are legitimate in some flows — so it defaults
+        out of the required set; opt in only when the customer's flow is
+        single-use. An empty list is rejected at startup: a binding that
+        requires nothing is not a binding.
+    attesterKeys:
+      type: array
+      default: []
+      items:
+        type: object
+        properties:
+          kid:
+            type: string
+          key:
+            type: string
+        required:
+          - kid
+          - key
+      description: >-
+        Known attester keys for verifying the P5 attestation MAC over the
+        approval scope: kid is the attesting authority's identifier (must differ
+        from the executor for P5 to hold), key is the shared secret this gateway
+        holds for that authority. This mirrors the ABV reference checker's
+        keyed-digest (HMAC-SHA256) attestation model. In a production PKI
+        deployment attesterKeys would instead reference a JWKS of the attesters'
+        public keys and verify asymmetric signatures; this build implements only
+        the symmetric shared-secret form. An attestation from an authority not
+        listed here always fails P5.
+    clockSkewSeconds:
+      type: integer
+      default: 60
+      description: >-
+        Tolerance, in seconds, applied to P4 freshness. The approval is valid
+        while now <= not_after + clockSkewSeconds, where "now" is this gateway's
+        own wall-clock time at the instant of the request — never a
+        caller-supplied timestamp, since a caller-supplied execution instant
+        would let the executing party grade its own freshness check.
+    mode:
+      type: string
+      default: monitor
+      enum:
+        - monitor
+        - block
+      description: >-
+        "monitor" — evaluate every required predicate and log the verdict
+        (allow, or the specific predicate that would have failed) via a
+        structured warning, but always forward the request. Use to characterize
+        traffic before enforcing. "block" — deny the request when a required
+        predicate fails, per onDeny. Every deployment, including monitor,
+        requires change-management review of what the approval envelope and
+        attesterKeys disclose to logs.
+    onDeny:
+      type: string
+      default: rpc-error
+      enum:
+        - rpc-error
+        - empty-403
+      description: >-
+        How a block-mode denial is rendered. "rpc-error" — an in-band JSON-RPC
+        response reusing the request's own id, error code -32008, with a message
+        naming only the failed predicate (never the approved or executed
+        argument values). "empty-403" — an HTTP 403 with an empty body and no
+        JSON-RPC envelope. Regardless of this setting, a request this policy
+        cannot confidently parse as a single, non-batch JSON-RPC call with an
+        echoable id always falls back to empty-403 — echoing an id we cannot
+        trust risks exposing a protected value, mirroring the decoy-coordinator's
+        containment rule. A JSON-RPC notification (no id) always gets an empty
+        HTTP 202, since JSON-RPC forbids a response to a notification either way.
+    resultHeader:
+      type: string
+      default: x-approval-binding
+      description: >-
+        Header stamped on the request forwarded upstream (monitor mode, or an
+        allowed request in block mode) or on the denial response (block mode)
+        recording the verdict, e.g. "allowed", "would-deny;predicate=P2", or
+        "denied;predicate=P5". Never carries the approval or argument values
+        themselves — only the predicate code — so it is safe to forward to
+        downstream logging, SIEM, or a Kill Switch without a further redaction
+        pass.
+  required:
+    - approvalSource
+    - approvalHeader
+    - approvalRpcField
+    - executorHeader
+    - requiredPredicates
+    - attesterKeys
+    - clockSkewSeconds
+    - mode
+    - onDeny
+    - resultHeader

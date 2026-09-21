@@ -1,0 +1,41 @@
+# Copyright (c) 2026 msaleme. Licensed under the MIT License.
+name: Verify policies
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: verify-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  policies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned build tools
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal \
+            --component rustfmt --component clippy --target wasm32-wasip1
+      - name: Verify each policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          for policy in approval-execution-binding aggregate-risk-gate; do
+            (
+              cd "$policy"
+              cargo +1.89.0 fetch --locked
+              cargo +1.89.0 fmt --check
+              cargo +1.89.0 clippy --lib --locked --offline -- -D warnings
+              cargo +1.89.0 test --lib --locked --offline
+              cargo +1.89.0 test --tests --no-run --locked --offline
+              cargo +1.89.0 build --release --target wasm32-wasip1 --locked --offline
+            )
+          done
+      # Runtime suites require separately authorized disposable Flex registrations.
+      # No registration or platform credentials are supplied to this workflow.
