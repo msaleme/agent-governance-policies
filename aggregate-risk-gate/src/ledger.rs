@@ -99,7 +99,30 @@ pub trait LedgerStore {
     /// `budget` — the monitor-mode primitive: composition is still tracked
     /// accurately (including symmetric commit/release around the upstream
     /// outcome), but nothing is ever denied.
+    ///
+    /// The filter (`lib.rs`) calls `force_reserve_checked` instead, since
+    /// monitor mode needs the breach signal to raise a policy violation.
+    /// `force_reserve` is kept as the simpler, directly-tested primitive
+    /// `force_reserve_checked` is documented against (and is deliberately
+    /// NOT implemented by delegating to this method plus a second locked
+    /// read, which would reopen the exact read-then-write race window this
+    /// module's whole correctness story is about) — hence `#[allow(dead_code)]`
+    /// rather than deleting a real, tested API.
+    #[allow(dead_code)]
     fn force_reserve(&self, scope: &str, contribution: f64) -> Reservation;
+
+    /// `force_reserve`, plus a breach signal: reserves `contribution`
+    /// against `scope` unconditionally (never denies — monitor mode still
+    /// forwards every call), but also reports whether doing so pushed
+    /// committed-plus-reserved exposure over `budget`. This is what lets
+    /// monitor mode raise the same policy-violation signal a block-mode
+    /// denial would, without actually denying the call.
+    fn force_reserve_checked(
+        &self,
+        scope: &str,
+        contribution: f64,
+        budget: f64,
+    ) -> (Reservation, bool);
 
     /// Resolves a reservation as successful: moves its contribution from
     /// `reserved` into `committed`.
@@ -117,12 +140,16 @@ pub trait LedgerStore {
     /// direct audit correction).
     fn record(&self, scope: &str, contribution: f64);
 
-    /// Resolves an ESTIMATED reservation (token-cost) once the real amount is
-    /// known: releases the estimate from `reserved`, then commits the real
-    /// `actual_contribution` — never re-checking the budget, because the call
-    /// already happened and its real exposure cannot be retroactively denied.
-    /// This is the estimate-then-reconcile true-up the token-cost contribution
-    /// mode depends on.
+    /// Resolves an ESTIMATED reservation once its final amount is known:
+    /// releases the estimate from `reserved`, then commits
+    /// `actual_contribution` in its place — never re-checking the budget,
+    /// because the call already happened and its exposure cannot be
+    /// retroactively denied. A general estimate-then-settle primitive: this
+    /// build's token-cost contribution mode calls it with
+    /// `actual_contribution` equal to the original estimate itself (it never
+    /// learns a different real figure — see `response_filter` in `lib.rs`),
+    /// but the primitive is written generally enough to also serve a true
+    /// reconcile-to-a-different-value, for a caller that has one.
     fn reconcile(&self, reservation: Reservation, actual_contribution: f64);
 
     /// A read-only view of one scope's current state, for diagnostics/tests.
@@ -191,6 +218,25 @@ impl LedgerStore for Ledger {
             scope: scope.to_string(),
             contribution,
         }
+    }
+
+    fn force_reserve_checked(
+        &self,
+        scope: &str,
+        contribution: f64,
+        budget: f64,
+    ) -> (Reservation, bool) {
+        self.with_state(scope, |state| {
+            state.reserved += contribution;
+            let breached = state.total() > budget;
+            (
+                Reservation {
+                    scope: scope.to_string(),
+                    contribution,
+                },
+                breached,
+            )
+        })
     }
 
     fn commit(&self, reservation: Reservation) {
@@ -560,6 +606,44 @@ mod test {
         assert_eq!(ledger.snapshot("s").reserved, 10_000.0);
         ledger.commit(reservation);
         assert_eq!(ledger.snapshot("s").committed, 10_000.0);
+    }
+
+    #[test]
+    fn force_reserve_checked_reports_no_breach_when_within_budget() {
+        let ledger = Ledger::new();
+        let (reservation, breached) = ledger.force_reserve_checked("s", 500.0, 1000.0);
+        assert!(!breached);
+        assert_eq!(ledger.snapshot("s").reserved, 500.0);
+        ledger.commit(reservation);
+    }
+
+    #[test]
+    fn force_reserve_checked_reports_breach_when_over_budget_but_still_reserves() {
+        let ledger = Ledger::new();
+        // Never denies (monitor-mode primitive), but must still truthfully
+        // report that this reservation pushed the scope over budget.
+        let (reservation, breached) = ledger.force_reserve_checked("s", 1500.0, 1000.0);
+        assert!(breached);
+        assert_eq!(
+            ledger.snapshot("s").reserved,
+            1500.0,
+            "force_reserve_checked must still reserve the full amount despite the breach"
+        );
+        ledger.commit(reservation);
+        assert_eq!(ledger.snapshot("s").committed, 1500.0);
+    }
+
+    #[test]
+    fn force_reserve_checked_breach_reflects_prior_committed_exposure_too() {
+        let ledger = Ledger::new();
+        let first = ledger.force_reserve_checked("s", 800.0, 1000.0);
+        assert!(!first.1);
+        ledger.commit(first.0);
+        // 800 committed + 300 more reserved = 1100 > 1000: a breach, even
+        // though this second call's OWN amount is well within budget alone.
+        let (reservation, breached) = ledger.force_reserve_checked("s", 300.0, 1000.0);
+        assert!(breached);
+        ledger.commit(reservation);
     }
 
     #[test]

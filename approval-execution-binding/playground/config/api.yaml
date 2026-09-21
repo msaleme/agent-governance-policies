@@ -15,10 +15,17 @@ spec:
             destinationPath: /anything/echo/
   policies:
     - policyRef:
-        name: mcp-honeytoken-tripwire-v1-0-impl # Generated implementation extension name
+        name: approval-execution-binding-v1-0-impl # This value will be overriden during 'make run' execution
       config:
-        honeytokens:
-          - acct_DECOY_9x1f-do-not-use
+        approvalSource: header
+        approvalHeader: x-approval
+        approvalRpcField: approvalBinding
+        executorHeader: client_id
+        requiredPredicates: [P1, P2, P3, P4, P5]
+        attesterKeys:
+          - kid: approver.example
+            key: abv/approver
+        clockSkewSeconds: 60
         mode: block
-        alertHeader: x-agent-decoy-tripwire
-        caseSensitive: false
+        onDeny: rpc-error
+        resultHeader: x-approval-binding

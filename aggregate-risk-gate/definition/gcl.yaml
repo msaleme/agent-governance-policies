@@ -80,6 +80,9 @@ spec:
     window:
       type: string
       default: rolling-24h
+      enum:
+        - rolling-24h
+        - fixed-period
       description: >-
         The accounting window the aggregateBudget applies to. This build's
         Stage A ledger keeps one continuously-accumulating total per scope for
@@ -104,12 +107,16 @@ spec:
         static per-call weight from fixedWeight, known before the call is
         authorized. "spend-amount" — a numeric field read from the request
         JSON-RPC body at spendAmountField, known before the call is authorized.
-        "token-cost" — the real cost is only known from the upstream response's
-        usage.total_tokens block, so the pre-flight reservation uses
-        estimatedTokens as a stand-in and the ledger is trued up (committed for
-        the real amount, not the estimate) once the response arrives; this is
-        an estimate-then-reconcile design, not a claim that pre-flight
-        token-cost is exactly known.
+        "token-cost" — pre-flight token cost is not exactly knowable, so the
+        reservation uses estimatedTokens as a stand-in and this build commits
+        that same estimate on a successful response (this build's response
+        handling is headers-only and never reads the response body, so it has
+        no real usage.total_tokens figure to true up against — see
+        estimatedTokens and the Honesty boundaries section in README.md); a
+        future build could settle to a real figure without changing this
+        field's meaning. A JSON-RPC BATCH (array) request's per-item
+        contribution is multiplied/summed across every item in the array, not
+        priced as a single call.
     fixedWeight:
       type: number
       default: 1
@@ -131,12 +138,14 @@ spec:
       default: 500
       description: >-
         Pre-flight reservation estimate, in tokens, used to reserve exposure
-        before authorizing when contribution=token-cost — the real
-        usage.total_tokens from the upstream response is not known until after
-        the call is authorized and forwarded. Set this to a conservative
-        upper-bound estimate for the traffic this instance governs; the
-        reservation is released and replaced with the real usage figure when
-        the response arrives (or released outright on an upstream failure).
+        before authorizing when contribution=token-cost. Set this to a
+        conservative upper-bound estimate for the traffic this instance
+        governs: on a successful response this build COMMITS the estimate
+        itself (it never reads the response body to learn a real
+        usage.total_tokens figure — see the contribution field and the
+        Honesty boundaries section in README.md), so an estimate set too low
+        under-counts real exposure; the reservation is released outright on an
+        upstream failure.
     ledgerEndpoint:
       type: string
       default: ""
@@ -169,15 +178,20 @@ spec:
         - empty-403
       description: >-
         How a block-mode denial is rendered. "rpc-error" — an in-band JSON-RPC
-        response reusing the request's own id, error code -32008, with a
+        response reusing the request's own id(s), error code -32008, with a
         message naming the scope and the budget that would be exceeded (never
-        other sessions' call content). "empty-403" — an HTTP 403 with an empty
-        body and no JSON-RPC envelope. Regardless of this setting, a request
-        this policy cannot confidently parse as a single, non-batch JSON-RPC
-        call with an echoable id always falls back to empty-403 — echoing an id
-        it cannot trust risks exposing a protected value. A JSON-RPC
-        notification (no id) always gets an empty HTTP 202 on deny, since
-        JSON-RPC forbids a response to a notification either way.
+        other sessions' call content); a JSON-RPC BATCH (array) request denied
+        atomically gets back a matching JSON array with one -32008 error per
+        id, never a single collapsed error. "empty-403" — an HTTP 403 with an
+        empty body and no JSON-RPC envelope. Regardless of this setting, a
+        request this policy cannot confidently parse as JSON-RPC with
+        echoable id(s) — including an ambiguous body with a duplicate JSON
+        object member, where this policy and the upstream tool could
+        legitimately disagree about which id is "the" id — always falls back
+        to empty-403: echoing an id it cannot trust risks exposing a protected
+        value. A JSON-RPC notification (no id) always gets an empty HTTP 202
+        on deny, since JSON-RPC forbids a response to a notification either
+        way.
     resultHeader:
       type: string
       default: x-aggregate-risk-gate

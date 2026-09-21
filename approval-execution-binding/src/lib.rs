@@ -40,12 +40,20 @@
 // in-band JSON-RPC denial bodies come back empty under `pdk_unit`. Registering no
 // response handler here means this policy's own `Response::new(...).with_body(...)`
 // early replies are sent as constructed, with nothing downstream re-inspecting them.
+//
+// Every predicate-failure verdict — a block-mode denial AND a monitor-mode
+// would-deny detection — registers a PDK policy violation via
+// `PolicyViolations::generate_policy_violation()` (mirroring the sibling Decoy
+// Tool Sentinel), so Anypoint Monitoring/SIEM records the hit even when monitor
+// mode still forwards the request. See README.md's "PDK policy violation
+// registration" note for exactly which paths do (and do not) register one.
 mod generated;
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use pdk::hl::*;
 use pdk::logger;
+use pdk::policy_violation::PolicyViolations;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -898,7 +906,11 @@ fn notification_denial(result_header: &str, tag: &str) -> Response {
 // Request filter
 // ---------------------------------------------------------------------------
 
-async fn request_filter(request_state: RequestState, binding: &Binding) -> Flow<()> {
+async fn request_filter(
+    request_state: RequestState,
+    binding: &Binding,
+    violations: &PolicyViolations,
+) -> Flow<()> {
     let headers_state = request_state.into_headers_state().await;
     let handler = headers_state.handler();
     let executor = handler.header(&binding.executor_header).unwrap_or_default();
@@ -913,6 +925,37 @@ async fn request_filter(request_state: RequestState, binding: &Binding) -> Flow<
         );
         return if binding.block {
             Flow::Break(empty_denial(&binding.result_header, &tag))
+        } else {
+            Flow::Continue(())
+        };
+    }
+
+    // Header-phase exclusion for bodies this policy cannot safely buffer and
+    // parse as JSON at all: a non-JSON content-type (SSE/streaming media types
+    // included) or any content-encoding (a compressed body, whose decoded size
+    // is not what the declared content-length bounds). Checked before the body
+    // is ever buffered, mirroring the sibling Decoy Tool Sentinel's admission
+    // gate — see README "Inspection boundary" for the documented exclusions.
+    let content_type_is_json = handler.header("content-type").is_some_and(|value| {
+        let media = value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        media == "application/json"
+            || (media.starts_with("application/") && media.ends_with("+json"))
+    });
+    let is_encoded = handler.header("content-encoding").is_some();
+    if !content_type_is_json || is_encoded {
+        let reason =
+            "request body cannot be safely inspected (non-JSON content-type, SSE/streaming, or content-encoding present)";
+        log_verdict("deny", None, reason);
+        return if binding.block {
+            Flow::Break(empty_denial(
+                &binding.result_header,
+                "denied;predicate=malformed",
+            ))
         } else {
             Flow::Continue(())
         };
@@ -993,6 +1036,13 @@ async fn request_filter(request_state: RequestState, binding: &Binding) -> Flow<
         Verdict::Deny { predicate, reason } => {
             let label = predicate.map(Predicate::as_str).unwrap_or("malformed");
             log_verdict("deny", predicate, &reason);
+            // Register a PDK policy violation for every predicate-failure
+            // decision — a block-mode denial AND a monitor-mode would-deny
+            // detection — so Anypoint Monitoring/SIEM records the hit even
+            // when the request is still forwarded. Mirrors the sibling Decoy
+            // Tool Sentinel's `violations.generate_policy_violation()` call,
+            // made before either return path below.
+            violations.generate_policy_violation();
             if !binding.block {
                 handler.set_header(
                     &binding.result_header,
@@ -1013,7 +1063,11 @@ async fn request_filter(request_state: RequestState, binding: &Binding) -> Flow<
 }
 
 #[entrypoint]
-async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> Result<()> {
+async fn configure(
+    launcher: Launcher,
+    Configuration(bytes): Configuration,
+    violations: PolicyViolations,
+) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
             "Invalid policy configuration at line {}, column {} ({:?})",
@@ -1035,7 +1089,7 @@ async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> R
         if binding.block { "block" } else { "monitor" }
     );
 
-    let filter = on_request(|rs| request_filter(rs, &binding));
+    let filter = on_request(|rs| request_filter(rs, &binding, &violations));
     launcher.launch(filter).await?;
     Ok(())
 }
@@ -1983,5 +2037,377 @@ mod test {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": "system.reboot", "params": {"target": "prod"}});
         let response = tester.request(request_with(&envelope, "executor.example", &body));
         assert_eq!(response.status_code(), 200);
+    }
+
+    // -----------------------------------------------------------------
+    // PDK policy violation registration (mirrors the sibling Decoy Tool
+    // Sentinel's `violations.generate_policy_violation()` contract): a
+    // predicate-failure decision must register a policy violation whether
+    // the request is actually blocked or only flagged in monitor mode; a
+    // clean, allowed request must never register one.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn block_mode_denial_sets_policy_violation_without_upstream_execution() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(vector_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let envelope = approval_envelope(
+            "deploy.apply",
+            CTRL01_DIGEST,
+            "2026-09-19T12:00:00Z",
+            "n-0001",
+            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
+            json!({}),
+        );
+        let body = jsonrpc_call(7, "deploy.destroy", json!({}));
+        let response = tester.request(request_with(&envelope, "executor.example", &body));
+        assert!(backend.next().is_none());
+        assert!(
+            response.violation().is_some(),
+            "a block-mode predicate-failure denial must signal a policy violation"
+        );
+    }
+
+    #[test]
+    fn monitor_mode_would_deny_still_sets_policy_violation_and_forwards() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config_with(
+                json!({"mode": "monitor", "requiredPredicates": ["P1"]}),
+            ))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let envelope = approval_envelope(
+            "deploy.apply",
+            CTRL01_DIGEST,
+            &far_future(),
+            "n-1",
+            json!([]),
+            json!({}),
+        );
+        let body = jsonrpc_call(1, "deploy.destroy", json!({}));
+        let response = tester.request(request_with(&envelope, "executor.example", &body));
+        assert_eq!(response.status_code(), 200);
+        let forwarded = backend
+            .next()
+            .expect("monitor mode must forward a would-deny detection");
+        assert!(
+            forwarded.violation().is_some(),
+            "a monitor-mode would-deny detection must still signal a policy violation"
+        );
+    }
+
+    #[test]
+    fn allowed_request_does_not_set_a_policy_violation() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(vector_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let envelope = approval_envelope(
+            "deploy.apply",
+            CTRL01_DIGEST,
+            "2026-09-19T12:00:00Z",
+            "n-clean-1",
+            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
+            json!({"blob://plan-v1": PLAN_V1_DIGEST}),
+        );
+        let body = jsonrpc_call(
+            1,
+            "deploy.apply",
+            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
+        );
+        tester.request(request_with(&envelope, "executor.example", &body));
+        let forwarded = backend.next().expect("a sound record must reach upstream");
+        assert!(
+            forwarded.violation().is_none(),
+            "an allowed request must never register a policy violation"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Batch (array) requests must not fail open: an unauthorized/altered
+    // call inside a batch must be denied atomically, never forwarded.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn jsonrpc_batch_with_unauthorized_call_is_denied_atomically_not_forwarded() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // A batch mixing an approved-looking call with an unapproved one: this
+        // policy binds one approval envelope to one executed action, never to
+        // a collection of them, so the whole batch is rejected atomically —
+        // it must never be split and partially forwarded.
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "deploy.apply", "arguments": {}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "deploy.destroy", "arguments": {}}}
+        ])
+        .to_string();
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/json")
+                .with_header("content-length", batch.len().to_string())
+                .with_header(
+                    "x-approval",
+                    approval_envelope(
+                        "deploy.apply",
+                        CTRL01_DIGEST,
+                        "2026-09-19T12:00:00Z",
+                        "n-batch-1",
+                        json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
+                        json!({}),
+                    )
+                    .to_string(),
+                )
+                .with_header("client_id", "executor.example")
+                .with_body(batch),
+        );
+        assert_eq!(response.status_code(), 403);
+        assert!(response.body().is_empty());
+        assert!(
+            backend.next().is_none(),
+            "a batch must be rejected atomically, never partially forwarded"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Header-phase gating: content-type / content-encoding exclusions
+    // (SSE, streaming, compressed, non-JSON bodies) — checked before the
+    // body is ever buffered, and fail-closed in block mode.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn non_json_content_type_fails_closed_in_block_mode() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let body = jsonrpc_call(1, "deploy.apply", json!({}));
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "text/event-stream")
+                .with_header("content-length", body.to_string().len().to_string())
+                .with_body(body.to_string()),
+        );
+        assert_eq!(response.status_code(), 403);
+        assert!(response.body().is_empty());
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn content_encoding_present_fails_closed_in_block_mode() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let body = jsonrpc_call(1, "deploy.apply", json!({}));
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/json")
+                .with_header("content-encoding", "gzip")
+                .with_header("content-length", body.to_string().len().to_string())
+                .with_body(body.to_string()),
+        );
+        assert_eq!(response.status_code(), 403);
+        assert!(response.body().is_empty());
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn uninspectable_content_type_forwards_uninspected_in_monitor_mode() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(monitor_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let body = jsonrpc_call(1, "deploy.apply", json!({}));
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/octet-stream")
+                .with_header("content-length", body.to_string().len().to_string())
+                .with_body(body.to_string()),
+        );
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            backend.next().is_some(),
+            "monitor mode always forwards, even an uninspectable body"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Fail-closed JSON parse limits: bounded nesting depth, no lossy scan.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn deeply_nested_body_fails_closed_in_block_mode_not_a_lossy_scan() {
+        // serde_json enforces a bounded recursion depth on any Value parse
+        // (custom NoDuplicateMembers visitor included, since the limit lives
+        // in the Deserializer itself); a body nested past that limit must be
+        // rejected as unparseable, not silently truncated or scanned lossily.
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let mut nested = "0".to_string();
+        for _ in 0..300 {
+            nested = format!("[{nested}]");
+        }
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"deploy.apply","arguments":{{"deep":{nested}}}}}}}"#
+        );
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/json")
+                .with_header("content-length", body.len().to_string())
+                .with_body(body),
+        );
+        assert_eq!(response.status_code(), 403);
+        assert!(response.body().is_empty());
+        assert!(backend.next().is_none());
+    }
+
+    #[test]
+    fn deeply_nested_approval_header_fails_closed_in_block_mode() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let mut nested = "0".to_string();
+        for _ in 0..300 {
+            nested = format!("[{nested}]");
+        }
+        let header_value =
+            format!(r#"{{"approval":{{"scope":{{"action":"x"}}}},"deep":{nested}}}"#);
+        let body = jsonrpc_call(1, "deploy.apply", json!({}));
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/json")
+                .with_header("content-length", body.to_string().len().to_string())
+                .with_header("x-approval", header_value)
+                .with_body(body.to_string()),
+        );
+        assert_eq!(response.status_code(), 200);
+        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
+        assert_eq!(json["error"]["code"], MCP_BLOCKED_CODE);
+    }
+
+    #[test]
+    fn numeric_overflow_in_body_does_not_panic_and_fails_closed_deterministically() {
+        // A JSON number far outside i64/u64/f64-safe range (1e400 overflows an
+        // f64) must never panic this policy's parser. In practice the strict
+        // parse pass rejects it as unparseable JSON — deterministic fail-closed
+        // handling, not a crash — and, because the whole body (including its
+        // "id") could not be confidently parsed, the denial falls back to an
+        // empty 403 rather than echoing an id salvaged from a broken parse.
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"deploy.apply","arguments":{"huge":1e400}}}"#;
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/json")
+                .with_header("content-length", body.len().to_string())
+                .with_body(body),
+        );
+        // No panic reaching this point is itself the core assertion.
+        assert_eq!(response.status_code(), 403);
+        assert!(response.body().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // id-echo containment: a body this policy cannot confidently and
+    // unambiguously parse never has its id "salvaged" and echoed, even if
+    // a naive scan of the raw bytes could find something id-shaped.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ambiguous_duplicate_id_never_echoes_a_salvaged_id_value() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(block_config())
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let body = r#"{"jsonrpc":"2.0","id":1,"id":"leaked-token","method":"tools/call","params":{"name":"deploy.apply","arguments":{}}}"#;
+        let response = tester.request(
+            UnitHttpRequest::post()
+                .with_header("content-type", "application/json")
+                .with_header("content-length", body.len().to_string())
+                .with_body(body),
+        );
+        assert_eq!(response.status_code(), 403);
+        assert!(
+            response.body().is_empty(),
+            "an ambiguous body must never echo either candidate id value"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Config fail-closed validation: every enum-shaped config field must be
+    // rejected at startup on an unknown/typo value, not fail open.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn unknown_approval_source_is_rejected_at_configure_time() {
+        let config = parse_config(json!({
+            "approvalSource": "hedaer-typo", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
+            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
+            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
+        }))
+        .unwrap();
+        match Binding::from_config(&config) {
+            Ok(_) => panic!("expected an unknown approvalSource to be rejected at startup"),
+            Err(err) => assert!(err.to_string().contains("unknown approvalSource")),
+        }
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected_at_configure_time() {
+        let config = parse_config(json!({
+            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
+            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
+            "clockSkewSeconds": 60, "mode": "blokc-typo", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
+        }))
+        .unwrap();
+        match Binding::from_config(&config) {
+            Ok(_) => panic!("expected an unknown mode to be rejected at startup"),
+            Err(err) => assert!(err.to_string().contains("unknown mode")),
+        }
+    }
+
+    #[test]
+    fn unknown_on_deny_is_rejected_at_configure_time() {
+        let config = parse_config(json!({
+            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
+            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
+            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error-typo", "resultHeader": "x-approval-binding"
+        }))
+        .unwrap();
+        match Binding::from_config(&config) {
+            Ok(_) => panic!("expected an unknown onDeny to be rejected at startup"),
+            Err(err) => assert!(err.to_string().contains("unknown onDeny")),
+        }
+    }
+
+    #[test]
+    fn unknown_predicate_value_is_rejected_at_configure_time() {
+        let config = parse_config(json!({
+            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
+            "executorHeader": "client_id", "requiredPredicates": ["P1", "P7-typo"], "attesterKeys": [],
+            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
+        }))
+        .unwrap();
+        match Binding::from_config(&config) {
+            Ok(_) => panic!("expected an unknown predicate value to be rejected at startup"),
+            Err(err) => assert!(err.to_string().contains("unknown predicate")),
+        }
     }
 }

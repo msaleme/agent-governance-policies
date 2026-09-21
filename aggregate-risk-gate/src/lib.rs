@@ -44,6 +44,7 @@ mod ledger;
 use anyhow::{anyhow, Result};
 use pdk::hl::*;
 use pdk::logger;
+use pdk::policy_violation::PolicyViolations;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -63,6 +64,62 @@ const MCP_BLOCKED_CODE: i64 = -32008;
 /// fallback (treat the call as unpriceable, or fall back to the estimate) rather
 /// than a risk of missing a hidden secret.
 const MAX_INSPECT_BYTES: usize = 64 * 1024;
+
+/// The request body available to this policy for pricing/batch-shape
+/// inspection, resolved at the HEADER phase, before any buffering decision.
+/// `NoBody` (a genuinely bodyless request) and `Uninspectable` (a body exists
+/// but this policy declines to buffer/read it — oversize, non-JSON, or
+/// compressed) are kept deliberately distinct: a bodyless call structurally
+/// cannot be a hidden batch, but an uninspectable one might be, so only
+/// `Uninspectable` is treated as unpriceable — fail-closed in block mode,
+/// never silently priced as a single call (see `compute_contribution`).
+enum RawBody<'a> {
+    NoBody,
+    Uninspectable,
+    Present(&'a [u8]),
+}
+
+impl<'a> RawBody<'a> {
+    /// Collapses `NoBody`/`Uninspectable` together for call sites (id-echo on
+    /// deny) that only care about having real bytes to parse — both already
+    /// fall back to the generic empty-403/202 containment path in
+    /// `deny_response`.
+    fn as_bytes(&self) -> Option<&'a [u8]> {
+        match self {
+            RawBody::Present(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+}
+
+/// Whether this request is safe to buffer and inspect at all, checked from
+/// headers ALONE, before this filter ever calls `into_headers_body_state()`.
+/// Buffering a body only to discover afterward that it was oversized,
+/// compressed, or a non-JSON media type would defeat the purpose of gating in
+/// the first place. A missing/invalid Content-Length, a declared length over
+/// `MAX_INSPECT_BYTES`, a non-JSON Content-Type, or any Content-Encoding
+/// (this build never decompresses) all fail this gate. See README.md's
+/// "Inspection boundary" section for the SSE/streaming/compressed/non-UTF-8
+/// exclusions this enforces.
+fn request_is_inspectable(handler: &(impl HeadersHandler + ?Sized)) -> bool {
+    let length_ok = handler
+        .header("content-length")
+        .filter(|value| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|len| len <= MAX_INSPECT_BYTES);
+    let json = handler.header("content-type").is_some_and(|value| {
+        let media = value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        media == "application/json"
+            || (media.starts_with("application/") && media.ends_with("+json"))
+    });
+    let uncompressed = handler.header("content-encoding").is_none();
+    length_ok && json && uncompressed
+}
 
 // ---------------------------------------------------------------------------
 // JSON-RPC parsing / response shaping. Protocol-generic (not specific to this
@@ -291,6 +348,14 @@ impl Gate {
                 ))
             }
         };
+        match config.window.as_str() {
+            "rolling-24h" | "fixed-period" => {}
+            other => {
+                return Err(anyhow!(
+                    "window must be rolling-24h or fixed-period, got {other:?}"
+                ))
+            }
+        };
         if !config.aggregate_budget.is_finite() || config.aggregate_budget < 0.0 {
             return Err(anyhow!(
                 "aggregateBudget must be a non-negative finite number"
@@ -394,31 +459,67 @@ enum ContributionOutcome {
     /// The real, known-now contribution (fixed-weight, or a parsed spend
     /// amount).
     Known(f64),
-    /// A pre-flight ESTIMATE (token-cost); the real amount is only knowable
-    /// from the upstream response and is reconciled in `response_filter`.
+    /// A pre-flight ESTIMATE (token-cost). This build never reads the
+    /// response body to learn a real usage figure (see `response_filter`),
+    /// so the estimate itself is what ultimately gets committed in
+    /// `response_filter` — settled, not reconciled against anything real.
     Estimate(f64),
     /// contribution=spend-amount and the body was missing, unparseable, or
     /// missing/non-numeric at `spendAmountField`.
     Unpriceable,
 }
 
-fn compute_contribution(gate: &Gate, raw_body: Option<&[u8]>) -> ContributionOutcome {
+/// How many JSON-RPC calls `body` represents, for contribution accounting. A
+/// batch (JSON array) body must never be priced as if it were a single call —
+/// that would fail-open the aggregate-risk check by letting a batch of N
+/// calls each escape at 1/N of their real weight. `body` is assumed already
+/// size-checked (`RawBody::Present` only, never `Uninspectable`).
+fn body_item_count(body: &[u8]) -> usize {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(Value::Array(items)) if !items.is_empty() => items.len(),
+        _ => 1,
+    }
+}
+
+fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
+    let body = match raw_body {
+        // An uninspectable-but-present body might be a batch of any size —
+        // fail closed rather than guess it is worth exactly one call.
+        RawBody::Uninspectable => return ContributionOutcome::Unpriceable,
+        RawBody::NoBody => None,
+        RawBody::Present(bytes) => Some(bytes),
+    };
     match gate.contribution {
-        Contribution::FixedWeight => ContributionOutcome::Known(gate.fixed_weight),
-        Contribution::TokenCost => ContributionOutcome::Estimate(gate.estimated_tokens),
+        Contribution::FixedWeight => {
+            let items = body.map(body_item_count).unwrap_or(1) as f64;
+            ContributionOutcome::Known(gate.fixed_weight * items)
+        }
+        Contribution::TokenCost => {
+            let items = body.map(body_item_count).unwrap_or(1) as f64;
+            ContributionOutcome::Estimate(gate.estimated_tokens * items)
+        }
         Contribution::SpendAmount => {
-            let Some(body) = raw_body.filter(|body| body.len() <= MAX_INSPECT_BYTES) else {
+            let Some(body) = body else {
                 return ContributionOutcome::Unpriceable;
             };
             let Ok(value) = serde_json::from_slice::<Value>(body) else {
                 return ContributionOutcome::Unpriceable;
             };
-            match dot_path_value(&value, &gate.spend_amount_field).and_then(Value::as_f64) {
-                Some(amount) if amount.is_finite() && amount >= 0.0 => {
-                    ContributionOutcome::Known(amount)
+            let items: Vec<&Value> = match &value {
+                Value::Array(items) if !items.is_empty() => items.iter().collect(),
+                _ => vec![&value],
+            };
+            let mut total = 0.0;
+            for item in &items {
+                match dot_path_value(item, &gate.spend_amount_field).and_then(Value::as_f64) {
+                    Some(amount) if amount.is_finite() && amount >= 0.0 => total += amount,
+                    // Fail closed on the WHOLE batch if any one item is
+                    // unpriceable — never silently price the batch at only
+                    // the items that happened to parse.
+                    _ => return ContributionOutcome::Unpriceable,
                 }
-                _ => ContributionOutcome::Unpriceable,
             }
+            ContributionOutcome::Known(total)
         }
     }
 }
@@ -475,10 +576,10 @@ enum Ticket {
     /// A reservation for a KNOWN contribution (fixed-weight or spend-amount):
     /// commit on a successful response, release otherwise.
     Reserved(String, Reservation),
-    /// A reservation made against an ESTIMATE (token-cost): reconcile with the
-    /// real `usage.total_tokens` from the response on success (falling back to
-    /// the estimate itself if usage is absent/unparseable), or release on
-    /// failure.
+    /// A reservation made against an ESTIMATE (token-cost): settled at the
+    /// pre-flight estimate itself on success (this build never reads the
+    /// response body to learn a real usage figure — see `response_filter`),
+    /// or released on failure.
     Estimated(String, Reservation),
 }
 
@@ -497,7 +598,8 @@ fn admit(
     scope: &str,
     contribution: f64,
     estimate: bool,
-    raw_body: Option<&[u8]>,
+    echo_bytes: Option<&[u8]>,
+    violations: &PolicyViolations,
 ) -> Flow<Ticket> {
     let reservation = match gate.mode {
         Mode::Block => match gate
@@ -506,11 +608,17 @@ fn admit(
         {
             Ok(reservation) => reservation,
             Err(denial) => {
+                // This IS the aggregate-risk signal this policy exists to
+                // catch: an individually valid call that composes past the
+                // budget. Mirrors the sibling decoy/binding policies'
+                // PolicyViolations usage so a downstream SIEM/Kill Switch can
+                // key off one signal across the whole gateway.
+                violations.generate_policy_violation();
                 let reason = DenyReason::BudgetExceeded(denial);
                 let stamp = reason.stamp(scope);
                 let response = deny_response(
                     gate.on_deny,
-                    raw_body,
+                    echo_bytes,
                     &gate.result_header,
                     &stamp,
                     &reason.message(scope),
@@ -518,7 +626,19 @@ fn admit(
                 return Flow::Break(response);
             }
         },
-        Mode::Monitor => gate.ledger.force_reserve(scope, contribution),
+        Mode::Monitor => {
+            let (reservation, breached) =
+                gate.ledger
+                    .force_reserve_checked(scope, contribution, gate.aggregate_budget);
+            if breached {
+                // The call that would have been refused in block mode is
+                // still forwarded (monitor never denies), but the composition
+                // breach is real and must be visible as a policy violation,
+                // not just a log line.
+                violations.generate_policy_violation();
+            }
+            reservation
+        }
     };
     let total_after = gate.ledger.snapshot(scope).total();
     let verb = if gate.mode == Mode::Block {
@@ -540,7 +660,8 @@ fn admit(
 fn decide(
     handler: &(impl HeadersHandler + ?Sized),
     gate: &Gate,
-    raw_body: Option<&[u8]>,
+    raw_body: RawBody,
+    violations: &PolicyViolations,
 ) -> Flow<Ticket> {
     let header_value = if gate.needs_scope_header {
         handler.header(&gate.scope_header)
@@ -548,13 +669,17 @@ fn decide(
         None
     };
     let (scope, missing_header) = gate.scope_key(header_value.as_deref());
+    // Captured before `raw_body` is moved into `compute_contribution` below —
+    // `as_bytes` only borrows, so this stays valid for every deny path that
+    // still needs the original bytes to attempt an in-band id-echo.
+    let echo_bytes = raw_body.as_bytes();
 
     if missing_header && gate.mode == Mode::Block {
         let reason = DenyReason::MissingScopeHeader;
         let stamp = reason.stamp(&scope);
         let response = deny_response(
             gate.on_deny,
-            raw_body,
+            echo_bytes,
             &gate.result_header,
             &stamp,
             &reason.message(&scope),
@@ -569,7 +694,7 @@ fn decide(
                 let stamp = reason.stamp(&scope);
                 let response = deny_response(
                     gate.on_deny,
-                    raw_body,
+                    echo_bytes,
                     &gate.result_header,
                     &stamp,
                     &reason.message(&scope),
@@ -587,22 +712,44 @@ fn decide(
                 Flow::Continue(Ticket::None(stamp))
             }
         }
-        ContributionOutcome::Known(amount) => admit(gate, &scope, amount, false, raw_body),
-        ContributionOutcome::Estimate(estimate) => admit(gate, &scope, estimate, true, raw_body),
+        ContributionOutcome::Known(amount) => {
+            admit(gate, &scope, amount, false, echo_bytes, violations)
+        }
+        ContributionOutcome::Estimate(estimate) => {
+            admit(gate, &scope, estimate, true, echo_bytes, violations)
+        }
     }
 }
 
-async fn request_filter(request_state: RequestState, gate: &Gate) -> Flow<Ticket> {
+async fn request_filter(
+    request_state: RequestState,
+    gate: &Gate,
+    violations: &PolicyViolations,
+) -> Flow<Ticket> {
     let headers_state = request_state.into_headers_state().await;
     if !headers_state.contains_body() {
         let handler = headers_state.handler();
-        return decide(handler, gate, None);
+        return decide(handler, gate, RawBody::NoBody, violations);
+    }
+    // Header-phase gate, BEFORE ever calling `into_headers_body_state()`:
+    // an oversized, non-JSON, or compressed body is never buffered at all —
+    // `decide` still runs (as `Uninspectable`) so this call gets the same
+    // fail-closed handling as a body this policy read and found unpriceable.
+    if !request_is_inspectable(headers_state.handler()) {
+        let handler = headers_state.handler();
+        return decide(handler, gate, RawBody::Uninspectable, violations);
     }
     let state = headers_state.into_headers_body_state().await;
     let handler = state.handler();
     let body = handler.body();
-    let raw_body: Option<&[u8]> = (body.len() <= MAX_INSPECT_BYTES).then(|| body.as_ref());
-    decide(handler, gate, raw_body)
+    // Defense in depth: a Content-Length that undersold the real body size
+    // must not smuggle an oversized body past the header-phase gate above.
+    let raw_body = if body.len() <= MAX_INSPECT_BYTES {
+        RawBody::Present(body.as_ref())
+    } else {
+        RawBody::Uninspectable
+    };
+    decide(handler, gate, raw_body, violations)
 }
 
 async fn response_filter(
@@ -632,42 +779,34 @@ async fn response_filter(
         return;
     };
 
-    if !is_estimate {
-        if is_success(headers_state.status_code()) {
-            gate.ledger.commit(reservation);
-        } else {
-            gate.ledger.release(reservation);
-        }
-        return;
-    }
-
-    // Estimated (token-cost): reconcile with the real usage.total_tokens once
-    // known. The estimate is what was reserved, so it is also the honest
-    // fallback if the response carries no usable usage figure — the call
-    // still happened and consumed real exposure.
-    let estimate = reservation.contribution;
     if !is_success(headers_state.status_code()) {
         gate.ledger.release(reservation);
         return;
     }
-    if !headers_state.contains_body() {
-        gate.ledger.reconcile(reservation, estimate);
+
+    if !is_estimate {
+        gate.ledger.commit(reservation);
         return;
     }
-    let state = headers_state.into_headers_body_state().await;
-    let handler = state.handler();
-    let body = handler.body();
-    let actual = (body.len() <= MAX_INSPECT_BYTES)
-        .then(|| serde_json::from_slice::<Value>(&body).ok())
-        .flatten()
-        .and_then(|value| value.get("usage")?.get("total_tokens")?.as_f64())
-        .filter(|tokens| tokens.is_finite() && *tokens >= 0.0);
-    gate.ledger
-        .reconcile(reservation, actual.unwrap_or(estimate));
+
+    // Token-cost is estimate-then-SETTLE, not estimate-then-reconcile against
+    // a real figure: this filter never calls `into_headers_body_state()` on
+    // the response leg (headers-only, by design — buffering a large/streamed
+    // upstream reply here would risk a 504 for no gain worth that risk), so
+    // there is no real `usage.total_tokens` to read. The reservation's own
+    // contribution — the pre-flight estimate — is what gets committed. See
+    // the Honesty boundaries section in README.md and the `contribution`
+    // field doc in gcl.yaml.
+    let estimate = reservation.contribution;
+    gate.ledger.reconcile(reservation, estimate);
 }
 
 #[entrypoint]
-async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> Result<()> {
+async fn configure(
+    launcher: Launcher,
+    Configuration(bytes): Configuration,
+    violations: PolicyViolations,
+) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
             "Invalid policy configuration at line {}, column {} ({:?})",
@@ -690,7 +829,7 @@ async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> R
         }
     );
 
-    let filter = on_request(|rs| request_filter(rs, &gate))
+    let filter = on_request(|rs| request_filter(rs, &gate, &violations))
         .on_response(|res, data| response_filter(res, data, &gate));
     launcher.launch(filter).await?;
     Ok(())
@@ -699,8 +838,11 @@ async fn configure(launcher: Launcher, Configuration(bytes): Configuration) -> R
 #[cfg(test)]
 mod test {
     use super::*;
-    use pdk_unit::{UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
+    use pdk_unit::{
+        TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder,
+    };
     use serde_json::json;
+    use std::rc::Rc;
 
     fn config(overrides: Value) -> String {
         let mut base = json!({
@@ -755,6 +897,30 @@ mod test {
         )
     }
 
+    /// A JSON-RPC BATCH (array) request, one `tools/call` per id — for
+    /// exercising the batch accounting/echo paths, never a single call.
+    fn batch_request(ids: &[i64], agent: &str) -> UnitHttpRequest {
+        let batch = Value::Array(
+            ids.iter()
+                .map(|id| json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {}}))
+                .collect(),
+        );
+        jsonrpc_request(batch, Some(agent))
+    }
+
+    /// A request built from a raw, already-serialized body string rather than
+    /// a `Value` — needed to construct bodies a `Value`/`json!` round-trip
+    /// could never produce, such as a duplicate JSON object member.
+    fn raw_request(body: &str, agent: Option<&str>) -> UnitHttpRequest {
+        let mut req = UnitHttpRequest::post()
+            .with_header("content-type", "application/json")
+            .with_header("content-length", body.len().to_string());
+        if let Some(agent) = agent {
+            req = req.with_header("x-agent-id", agent);
+        }
+        req.with_body(body.as_bytes().to_vec())
+    }
+
     fn ok_backend(_req: UnitHttpRequest) -> UnitHttpResponse {
         let body = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         UnitHttpResponse::new(200)
@@ -784,6 +950,16 @@ mod test {
                 .with_header("content-length", body.len().to_string())
                 .with_body(body.into_bytes())
         }
+    }
+
+    /// 10x the inspection cap — the response leg must stamp the header and
+    /// return this untouched without ever buffering it (see `response_filter`).
+    fn huge_backend(_req: UnitHttpRequest) -> UnitHttpResponse {
+        let body = vec![b'x'; 10 * MAX_INSPECT_BYTES];
+        UnitHttpResponse::new(200)
+            .with_header("content-type", "text/plain")
+            .with_header("content-length", body.len().to_string())
+            .with_body(body)
     }
 
     fn response_error_code(response: &UnitHttpResponse) -> Option<i64> {
@@ -1035,24 +1211,255 @@ mod test {
     }
 
     #[test]
-    fn token_cost_contribution_reconciles_with_real_usage_from_the_response() {
+    fn token_cost_contribution_commits_the_full_estimate_and_never_reads_the_response_body() {
         let mut tester = UnitTestBuilder::default()
             .with_config(config(json!({"contribution": "token-cost", "estimatedTokens": 600, "aggregateBudget": 1000})))
             .with_backend(usage_backend(50.0))
             .with_entrypoint(super::configure);
-        // First call reserves the 600-token ESTIMATE, then reconciles down to
-        // the real 50-token usage.total_tokens once the response is seen.
+        // The backend reports a real usage.total_tokens of 50, far below the
+        // 600-token estimate — but the response leg is headers-only and never
+        // reads the response body (see response_filter), so the FULL 600
+        // estimate is what gets committed, not the smaller real figure.
         let first = tester.request(rpc_request(1, "broker-7"));
         assert_eq!(response_error_code(&first), None);
-        // A second call reserving another 600-token estimate only fits
-        // (50 + 600 = 650 <= 1000) if the first call's ledger entry was
-        // actually trued up to 50 — an un-reconciled 600 would make
-        // 600 + 600 = 1200, over budget.
+        let header = first.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("600.00"));
+        // A 2nd 600-token estimate only denies (600 + 600 = 1200 > 1000) if
+        // the 1st call's estimate was committed IN FULL — a true-up to the
+        // real 50-token usage would leave 50 + 600 = 650, still under budget.
         let second = tester.request(rpc_request(2, "broker-7"));
         assert_eq!(
             response_error_code(&second),
-            None,
-            "reconciliation must free the unused estimate before the 2nd call"
+            Some(MCP_BLOCKED_CODE),
+            "the full 600-token estimate, not the real 50-token usage, must have been committed"
+        );
+    }
+
+    #[test]
+    fn a_large_response_body_is_never_buffered_and_the_header_still_lands() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(huge_backend)
+            .with_entrypoint(super::configure);
+        // 10x the inspection cap: if response_filter ever called
+        // into_headers_body_state() on the response leg, this is the body it
+        // would have to buffer. It must not — the response leg is headers-only.
+        let response = tester.request(rpc_request(1, "broker-7"));
+        assert!(
+            response
+                .header("x-aggregate-risk-gate")
+                .unwrap()
+                .contains("allowed"),
+            "the result header must still be stamped even on a huge response body"
+        );
+        assert_eq!(
+            response.body().len(),
+            10 * MAX_INSPECT_BYTES,
+            "the (never-buffered) body must reach the caller unmodified"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Batch (array) JSON-RPC requests — must never fail-open the aggregate
+    // check by pricing a batch of N calls as if it were one.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_over_budget_batch_is_denied_atomically_with_one_error_per_id() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // fixed-weight=800, aggregateBudget=3000: a single batch of 4 calls
+        // (3200) must be refused as ONE atomic unit — never split so that 3
+        // of the 4 slip through underneath the per-item weight.
+        let response = tester.request(batch_request(&[1, 2, 3, 4], "broker-7"));
+        assert!(
+            backend.next().is_none(),
+            "an over-budget batch must never reach upstream"
+        );
+        assert_eq!(
+            response.status_code(),
+            200,
+            "denial rendered as in-band JSON-RPC errors"
+        );
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        let errors = body.as_array().expect("batch denial echoes a JSON array");
+        assert_eq!(errors.len(), 4, "one error per id in the batch");
+        for (id, error) in [1, 2, 3, 4].iter().zip(errors) {
+            assert_eq!(error["id"], json!(id));
+            assert_eq!(error["error"]["code"], MCP_BLOCKED_CODE);
+        }
+    }
+
+    #[test]
+    fn a_within_budget_batch_commits_the_full_per_item_contribution() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let response = tester.request(batch_request(&[1, 2, 3], "broker-7"));
+        assert_eq!(response_error_code(&response), None);
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(
+            header.contains("2400.00"),
+            "3 items at 800 each must commit as 2400, not as a single 800"
+        );
+        // A follow-up single call only denies (2400 + 800 = 3200 > 3000) if
+        // the batch really committed 2400 — an under-counted 800 would leave
+        // 800 + 800 = 1600, still under budget.
+        let response = tester.request(rpc_request(4, "broker-7"));
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+    }
+
+    #[test]
+    fn spend_amount_batch_sums_per_item_contributions() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"contribution": "spend-amount"})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 800.0}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"amount": 800.0}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"amount": 800.0}},
+        ]);
+        let response = tester.request(jsonrpc_request(batch, Some("broker-7")));
+        assert_eq!(response_error_code(&response), None);
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("2400.00"));
+        // Only denies (2400 + 800 = 3200 > 3000) if the batch truly summed to
+        // 2400 rather than, say, pricing the whole batch as a single item.
+        let response = tester.request(rpc_request_with_amount(4, "broker-7", 800.0));
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+    }
+
+    #[test]
+    fn spend_amount_batch_with_any_unpriceable_item_denies_the_whole_batch() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"contribution": "spend-amount"})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // The 2nd item has no params.amount at all.
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 100.0}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}},
+        ]);
+        let response = tester.request(jsonrpc_request(batch, Some("broker-7")));
+        assert!(
+            backend.next().is_none(),
+            "a batch with any unpriceable item must never reach upstream in block mode"
+        );
+        assert_eq!(response.status_code(), 200);
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        let errors = body.as_array().expect("batch denial echoes a JSON array");
+        assert_eq!(
+            errors.len(),
+            2,
+            "fail-closed on the WHOLE batch, not just the unpriceable item"
+        );
+        for error in errors {
+            assert_eq!(error["error"]["code"], MCP_BLOCKED_CODE);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Deny-path id-echo containment: never echo an id this policy cannot
+    // trust, even when the underlying denial (budget exceeded) is genuine.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_duplicate_json_member_falls_back_to_empty_403_without_echoing_any_id() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        for i in 0..3 {
+            tester.request(rpc_request(i, "broker-7"));
+        }
+        for _ in 0..3 {
+            backend.next(); // discard the first three admitted calls
+        }
+        // A duplicate "id" member: a parser-differential body where this
+        // policy and the upstream tool could legitimately disagree about
+        // which id is "the" id. This 4th call is a genuine budget-exceeded
+        // denial, but neither id may ever be echoed — fall back to the
+        // generic empty-403, exactly as an unparseable body would (issue #36
+        // containment).
+        let ambiguous = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","id":999,"params":{}}"#;
+        let response = tester.request(raw_request(ambiguous, Some("broker-7")));
+        assert!(
+            backend.next().is_none(),
+            "the over-budget call must not reach upstream"
+        );
+        assert_eq!(
+            response.status_code(),
+            403,
+            "an ambiguous body falls back to empty-403, echoing no id"
+        );
+        assert!(response.body().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // PolicyViolations — mirrors the sibling decoy/binding policies' signal so
+    // a downstream SIEM/Kill Switch can key off one code across the gateway.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn block_budget_exceeded_denial_sets_a_policy_violation() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for i in 0..3 {
+            tester.request(rpc_request(i, "broker-7"));
+        }
+        let response = tester.request(rpc_request(4, "broker-7"));
+        assert!(
+            response.violation().is_some(),
+            "a block-mode budget-exceeded denial must signal a policy violation"
+        );
+    }
+
+    #[test]
+    fn admitted_calls_do_not_generate_policy_violations() {
+        for mode in ["block", "monitor"] {
+            let backend = Rc::new(TraceBackend::new(ok_backend));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({ "mode": mode })))
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            tester.request(rpc_request(1, "broker-7"));
+            assert!(
+                backend.next().unwrap().violation().is_none(),
+                "an admitted call under {} mode must not signal a policy violation",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn monitor_over_budget_call_reports_violation_and_still_reaches_upstream() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"mode": "monitor"})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        for i in 0..3 {
+            tester.request(rpc_request(i, "broker-7"));
+        }
+        // The 4th call composes past budget (3200 > 3000); monitor mode never
+        // denies, but the breach itself must be visible as a policy violation.
+        tester.request(rpc_request(4, "broker-7"));
+        for _ in 0..3 {
+            backend.next(); // discard the first three admitted calls
+        }
+        let forwarded = backend.next().expect("monitor mode forwards every call");
+        assert!(
+            forwarded.violation().is_some(),
+            "an over-budget call in monitor mode must signal a policy violation"
         );
     }
 
@@ -1175,6 +1582,20 @@ mod test {
         let mut cfg = valid_config_struct();
         cfg.on_deny = "not-a-real-on-deny".to_string();
         assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn invalid_window_is_rejected() {
+        let mut cfg = valid_config_struct();
+        cfg.window = "not-a-real-window".to_string();
+        assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn fixed_period_window_is_accepted() {
+        let mut cfg = valid_config_struct();
+        cfg.window = "fixed-period".to_string();
+        assert!(Gate::from_config(&cfg).is_ok());
     }
 
     #[test]

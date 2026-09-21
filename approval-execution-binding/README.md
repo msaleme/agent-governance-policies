@@ -62,14 +62,33 @@ itself; it does not establish that the attester was *entitled* to approve the ac
 
 ### Inspection boundary
 
-The policy evaluates a request only if it parses as a single (non-batch) JSON-RPC 2.0 object with
-a valid, declared `content-length` no greater than **64 KiB**, and the actual body received
-matches that declared length exactly. A body that is missing entirely, declares no length or an
-oversized one, arrives with a length mismatch, is a JSON-RPC **batch**, or fails to parse as a
-single JSON-RPC object at all (missing/invalid `jsonrpc`, missing `method`, or — for `tools/call`
-— missing `params.name`) is treated as **malformed**: `monitor` mode logs the verdict and always
-forwards; `block` mode denies. Batches are explicitly out of scope for approval binding, not a
-future predicate — an approval record binds to one executed action, not to a collection of them.
+Before any body is buffered, the policy checks the request's declared framing at the header phase:
+a `content-type` that isn't `application/json` (or an `application/*+json` variant) — which
+excludes SSE/streaming media types such as `text/event-stream` — or the presence of any
+`content-encoding` header (a compressed body, whose decoded size the declared `content-length`
+cannot bound) is treated the same as malformed framing below: `monitor` mode logs and always
+forwards the request uninspected; `block` mode denies before ever buffering it. This mirrors the
+sibling Decoy Tool Sentinel's admission gate and is the reason SSE/streaming, compressed, and
+non-UTF-8 bodies are excluded from inspection — this policy cannot safely buffer or parse them as
+JSON at all.
+
+Once a body clears that header-phase gate, the policy evaluates it only if it parses as a single
+(non-batch) JSON-RPC 2.0 object with a valid, declared `content-length` no greater than **64 KiB**,
+and the actual body received matches that declared length exactly. A body that is missing
+entirely, declares no length or an oversized one, arrives with a length mismatch, is a JSON-RPC
+**batch**, or fails to parse as a single JSON-RPC object at all (missing/invalid `jsonrpc`, missing
+`method`, or — for `tools/call` — missing `params.name`) is treated as **malformed**: `monitor`
+mode logs the verdict and always forwards; `block` mode denies. Batches are explicitly out of scope
+for approval binding, not a future predicate — an approval record binds to one executed action, not
+to a collection of them; a batch is therefore rejected atomically (the whole array denied together)
+and never split into a per-member allow/deny — so an unauthorized or altered call riding inside an
+otherwise-plausible batch can never slip through as one of several forwarded calls.
+
+**What this policy reads — and nothing else.** Inspection is limited to: the approval envelope
+(from `approvalHeader` or, for `approvalSource: rpc-param`, the `approvalRpcField` sibling member of
+the JSON-RPC body), the executor identity header (`executorHeader`), and the JSON-RPC body itself
+(`jsonrpc`/`id`/`method`/`params`, and for `tools/call`, `params.name`/`params.arguments`). It never
+inspects arbitrary headers, the query string, or the request path.
 
 Denial rendering follows the request's own framing, not just `onDeny`:
 - A JSON-RPC **notification** (no `id`) always gets an empty HTTP `202` — JSON-RPC forbids a
@@ -77,7 +96,9 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 - A request this policy cannot confidently parse as a single, non-batch JSON-RPC call with an
   echoable `id` (malformed body, unreadable framing, or a request with no body at all) always
   falls back to an empty HTTP `403`, regardless of `onDeny` — echoing an `id` it cannot trust risks
-  exposing a protected value.
+  exposing a protected value. This includes a body with an **ambiguous duplicate `"id"` member**
+  (e.g. `{"id":1,"id":"leaked-token",...}`): the strict parse rejects it outright rather than
+  picking either candidate value, so neither one is ever echoed back.
 - Otherwise, `onDeny: rpc-error` returns an in-band JSON-RPC `-32008` error reusing the request's
   own `id` (HTTP `200` — the error is payload-level, matching real JSON-RPC semantics, so a caller
   or test that only checks the HTTP status code cannot distinguish an allowed, forwarded request
@@ -135,7 +156,16 @@ On a denial the log carries a structured event, e.g.
 `{"event":"approval_execution_binding","action":"deny","predicate":"P1","reason":"approved action 'deploy.apply', executed 'deploy.destroy'"}`
 
 The reason names only the failed predicate and, where relevant, the mismatched action/reference
-identifiers — never the argument payload or attestation key material.
+identifiers — never the argument payload, approval-token values, or attestation key material.
+
+**PDK policy violation registration.** Every predicate-failure decision — a `block`-mode denial
+*and* a `monitor`-mode would-deny detection — registers a PDK policy violation via
+`PolicyViolations::generate_policy_violation()`, mirroring the sibling Decoy Tool Sentinel, so
+Anypoint Monitoring/SIEM records the hit even when `monitor` mode still forwards the request. A
+structural/framing rejection that never reaches predicate evaluation at all (no body, wrong
+content-type, oversized/mismatched `content-length`, unparseable JSON-RPC envelope) does not
+register a violation — there is no evaluated verdict to report — but is still logged via the
+structured warning above and, in `block` mode, still denied.
 
 ### Honesty boundaries
 
@@ -187,15 +217,21 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/lib.rs`'s `#[cfg(test)] mod test` (33 tests, run via `cargo +1.89.0 test --lib`) covers all six
+`src/lib.rs`'s `#[cfg(test)] mod test` (48 tests, run via `cargo +1.89.0 test --lib`) covers all six
 predicates via the vendored ABV vectors (`tests/fixtures/abv/`) plus hand-authored edge cases:
-config validation (empty/unknown predicates, `sidecar` rejection, duplicate/blank attester kids),
-malformed/oversized/batch/notification JSON-RPC framing, monitor-vs-block behavior, and the
-rpc-param approval source. `tests/requests.rs` adds a small Docker/`pdk_test` end-to-end suite
-(sound-approval-reaches-upstream, action-mismatch-denied-and-never-reaches-upstream) — deliberately
-smaller than Tripwire's integration suite, since this policy's threat model ("is this record proof
-of this execution") is already covered exhaustively by the unit tests; it adds only what an
-in-process harness cannot exercise.
+config validation (empty/unknown predicates and enum values, `sidecar` rejection, duplicate/blank
+attester kids), malformed/oversized/batch/notification JSON-RPC framing, monitor-vs-block behavior,
+the rpc-param approval source, PDK policy-violation registration on both block-mode denials and
+monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial)
+denial of a batch containing an unauthorized call, the content-type/content-encoding header-phase
+admission gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking,
+in both the JSON-RPC body and the approval header), a numeric-overflow literal that fails closed
+deterministically without panicking, and the ambiguous-duplicate-`id` containment rule. `tests/requests.rs`
+adds a small Docker/`pdk_test` end-to-end suite (sound-approval-reaches-upstream,
+action-mismatch-denied-and-never-reaches-upstream) — deliberately smaller than Tripwire's
+integration suite, since this policy's threat model ("is this record proof of this execution") is
+already covered exhaustively by the unit tests; it adds only what an in-process harness cannot
+exercise.
 
 ---
 

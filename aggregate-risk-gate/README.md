@@ -71,19 +71,45 @@ reserve-then-authorize ledger holds.
 
 ## Inspection boundary
 
-The policy reads the request body for two things: the JSON-RPC envelope (to echo the caller's own
-`id` on a `rpc-error` denial) and, when `contribution=spend-amount`, the numeric value at
-`spendAmountField`. Neither read is attempted on a body larger than **64 KiB**
-(`MAX_INSPECT_BYTES`). This is a latency/inspection admission cap, not a security containment
-boundary — unlike a tripwire that must not silently pass an oversized body, a call this policy
-cannot price has an explicit, safe fallback rather than a risk of missing something: an oversized
-`spend-amount` call is treated as unpriceable (denied in `block` mode, recorded as zero in
-`monitor` mode, per the Configuration table below); an oversized body on a denial simply cannot be
-echoed as an in-band JSON-RPC error and falls back to an empty `403`. The same 64 KiB cap applies
-on the response side when reconciling a `token-cost` reservation against `usage.total_tokens` — an
-oversized response body falls back to committing the pre-flight `estimatedTokens` figure rather
-than the real usage. This cap only governs what this policy itself reads for pricing/echo
-purposes; it is not a substitute for Flex/Gateway's own framing and buffering limits.
+**What this policy reads.** On the request, exactly two things, both from the JSON-RPC body: the
+envelope's `id`(s) (to echo the caller's own id on a `rpc-error` denial) and, when
+`contribution=spend-amount`, the numeric value at `spendAmountField`. Alongside those, it reads the
+one identity header configured by `scopeHeader` (for `agent`/`tenant` budget scope). It never reads
+any other header, the query string, or the request/response path. **On the response, it reads
+nothing but headers** — the status code (to decide commit vs. release) — and never the response
+body; see the `contribution` and Honesty boundaries sections below for why a `token-cost`
+reservation settles at its own pre-flight estimate rather than a real usage figure.
+
+**Inspection exclusions.** A request body is inspected only if ALL of the following hold, checked
+at the HEADER phase, before this policy ever buffers the body:
+
+- **Size** — a declared `Content-Length` no larger than **64 KiB** (`MAX_INSPECT_BYTES`). A missing
+  or non-numeric `Content-Length` is also excluded, since there is then no safe pre-buffering size
+  check at all. (Defense in depth: even with a valid declared length, a body that turns out larger
+  than 64 KiB once read is excluded the same way — a Content-Length that undersold the real size
+  cannot smuggle an oversized body past this boundary.)
+- **Content type** — `Content-Type` must be `application/json` or an `application/*+json` media
+  type. This excludes **SSE/streaming** responses and requests (`text/event-stream` and similar),
+  and any other non-JSON media type.
+- **Compression** — any `Content-Encoding` at all excludes the body; this policy never
+  decompresses, so a compressed body's real JSON content is opaque to it.
+- **Encoding** — a body that is not valid UTF-8 fails JSON parsing (JSON is a UTF-8-only format),
+  so a **non-UTF-8** body is excluded the same way an oversized one is, even though this specific
+  case cannot be caught at the header phase.
+
+A body excluded on any of these grounds is never buffered or read; it is treated as unpriceable —
+fail-closed in `block` mode (denied, `onDeny` applies), recorded as zero contribution with the gap
+flagged on the header in `monitor` mode (see the Configuration table below). None of this is a
+security containment boundary the way a tripwire's would be — a call this policy cannot price has
+an explicit, safe fallback, not a risk of missing a hidden secret — and none of it substitutes for
+Flex/Gateway's own framing and buffering limits.
+
+**Batch (array) requests.** A JSON-RPC batch is never priced as if it were a single call: under
+`fixed-weight`/`token-cost` its per-item weight/estimate is multiplied by the number of items in the
+array; under `spend-amount` every item's amount is read and summed, and the whole batch fails closed
+if any single item is unpriceable. A batch denied for exceeding budget is refused atomically — never
+split so that some items land while others don't — and, in `rpc-error` mode, gets back a JSON array
+with one `-32008` error per id, echoing every id in the batch.
 
 ## Configuration
 
@@ -93,13 +119,13 @@ purposes; it is not a substitute for Flex/Gateway's own framing and buffering li
 | `scopeHeader` | string | `x-agent-id` | Request header carrying the identity value used to key the ledger when `budgetScope` is `agent` or `tenant`. Ignored for `fabric`. Missing when required: fails closed in `block` mode; recorded under a fixed `(missing)` key in `monitor` mode so the gap is visible rather than silently dropped. |
 | `aggregateBudget` | number | `3000` | The exposure budget for the scope's current window, in `contribution`'s units. A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
 | `window` | string | `rolling-24h` | The accounting window `aggregateBudget` nominally applies to. **Accepted but not enforced at Stage A** — see Honesty boundaries below; the ledger accumulates for the life of the gateway worker process, not a real window. |
-| `contribution` | `token-cost`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — numeric field read from the request body at `spendAmountField`. `token-cost` — reserved as `estimatedTokens` before authorizing (the real cost isn't known until the response arrives), then reconciled against the response's `usage.total_tokens` once available. |
+| `contribution` | `token-cost`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — numeric field read from the request body at `spendAmountField`. `token-cost` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Honesty boundaries below). A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
 | `fixedWeight` | number | `1` | Per-call contribution when `contribution=fixed-weight`. |
 | `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the numeric spend amount when `contribution=spend-amount`. Missing/unparseable/non-numeric: unpriceable — denied in `block` mode, recorded as zero in `monitor` mode. |
-| `estimatedTokens` | number | `500` | Pre-flight reservation estimate (tokens) when `contribution=token-cost`. Set to a conservative upper bound for the traffic this instance governs; reconciled with the real `usage.total_tokens` on success, released outright on upstream failure. |
+| `estimatedTokens` | number | `500` | Pre-flight reservation estimate (tokens) when `contribution=token-cost`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
 | `ledgerEndpoint` | string | `""` | **Reserved for Stage B, NOT implemented.** Accepted and validated (a non-empty value is logged as a forward-compatibility notice) but every decision in this build is made by the in-process Stage A ledger regardless of this value. Leave empty. |
-| `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`. |
-| `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id, error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content). `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as a single, non-batch JSON-RPC call with an echoable id always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
+| `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. |
+| `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
 | `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:broker-7;contribution=800.00;total=2400.00/3000.00` or, on denial, `denied;scope=agent:broker-7;would-be-total=3200.00;budget=3000.00`. Never carries other sessions' call content — only the scope key and numeric totals — so it is safe to forward to downstream logging, SIEM, or a Kill Switch without a further redaction pass. |
 
 ```yaml
@@ -156,11 +182,15 @@ cryptographic non-repudiation claim over its decisions. Concretely:
   a scope's exposure accumulates for the life of the running worker process, not for a rolling or
   fixed accounting window. Real per-window expiry needs a clock-driven eviction policy against a
   real distributed store, not a per-request approximation; it is Stage B roadmap work.
-- **`token-cost` contribution is estimate-then-reconcile, not exactly known pre-flight.** The
-  reservation made before authorizing a token-cost call is `estimatedTokens`, a configured upper
-  bound — the ledger is trued up to the real `usage.total_tokens` only once the upstream response
-  arrives (or released outright on failure). Set the estimate conservatively for the traffic this
-  instance governs.
+- **`token-cost` contribution is estimate-then-SETTLE, not estimate-then-reconcile, and pre-flight
+  token cost is not exactly known.** The reservation made before authorizing a token-cost call is
+  `estimatedTokens`, a configured upper bound. This build's response leg is strictly headers-only
+  (see Inspection boundary above) — it never buffers or reads the response body, so it never learns
+  a real `usage.total_tokens` figure to true up against. On a successful response the reservation is
+  therefore **committed at the estimate itself**, unchanged (or released outright on failure). This
+  is a more conservative behavior than a real reconcile would be, not a softer one: set the estimate
+  conservatively for the traffic this instance governs, since it is what actually lands in the
+  ledger, not a placeholder for something more accurate arriving later.
 - **No signed decision records.** Every ledger operation happens in-process and is not
   independently attestable outside this policy's own process; this build makes no claim that its
   admit/deny decisions are cryptographically non-repudiable.
@@ -171,28 +201,46 @@ here**. Do not present this build as shipping it.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 60 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 74 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency): correctness of
-  `reserve`/`force_reserve`/`commit`/`release`/`record`/`reconcile`/`snapshot` in isolation, plus
-  two concurrency tests that are the load-bearing proof for this whole policy —
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 27 tests): correctness of
+  `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`reconcile`/`snapshot`
+  in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
   800-unit calls against a 3000 budget, breaching to 4000) and
   `reserve_then_authorize_holds_budget_under_concurrency` (the real ledger, same concurrent load,
   admits exactly 3 of 5, holding at 2400) — reproducing both the sequential-composition and the
   race scenario from `authorized-but-composed`, plus a broader multi-scope stress variant
-  (`reserve_then_authorize_never_exceeds_budget_across_many_concurrent_scopes`).
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness
-  (`sequential_composition_through_the_real_filter_refuses_the_fourth_call` and ~19 more): per-mode
+  (`reserve_then_authorize_never_exceeds_budget_across_many_concurrent_scopes`). These two headline
+  tests, and every other test in this file, are never weakened or skipped — they are the correctness
+  proof this whole policy exists to make.
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (27 tests,
+  from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
-  unpriceable and token-cost-reconciliation edge cases, independent per-scope budgets, the missing-
+  unpriceable and estimate-then-settle edge cases, independent per-scope budgets, the missing-
   scope-header path in both modes, and that the `resultHeader` stamp lands on the client-facing
-  response (not the upstream request) in both the allow and deny paths.
-- **Direct `Gate::from_config` validation tests** (~14): every config-validation rejection path
-  (invalid enum values, non-finite/negative numeric fields, blank required strings) and the
-  corresponding accepted cases.
+  response (not the upstream request) in both the allow and deny paths. Also:
+  - **Batch (array) accounting** — an over-budget batch is denied atomically with one `-32008`
+    error per id (`an_over_budget_batch_is_denied_atomically_with_one_error_per_id`), a
+    within-budget batch commits the FULL per-item contribution
+    (`a_within_budget_batch_commits_the_full_per_item_contribution`), and `spend-amount` batches
+    both sum correctly and fail closed on any single unpriceable item.
+  - **Id-echo containment** — a body with a duplicate JSON object member falls back to an empty
+    `403` echoing no id at all, even though the underlying denial is a genuine budget-exceeded one
+    (`a_duplicate_json_member_falls_back_to_empty_403_without_echoing_any_id`).
+  - **PolicyViolations signaling** — a block-mode budget-exceeded denial and a monitor-mode
+    over-budget-but-forwarded call both set a policy violation; an admitted call under either mode
+    does not.
+  - **Response leg is headers-only** — a 10x-oversized response body is never buffered and the
+    `resultHeader` still lands (`a_large_response_body_is_never_buffered_and_the_header_still_lands`),
+    and a `token-cost` call commits its full pre-flight estimate rather than a smaller real usage
+    figure the response body is never read to find
+    (`token_cost_contribution_commits_the_full_estimate_and_never_reads_the_response_body`).
+- **Direct `Gate::from_config` validation tests** (16): every config-validation rejection path
+  (invalid enum values including `window`, non-finite/negative numeric fields, blank required
+  strings) and the corresponding accepted cases.
 - **`dot_path_value` unit tests** (4): the dotted-path body reader used for `spend-amount`.
 
 `tests/requests.rs` holds two `pdk_test` integration tests that run the same
