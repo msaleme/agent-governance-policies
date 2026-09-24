@@ -22,11 +22,17 @@ publication are included.
   OS-thread contention: a naive read-then-write counter is shown to breach the
   budget while the atomic reserve-then-authorize ledger holds it. Monitor and block
   modes; per-scope (agent/fabric/tenant) budgets; token-cost, spend-amount, and
-  fixed-weight contribution modes with estimate-then-reconcile true-up.
+  fixed-weight contribution modes with estimate-then-settle commitment (this build
+  commits the full estimate; it does not read the response body to reconcile).
 - Per-policy PDK project scaffold: config schema (`definition/gcl.yaml`), generated
   `Config`, Makefile, playground, and pinned `rust-toolchain.toml` (1.89.0).
 - Repository scaffolding: MIT license, attribution and corpus provenance,
   composition notes, and a credential-free CI workflow.
+- Attribution: full research provenance for the aggregate-risk corpus (position
+  paper *"Authorized but Composed"*, Zenodo DOI 10.5281/zenodo.21400261, sibling
+  DOI 10.5281/zenodo.21263262, and the `red-team-blue-team-agent-fabric` verifier
+  harness) and a Protocol specifications section citing the governed wire formats
+  (MCP, A2A, JSON-RPC 2.0).
 
 ### Known limitations
 

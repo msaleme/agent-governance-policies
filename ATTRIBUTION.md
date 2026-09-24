@@ -39,12 +39,36 @@ add the runtime that performs it. The corpora are cited, not relicensed here.
   explicitly notes that the enforcement boundary is an architectural property the
   corpus itself cannot observe.
 - **Cross-Session Aggregate-Risk Gate** implements the reserve-then-authorize
-  model demonstrated by the `authorized-but-composed` reference work. The
-  concurrency scenarios there are synthetic and simulated; this repository
-  reproduces the naive-counter-breaches vs. reserve-then-authorize-holds contrast
-  as executable Rust tests, not as a claim of production telemetry or a safety
-  benchmark. Its `verify` step is a replay/consistency check, not an independently
-  provable signed attestation.
+  model demonstrated by the `authorized-but-composed` reference work
+  (`github.com/msaleme/authorized-but-composed`), companion code to the position
+  paper *"Authorized but Composed: Cross-Session Risk Composition as an
+  Agent-Governance Control"* (Michael K. Saleme), Zenodo concept DOI
+  [10.5281/zenodo.21400261](https://doi.org/10.5281/zenodo.21400261); its
+  single-action sibling is *"Authorized but Refused"*
+  ([10.5281/zenodo.21263262](https://doi.org/10.5281/zenodo.21263262)). The
+  corpus's conformance fixtures and verifier are also exercised inside the
+  `red-team-blue-team-agent-fabric` security harness
+  (`github.com/msaleme/red-team-blue-team-agent-fabric`). The concurrency scenarios
+  there are synthetic and simulated; this repository reproduces the
+  naive-counter-breaches vs. reserve-then-authorize-holds contrast as executable
+  Rust tests, not as a claim of production telemetry or a safety benchmark. The
+  corpus `verify` step is a replay/consistency check, not an independently provable
+  signed attestation.
+
+## Protocol specifications
+
+These policies inspect and enforce on live agent-protocol traffic; they implement
+the wire formats defined by the following specifications (cited as the governed
+protocols, not as an endorsement or a conformance claim by their maintainers):
+
+- **Model Context Protocol (MCP)** — the JSON-RPC tool-calling protocol both
+  policies admit and gate on MCP instances: [modelcontextprotocol.io](https://modelcontextprotocol.io).
+- **Agent2Agent (A2A)** — the agent-to-agent protocol these policies gate on A2A
+  instances: [a2a-protocol.org](https://a2a-protocol.org) /
+  [github.com/a2aproject/A2A](https://github.com/a2aproject/A2A).
+- **JSON-RPC 2.0** — the envelope both protocols share and these policies parse,
+  including the `-32008` in-band error rendering on denial:
+  [jsonrpc.org/specification](https://www.jsonrpc.org/specification).
 
 ## Direct Rust dependencies
 
