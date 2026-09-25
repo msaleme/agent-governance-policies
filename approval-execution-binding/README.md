@@ -5,8 +5,10 @@
 > NIST SP 800-53 Rev 5 **AC-3** (Access Enforcement — the gateway is where the executed action
 > either matches or fails to match what was approved), **AC-4** (Information Flow Enforcement —
 > the approval record must travel with the request across the hop from approver to executor),
-> **AU-10** (Non-repudiation — the P5 separate-attester requirement), and **AU-2** (Event
-> Logging — the structured verdict line below). OWASP **LLM06: Excessive Agency**. MITRE ATLAS
+> **AU-10** (Non-repudiation — the P5 separate-attester requirement is *supporting* evidence toward
+> this; the symmetric HMAC this build uses provides separation-of-duties, not non-repudiation in the
+> PKI sense), and **AU-2** (Event Logging — the structured verdict line below). OWASP **LLM06:
+> Excessive Agency**. MITRE ATLAS
 > (adversarial-ML design context) and MITRE Engage (the **Expose**/**Affect** vocabulary used for
 > `monitor`/`block` below) as design context, not a detection-coverage claim. EU AI Act
 > **Article 14** (human oversight — the approval this policy verifies wasn't bypassed or altered
@@ -26,14 +28,21 @@ supervising broker approves an action; a downstream broker executes several call
 different connection. Nothing at the gateway normally proves those two events are the *same*
 action. A changed vendor, a changed quantity, a re-pointed target, an approval reused past its
 window — any of these can slip through the gap between "approved" and "executed," and today
-nothing at the gateway catches it. This policy closes that gap: on every governed MCP/A2A
-JSON-RPC execution, it checks the accompanying approval record against six independent
+nothing at the gateway catches it. This policy closes that gap: on every governed MCP
+`tools/call` execution, it checks the accompanying approval record against five independent
 predicates and denies the call if any **required** predicate fails.
 
-Predicate semantics, canonical form, and the P2/P3 precedence rule all follow the
+**Scope: MCP `tools/call` only.** This policy binds exactly one JSON-RPC method — `tools/call` —
+because that is the method that *executes a tool*, which is what an approval constrains. Every other
+JSON-RPC method (`tools/list`, `initialize`, `ping`, notifications, anything unrecognized) is
+**out of scope**: it is forwarded upstream untouched, with the result header stamped `out-of-scope`
+in both monitor and block mode. The policy never blocks a non-`tools/call` method. A request that
+cannot be parsed at all still fails closed in block mode (see the inspection boundary below).
+
+Predicate semantics and canonical form follow the
 [**Approval Binding Vectors (ABV) v0.1**](https://github.com/msaleme/approval-binding-vectors)
 conformance corpus (MIT) — a protocol-neutral spec for exactly this question, with its own positive
-controls and negative vectors. This implementation vendors all 12 ABV vectors
+controls and negative vectors. This implementation vendors the ABV vectors
 (`tests/fixtures/abv/`) and drives its negative/positive unit tests directly from them.
 
 - **`monitor`** (Expose) — evaluate every required predicate on every governed call and log the
@@ -43,16 +52,21 @@ controls and negative vectors. This implementation vendors all 12 ABV vectors
 - **`block`** (Affect) — deny the call when a required predicate fails, per `onDeny`, even though
   nothing about the request's own JSON-RPC framing is otherwise invalid.
 
-### The six predicates
+### The five predicates
 
 | ID | Predicate | The failure it excludes |
 |---|---|---|
 | **P1** | Action | Approved tool A, executed tool B. |
-| **P2** | Arguments | Approved A with args X, executed A with args Y. |
-| **P3** | Dereference | An argument carried by reference (`{"$ref": "..."}`); the bytes behind it changed. Takes precedence over P2 whenever a reference is involved. |
+| **P2** | Arguments | Approved A with args X, executed A with args Y. Arguments are compared by canonical (RFC 8785 JCS) digest; a reference-shaped argument (an object carrying a `$ref` key at any depth) is **rejected under P2**, not dereferenced — the approved and executed argument bytes must match directly. |
 | **P4** | Freshness | Approval correctly scoped and granted, but expired before execution — checked against this gateway's own wall clock, never a caller-supplied timestamp. |
-| **P5** | Separate attester | A record whose only witness that it was approved is the party now executing it. |
-| **P6** | Single use *(opt-in)* | One approval, replayed for a second execution. Reusable approvals are legitimate in some flows, so P6 defaults out of `requiredPredicates`. |
+| **P5** | Separate attester | A record whose only witness that it was approved is the party now executing it. The P5 HMAC covers a **versioned, domain-separated `mcp-v1` payload** (see below), and the executor identity it is checked against is read from the **verified authentication data**, never a caller-asserted header. |
+| **P6** | Single use *(opt-in)* | One approval, replayed for a second execution. Enforced **atomically via gateway data storage** in block mode. Reusable approvals are legitimate in some flows, so P6 defaults out of `requiredPredicates`. |
+
+> **P3 (dereference) was removed.** An earlier draft carried a sixth predicate that verified the
+> bytes behind a `$ref`-shaped argument via a caller-supplied `dereferenced` digest map. That put
+> the gateway in the business of trusting a caller-populated blob map it cannot itself resolve.
+> The safer rule — a reference-shaped argument is simply **rejected under P2** — is now the whole
+> story; there is no P3 anywhere in the config, the code, or the ABV mapping.
 
 **Honesty boundary.** This policy (and the ABV corpus it implements) tests whether the *record*
 proves the executed action is the approved one. It does not and cannot prove that approving the
@@ -111,10 +125,13 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `approvalSource` | `header`\|`rpc-param`\|`sidecar` | `header` | Where the approval envelope rides. `sidecar` is rejected at startup (not implemented). |
 | `approvalHeader` | string | `x-approval` | Header carrying the JSON-encoded envelope when `approvalSource: header`. |
 | `approvalRpcField` | string | `approvalBinding` | Top-level JSON-RPC body member carrying the envelope when `approvalSource: rpc-param`. |
-| `executorHeader` | string | `client_id` | Header carrying the already-authenticated identity about to execute; used only for P5. |
-| `requiredPredicates` | string[] | `[P1, P2, P3, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. |
-| `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check. An attestation from an authority not listed here always fails P5. |
+| `executorHeader` | string | `client_id` | **Fallback** header naming the executor. The executor identity is taken FIRST from the **verified** authentication data (`client_id`, then `principal`) established by an upstream authentication policy; this header is used only when no verified subject is present, and when P5 is required and no verified subject exists the call **fails closed** rather than trusting the header. Used only for P5. |
+| `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. (There is no P3.) |
+| `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
 | `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. |
+| `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
+| `expectedTenant` | string | `""` | The tenant this gateway serves, bound as `tenant`. **Required (non-empty) whenever P5 is required.** |
+| `expectedEnvironment` | string | `""` | The environment this gateway serves, bound as `env`. **Required (non-empty) whenever P5 is required.** |
 | `mode` | `monitor`\|`block` | `monitor` | Evaluate and log only, vs. actually deny on a failed required predicate. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a block-mode denial is rendered. A request that can't be confidently parsed as a single, non-batch JSON-RPC call with an echoable id always falls back to `empty-403` regardless of this setting — echoing an untrustworthy id risks exposing a protected value. A notification (no id) always gets an empty HTTP 202. |
 | `resultHeader` | string | `x-approval-binding` | Header stamped with the verdict (`allowed`, `would-deny;predicate=P2`, `denied;predicate=P5`) — never the approval or argument values themselves. |
@@ -129,10 +146,30 @@ The approval envelope shape (header or rpc-param, identical either way):
   },
   "attestations": [
     {"claim": "approval", "authority": "approver.example", "mac": "<hmac-sha256-hex>"}
-  ],
-  "dereferenced": {"blob://plan-v1": "<sha256-hex-of-dereferenced-bytes>"}
+  ]
 }
 ```
+
+**The P5 `mac` is an HMAC-SHA256 over a versioned, domain-separated `mcp-v1` payload** — not over
+the raw scope. The payload is the canonical (RFC 8785 JCS) JSON of:
+```json
+{
+  "v": "mcp-v1",
+  "iss": "<attesting authority = attestation.authority>",
+  "aud": "<expectedAudience>",
+  "tenant": "<expectedTenant>",
+  "env": "<expectedEnvironment>",
+  "sub": "<the executor identity, from verified auth>",
+  "action": "<approval.scope.action>",
+  "arguments_digest": "<approval.scope.arguments_digest>",
+  "not_after": "<approval.not_after>",
+  "nonce": "<approval.nonce>"
+}
+```
+Binding `aud`/`tenant`/`env` into the signed payload is what stops an approval minted for one
+gateway, tenant, or environment from being replayed against another; binding `sub` is what makes
+P5 a *separate*-attester check (the attesting authority must differ from the executor). Mutating any
+of these protected claims after the MAC is computed causes P5 to fail.
 
 ```yaml
 - policyRef:
@@ -142,11 +179,14 @@ The approval envelope shape (header or rpc-param, identical either way):
     approvalHeader: x-approval
     approvalRpcField: approvalBinding
     executorHeader: client_id
-    requiredPredicates: [P1, P2, P3, P4, P5]
+    requiredPredicates: [P1, P2, P4, P5]
     attesterKeys:
       - kid: approver.example
-        key: "<shared-secret>"
+        key: "<shared-secret-at-least-32-bytes>"
     clockSkewSeconds: 60
+    expectedAudience: mcp-gateway-prod
+    expectedTenant: acme
+    expectedEnvironment: prod
     mode: block
     onDeny: rpc-error
     resultHeader: x-approval-binding
@@ -170,18 +210,28 @@ structured warning above and, in `block` mode, still denied.
 ### Honesty boundaries
 
 Further honest limitations, disclosed rather than hidden:
-- **Symmetric HMAC, not PKI.** `attesterKeys` holds shared secrets and P5 verifies an HMAC-SHA256
-  over the canonicalized approval scope — mirroring the ABV reference checker's keyed-digest
-  attestation model. A production PKI deployment would instead verify asymmetric signatures against
-  a JWKS; this build implements only the symmetric form.
+- **Symmetric HMAC, not PKI — separation-of-duties, not non-repudiation.** `attesterKeys` holds
+  shared secrets and P5 verifies an HMAC-SHA256 over the canonicalized versioned `mcp-v1` payload
+  (not the raw scope). Because the verifying gateway holds the same secret it verifies against, this
+  is a **separation-of-duties** control (the attester differs from the executor), **not**
+  non-repudiation in the cryptographic sense — the gateway could in principle have minted the MAC
+  itself. A production PKI deployment would instead verify asymmetric signatures against a JWKS;
+  this build implements only the symmetric form. Keys shorter than 32 bytes are rejected at startup.
 - **`approvalSource: sidecar` is not implemented.** Fetching the approval record from an external
   attestation service is out of scope for this build. Selecting it fails policy startup with a
   clear error rather than silently no-op-ing, so a misconfiguration can't be mistaken for an armed
   binding.
-- **P6's nonce store is in-process, not distributed.** It is a single gateway worker's bounded
-  (FIFO-evicted at 100,000 entries), in-memory set — reused-nonce detection does not span multiple
-  gateway workers/replicas, and a restart clears it. A multi-replica deployment needing durable P6
-  needs an external nonce store; this build does not provide one.
+- **P6 uses gateway data storage `local()`, which is per-replica and has no TTL control.** P6
+  reserves the nonce atomically via the gateway's data-storage API (`store(&nonce,
+  &StoreMode::Absent, ...)`): the first reservation succeeds and the call is allowed; a second
+  reservation of the same nonce returns a CAS mismatch and the call is denied under P6; any other
+  storage error **fails closed** (deny). The reservation happens only in **block** mode — monitor
+  mode never reserves. But `local()` storage is **per-replica** and its durability across a gateway
+  **restart** is runtime-defined: a replayed approval can slip through on a second replica or after
+  a restart. A horizontally-scaled deployment needing durable, global P6 must swap `local()` for a
+  shared/remote store. The cross-replica / restart / storage-unavailable behaviours can only be
+  proven on a real gateway — that end-to-end validation is handed to Astra
+  (`docs/ASTRA-TASK-approval-p6-replay.md`).
 - **No `.on_response()` handler, by design.** Unlike the sibling MCP Honeytoken Tripwire, this
   filter registers only an `on_request` handler. PDK's `DualFilter` re-runs a configured response
   handler even over a request filter's own `Flow::Break` early reply, and a response handler that
@@ -202,14 +252,13 @@ Further honest limitations, disclosed rather than hidden:
   "at"; this policy instead binds P4 to real wall-clock time (`chrono::Utc::now()`), so its freshness
   tests use dynamically computed `not_after` values instead of replaying a vector that would now
   always read as expired.
-- **`dereferenced` is a novel config-surface concept invented for this implementation.** ABV's
-  neutral record shape doesn't include a caller-supplied blob-digest map — a real gateway has no
-  blob store to dereference `$ref` URIs itself. This policy's approval envelope therefore carries an
-  optional `dereferenced: {"<uri>": "<sha256-hex>", ...}` map, which the caller populates with the
-  digest of the content each reference resolves to; P3 fails closed with "unresolvable reference" if
-  a `$ref` has no matching entry. The gateway verifies a digest match against what the execution
-  context presents for that reference — it does not, and cannot, fetch or independently re-resolve
-  the reference itself.
+- **Reference-shaped arguments are rejected, not dereferenced.** An earlier draft carried a P3
+  predicate that verified the bytes behind a `$ref`-shaped argument via a caller-supplied
+  `dereferenced` digest map. That asked the gateway to trust a caller-populated blob map it cannot
+  itself resolve. This build removes P3 entirely: any argument object carrying a `$ref` key (at any
+  depth) is **rejected under P2** — the approved and executed argument bytes must match directly.
+  (A `$ref` appearing only as a *string value* is fine; it is a `$ref`-shaped *object* that is
+  rejected.)
 - **A sound record checked by the party it constrains proves nothing without P5.** P5's
   separate-attester requirement exists precisely because a record whose only witness that it was
   approved is the executor itself is not evidence of anything beyond the executor's own say-so —
@@ -217,16 +266,26 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/lib.rs`'s `#[cfg(test)] mod test` (48 tests, run via `cargo +1.89.0 test --lib`) covers all six
-predicates via the vendored ABV vectors (`tests/fixtures/abv/`) plus hand-authored edge cases:
-config validation (empty/unknown predicates and enum values, `sidecar` rejection, duplicate/blank
-attester kids), malformed/oversized/batch/notification JSON-RPC framing, monitor-vs-block behavior,
-the rpc-param approval source, PDK policy-violation registration on both block-mode denials and
-monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial)
-denial of a batch containing an unauthorized call, the content-type/content-encoding header-phase
-admission gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking,
-in both the JSON-RPC body and the approval header), a numeric-overflow literal that fails closed
-deterministically without panicking, and the ambiguous-duplicate-`id` containment rule. `tests/requests.rs`
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **46 tests**, run via
+`cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
+(`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
+and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
+rejection**, **`expectedAudience` required when P5 is required**), malformed/oversized/batch/
+notification JSON-RPC framing, monitor-vs-block behavior, the rpc-param approval source, **non-
+`tools/call` methods forwarded as out-of-scope** (never blocked), **`$ref`-shaped arguments rejected
+under P2** (top-level, nested, `$ref`+extra keys) while a `$ref` string *value* is allowed,
+**versioned canonical-JSON digests** (a float or non-integer number fails closed; `null` vs `{}` vs
+`[]` vs a scalar all produce distinct digests), **P5 authenticated over the `mcp-v1` payload** (each
+protected claim, when mutated, flips to deny; kid rotation), **the executor read from verified
+`AuthenticationData`** (an injected verified subject wins over a spoofed header; absent-and-P5-
+required fails closed), **atomic single-use via data storage** (first allow, replay denied under P6,
+monitor mode does not reserve), PDK policy-violation registration on both block-mode denials and
+monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial) denial
+of a batch containing an unauthorized call, the content-type/content-encoding header-phase admission
+gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking, in both the
+JSON-RPC body and the approval header), a numeric-overflow literal that fails closed deterministically
+without panicking, the ambiguous-duplicate-`id` containment rule, and a corpus self-consistency check
+that deserializes every `tests/fixtures/abv/*.json` vector. `tests/requests.rs`
 adds a small Docker/`pdk_test` end-to-end suite (sound-approval-reaches-upstream,
 action-mismatch-denied-and-never-reaches-upstream) — deliberately smaller than Tripwire's
 integration suite, since this policy's threat model ("is this record proof of this execution") is
