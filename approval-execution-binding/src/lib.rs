@@ -723,9 +723,18 @@ impl Binding {
         // vacuous, so reject it at configure time (fail closed).
         if required.contains(Predicate::P5) {
             for (label, value) in [
-                ("expectedAudience", config.expected_audience.trim()),
-                ("expectedTenant", config.expected_tenant.trim()),
-                ("expectedEnvironment", config.expected_environment.trim()),
+                (
+                    "expectedAudience",
+                    config.expected_audience.as_deref().unwrap_or("").trim(),
+                ),
+                (
+                    "expectedTenant",
+                    config.expected_tenant.as_deref().unwrap_or("").trim(),
+                ),
+                (
+                    "expectedEnvironment",
+                    config.expected_environment.as_deref().unwrap_or("").trim(),
+                ),
             ] {
                 if value.is_empty() {
                     return Err(anyhow!(
@@ -755,9 +764,9 @@ impl Binding {
             executor_header: config.executor_header.clone(),
             required,
             attester_keys,
-            expected_audience: config.expected_audience.clone(),
-            expected_tenant: config.expected_tenant.clone(),
-            expected_environment: config.expected_environment.clone(),
+            expected_audience: config.expected_audience.clone().unwrap_or_default(),
+            expected_tenant: config.expected_tenant.clone().unwrap_or_default(),
+            expected_environment: config.expected_environment.clone().unwrap_or_default(),
             clock_skew_seconds: config.clock_skew_seconds,
             block,
             deny_with_rpc_error,
