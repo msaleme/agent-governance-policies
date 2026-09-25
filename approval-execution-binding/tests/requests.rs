@@ -8,13 +8,21 @@
 // gateway-level framing/buffering/timeout behavior (its threat model is about
 // bytes arriving at all) — none of that is specific to approval binding, whose
 // threat model is "is this record proof of this execution," already covered
-// exhaustively by the 25+ `#[cfg(test)]` unit tests in `src/lib.rs` (driven by
-// the vendored ABV vectors plus hand-written edge cases) using the in-process
+// exhaustively by the `#[cfg(test)]` unit tests in `src/test.rs` (driven by the
+// vendored ABV vectors plus hand-written edge cases) using the in-process
 // `pdk_unit` harness. This file adds only what a unit-test harness cannot
 // exercise: the request actually traveling through a real Flex Gateway
-// container to a real upstream, end to end, in both an allow and a block-mode
-// deny path. It intentionally does not repeat the unit tests' predicate-by-
+// container to a real upstream, end to end, in an allow (P1+P2) and a block-mode
+// P1-deny path. It intentionally does not repeat the unit tests' predicate-by-
 // predicate coverage.
+//
+// SCOPE: these two e2e tests exercise ONLY P1 (action) and P2 (canonical
+// argument match) — the predicates that need no external prerequisite. P5
+// (separate-attester mcp-v1 MAC over the versioned payload) requires a verified
+// AuthenticationData subject from an upstream identity policy, and P6 (atomic
+// single-use) requires gateway data storage; both are exercised by the in-
+// process unit tests, and their FULL end-to-end validation on a real Flex
+// container is handed off to Astra — see `docs/ASTRA-TASK-approval-p6-replay.md`.
 //
 // Running this suite requires Docker and a working `pdk-test` runtime image
 // pull, and was not part of the mandated `cargo test --lib` verification gate
@@ -75,38 +83,6 @@ fn compute_digest(value: &serde_json::Value) -> String {
         .collect()
 }
 
-fn compute_mac(key: &str, scope: &serde_json::Value) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    fn canonical(value: &serde_json::Value) -> String {
-        match value {
-            serde_json::Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let members: Vec<String> = keys
-                    .into_iter()
-                    .map(|k| {
-                        format!(
-                            "{}:{}",
-                            serde_json::to_string(k).unwrap(),
-                            canonical(&map[k])
-                        )
-                    })
-                    .collect();
-                format!("{{{}}}", members.join(","))
-            }
-            other => serde_json::to_string(other).unwrap(),
-        }
-    }
-    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
-    mac.update(&canonical(scope).into_bytes());
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 fn approval_policy_config(required_predicates: &[&str]) -> serde_json::Value {
     serde_json::json!({
         "approvalSource": "header",
@@ -114,8 +90,14 @@ fn approval_policy_config(required_predicates: &[&str]) -> serde_json::Value {
         "approvalRpcField": "approvalBinding",
         "executorHeader": "client_id",
         "requiredPredicates": required_predicates,
-        "attesterKeys": [{"kid": "approver.example", "key": "abv/approver"}],
+        "attesterKeys": [],
         "clockSkewSeconds": 60,
+        // Non-empty placeholders: from_config only enforces non-empty when P5 is
+        // required (these e2e tests bind P1+P2 only), but the GCL marks them
+        // required, so a real instance always carries them.
+        "expectedAudience": "e2e-gateway",
+        "expectedTenant": "e2e-tenant",
+        "expectedEnvironment": "e2e",
         "mode": "block",
         "onDeny": "rpc-error",
         "resultHeader": "x-approval-binding"
@@ -131,7 +113,7 @@ async fn sound_approval_reaches_the_real_upstream_end_to_end() -> anyhow::Result
         .build();
     let policy_config = PolicyConfig::builder()
         .name(POLICY_NAME)
-        .configuration(approval_policy_config(&["P1", "P2", "P5"]))
+        .configuration(approval_policy_config(&["P1", "P2"]))
         .build();
     let api_config = ApiConfig::builder()
         .name("myApi")
@@ -170,14 +152,8 @@ async fn sound_approval_reaches_the_real_upstream_end_to_end() -> anyhow::Result
 
     let arguments = serde_json::json!({"confirm": true});
     let digest = compute_digest(&arguments);
-    let mac = compute_mac(
-        "abv/approver",
-        &serde_json::json!({"action": "deploy.apply", "arguments_digest": digest}),
-    );
     let envelope = serde_json::json!({
-        "approval": {"scope": {"action": "deploy.apply", "arguments_digest": digest}, "nonce": "e2e-1"},
-        "attestations": [{"claim": "approval", "authority": "approver.example", "mac": mac}],
-        "dereferenced": {}
+        "approval": {"scope": {"action": "deploy.apply", "arguments_digest": digest}, "nonce": "e2e-1"}
     });
 
     let client = reqwest::Client::builder()
@@ -211,7 +187,7 @@ async fn action_mismatch_is_denied_end_to_end_and_never_reaches_upstream() -> an
         .build();
     let policy_config = PolicyConfig::builder()
         .name(POLICY_NAME)
-        .configuration(approval_policy_config(&["P1", "P2", "P5"]))
+        .configuration(approval_policy_config(&["P1", "P2"]))
         .build();
     let api_config = ApiConfig::builder()
         .name("myApi")
@@ -250,15 +226,9 @@ async fn action_mismatch_is_denied_end_to_end_and_never_reaches_upstream() -> an
 
     let arguments = serde_json::json!({"confirm": true});
     let digest = compute_digest(&arguments);
-    let mac = compute_mac(
-        "abv/approver",
-        &serde_json::json!({"action": "deploy.apply", "arguments_digest": digest}),
-    );
     // Approved deploy.apply; executes deploy.destroy — a real P1 violation.
     let envelope = serde_json::json!({
-        "approval": {"scope": {"action": "deploy.apply", "arguments_digest": digest}, "nonce": "e2e-2"},
-        "attestations": [{"claim": "approval", "authority": "approver.example", "mac": mac}],
-        "dereferenced": {}
+        "approval": {"scope": {"action": "deploy.apply", "arguments_digest": digest}, "nonce": "e2e-2"}
     });
 
     let client = reqwest::Client::builder()
