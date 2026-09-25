@@ -21,7 +21,7 @@ policy; deployment is gateway- and environment-specific.
 
 | Policy | Customer problem it answers | Available behavior |
 | --- | --- | --- |
-| [Approval-to-Execution Binding](approval-execution-binding/README.md) | "The agent got approval for one action and executed a different one." | Monitor or block; verify the six ABV predicates against the approval record; deny with a JSON-RPC `-32008` error or empty `403` |
+| [Approval-to-Execution Binding](approval-execution-binding/README.md) | "The agent got approval for one action and executed a different one." | MCP `tools/call` only (other methods pass through); monitor or block; verify five ABV predicates (action, canonical arguments, freshness, separate mcp-v1 attester, opt-in single-use) against the approval record; deny with a JSON-RPC `-32008` error or empty `403` |
 | [Cross-Session Aggregate-Risk Gate](aggregate-risk-gate/README.md) | "Every call passed its per-session cap, but the totals blew past our exposure budget." | Monitor or block; reserve-then-authorize each call against a shared aggregate budget; deny the composing call |
 
 Each policy README defines its configuration, admission rules, protocol behavior,
@@ -81,7 +81,12 @@ fixture.
 
 - **Enforcement, not attestation.** Approval-binding checks an approval *record*;
   a record checked only by the party it constrains proves nothing without the
-  separate-attester predicate. Its P5 attestation is symmetric-HMAC in this build.
+  separate-attester predicate. Its P5 attestation is symmetric-HMAC over a
+  versioned, domain-separated `mcp-v1` payload — separation-of-duties, not
+  non-repudiation. The executor identity P5 checks against is read from verified
+  authentication data, not a caller-asserted header. P6 single-use is enforced
+  atomically via gateway data storage (`local()`, per-replica; see the policy
+  README's honesty boundaries for the cross-replica/restart limits).
 - **Stage A ledger.** The aggregate-risk gate ships a real, atomic, in-process
   reserve-then-authorize ledger, correct under genuine multi-thread contention.
   It is **not** distributed: each gateway worker holds its own independent ledger,

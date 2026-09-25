@@ -6,33 +6,12 @@ metadata:
     title: Approval-to-Execution Binding
     category: Security
     description: >-
-      Verifies that a governed MCP/A2A JSON-RPC execution is the SAME action the
-      accompanying approval record actually approved — not a superficially similar
-      one. An Agent Fabric approval and its execution are almost always separated
-      by time and by hops (a supervising broker approves; a downstream broker
-      executes several calls later), and nothing at the gateway normally proves
-      the two are the same action. This policy closes that gap by checking six
-      independent predicates against the approval record on every governed
-      execution: P1 the approved and executed action/tool match; P2 the approved
-      and executed argument bytes match; P3 where an argument is carried by
-      reference, the dereferenced bytes match what was committed (P3 takes
-      precedence over P2 whenever a reference is involved); P4 the approval is
-      still valid at this instant; P5 the approval was attested by a party other
-      than the one now executing, using a key this gateway recognizes; and P6
-      (opt-in) the approval authorizes at most one execution. Any predicate named
-      in requiredPredicates that fails denies the call; an empty requiredPredicates
-      list is rejected at startup, since a binding that checks nothing is not a
-      binding. Predicate semantics and canonical form follow the Approval Binding
-      Vectors (ABV) v0.1 conformance corpus (github.com/msaleme/approval-binding-vectors)
-      — a protocol-neutral spec for exactly this question, with its own positive
-      controls and negative vectors. Honesty boundary: this corpus (and this
-      policy) tests whether the RECORD proves the executed action is the approved
-      one; it does not and cannot prove that approving the action was itself wise,
-      and P5's separate attester is what keeps the check from being a document an
-      actor wrote about itself. Deploys as an inbound policy on MCP/A2A instances,
-      after mcp-support and access-control, before the call reaches the upstream
-      tool.
+      Binds an MCP tools/call to its approval: same action (P1), same canonical
+      arguments (P2), still fresh (P4), separately attested over a versioned
+      mcp-v1 payload (P5), single-use (P6). Non-tools/call methods pass through
+      untouched.
     metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp
     metadata/interfaceScope: api,resource
 spec:
   extends:
@@ -64,9 +43,9 @@ spec:
         approvalSource=header. The envelope shape is
         {"approval":{"scope":{"action":...,"arguments_digest":...},"authority":...,
         "not_after":...,"nonce":...},"attestations":[{"claim":"approval",
-        "authority":...,"mac":...}],"dereferenced":{"<uri>":"<sha256-hex>",...}} —
-        the ABV v0.1 neutral record's approval/attestations members plus an
-        optional dereferenced-bytes digest map for P3.
+        "authority":...,"mac":...}]}. Reference-shaped arguments ($ref) are not
+        supported and are rejected under P2 — the approved and executed argument
+        bytes must match directly, with no dereferencing step.
     approvalRpcField:
       type: string
       default: approvalBinding
@@ -78,32 +57,38 @@ spec:
       type: string
       default: client_id
       description: >-
-        Header carrying the identity of the party about to execute, as already
-        verified by an upstream identity/auth policy earlier in the chain (this
-        policy trusts the chain's authentication, the same way llm-token-rate-limit
-        elsewhere in this gateway keys its budget off
-        #[attributes.headers['client_id']]). Used only for P5: an approval
-        attested by this same identity is not a separate attestation.
+        Fallback header naming the party about to execute. The executor identity
+        is taken FIRST from the VERIFIED authentication data (client_id, then
+        principal) established by an upstream authentication policy — e.g. OpenID
+        Connect Access Token Enforcement, JWT Validation, or Client ID
+        Enforcement placed before this policy in the chain. This header is used
+        only when no verified subject is present; when P5 is required and there
+        is no verified subject, the call fails closed rather than trusting a
+        caller-asserted header. Used for P5: an approval attested by this same
+        identity is not a separate attestation.
     requiredPredicates:
       type: array
-      default: [P1, P2, P3, P4, P5]
+      default: [P1, P2, P4, P5]
       items:
         type: string
         enum:
           - P1
           - P2
-          - P3
           - P4
           - P5
           - P6
       description: >-
         Predicates that MUST hold for the execution to be allowed; any that
         fails denies the call in block mode (or logs a would-deny verdict in
-        monitor mode). P6 (single use) is a profile choice, not a universal
-        rule — reusable approvals are legitimate in some flows — so it defaults
-        out of the required set; opt in only when the customer's flow is
-        single-use. An empty list is rejected at startup: a binding that
-        requires nothing is not a binding.
+        monitor mode). P1 action match; P2 canonical argument-byte match
+        ($ref-shaped arguments are rejected, not dereferenced); P4 freshness;
+        P5 a separate attester's HMAC over the versioned mcp-v1 payload; P6
+        (opt-in) single use, enforced atomically via gateway data storage in
+        block mode only. P6 is a profile choice, not a universal rule — reusable
+        approvals are legitimate in some flows — so it defaults out of the
+        required set; opt in only when the customer's flow is single-use. An
+        empty list is rejected at startup: a binding that requires nothing is
+        not a binding.
     attesterKeys:
       type: array
       default: []
@@ -114,19 +99,22 @@ spec:
             type: string
           key:
             type: string
+            characteristics:
+              - security:sensitive
         required:
           - kid
           - key
       description: >-
-        Known attester keys for verifying the P5 attestation MAC over the
-        approval scope: kid is the attesting authority's identifier (must differ
-        from the executor for P5 to hold), key is the shared secret this gateway
-        holds for that authority. This mirrors the ABV reference checker's
-        keyed-digest (HMAC-SHA256) attestation model. In a production PKI
-        deployment attesterKeys would instead reference a JWKS of the attesters'
-        public keys and verify asymmetric signatures; this build implements only
-        the symmetric shared-secret form. An attestation from an authority not
-        listed here always fails P5.
+        Known attester keys for verifying the P5 attestation HMAC-SHA256 over the
+        versioned mcp-v1 payload: kid is the attesting authority's identifier
+        (must differ from the executor for P5 to hold), key is the shared secret
+        this gateway holds for that authority. Keys must be at least 32 bytes;
+        a shorter key is rejected at startup. In a production PKI deployment
+        attesterKeys would instead reference a JWKS of the attesters' public keys
+        and verify asymmetric signatures; this build implements only the
+        symmetric shared-secret form. An attestation from an authority not listed
+        here always fails P5. HMAC provides separation-of-duties, not
+        non-repudiation.
     clockSkewSeconds:
       type: integer
       default: 60
@@ -136,6 +124,29 @@ spec:
         own wall-clock time at the instant of the request — never a
         caller-supplied timestamp, since a caller-supplied execution instant
         would let the executing party grade its own freshness check.
+    expectedAudience:
+      type: string
+      default: ""
+      description: >-
+        This gateway's deployment audience, bound into the P5 mcp-v1 payload as
+        `aud`. An approval MAC computed for a different audience will not verify,
+        preventing an attestation minted for one gateway from being replayed at
+        another. Required (non-empty) whenever P5 is in requiredPredicates.
+    expectedTenant:
+      type: string
+      default: ""
+      description: >-
+        The tenant this gateway serves, bound into the P5 mcp-v1 payload as
+        `tenant`, so an approval minted for one tenant cannot be replayed against
+        another. Required (non-empty) whenever P5 is in requiredPredicates.
+    expectedEnvironment:
+      type: string
+      default: ""
+      description: >-
+        The environment this gateway serves (e.g. prod), bound into the P5
+        mcp-v1 payload as `env`, so an approval minted in one environment cannot
+        be replayed in another. Required (non-empty) whenever P5 is in
+        requiredPredicates.
     mode:
       type: string
       default: monitor
@@ -186,6 +197,9 @@ spec:
     - requiredPredicates
     - attesterKeys
     - clockSkewSeconds
+    - expectedAudience
+    - expectedTenant
+    - expectedEnvironment
     - mode
     - onDeny
     - resultHeader

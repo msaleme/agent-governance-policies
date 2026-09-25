@@ -9,13 +9,17 @@ publication are included.
 
 ### Added
 
-- **Approval-to-Execution Binding** — enforces the six `approval-binding-vectors`
-  (ABV v0.1) predicates (P1 action, P2 argument bytes, P3 dereferenced-reference
-  bytes, P4 valid-at-execution, P5 separate attester, P6 single-use nonce) on
-  admitted MCP/A2A JSON-RPC. Vendors the 12-vector ABV corpus (3 positive controls
-  + 9 negative predicate cases) as conformance fixtures. Monitor and block modes;
-  JSON-RPC `-32008` or empty-`403` denial rendering. Real HMAC-SHA256 attestation
-  (P5) over the canonicalized approval scope and real wall-clock freshness (P4).
+- **Approval-to-Execution Binding** — enforces five `approval-binding-vectors`
+  (ABV v0.1) predicates (P1 action, P2 canonical argument bytes — reference-shaped
+  `$ref` arguments rejected, not dereferenced; P4 valid-at-execution, P5 separate
+  attester, P6 opt-in single-use nonce) on admitted MCP **`tools/call`** requests;
+  every other JSON-RPC method is forwarded untouched as out-of-scope. (An earlier
+  draft's P3 dereference predicate was removed in favor of rejecting reference-shaped
+  arguments under P2.) Vendors the ABV corpus as conformance fixtures. Monitor and
+  block modes; JSON-RPC `-32008` or empty-`403` denial rendering. Real HMAC-SHA256
+  P5 attestation over a versioned, domain-separated `mcp-v1` payload (checked against
+  the *verified* executor identity, not a caller-asserted header), real wall-clock P4
+  freshness, and atomic P6 single-use via gateway data storage (`StoreMode::Absent`).
 - **Cross-Session Aggregate-Risk Gate** — a reserve-then-authorize decision engine
   (`ledger.rs`) that holds a shared exposure budget across sessions where each call
   is individually under its cap. PDK-independent engine, unit-tested under genuine
@@ -36,9 +40,13 @@ publication are included.
 
 ### Known limitations
 
-- Approval-binding P5 attestation is symmetric HMAC in this build; the `sidecar`
-  approval source is rejected at startup. A record checked only by the party it
-  constrains is not meaningful without the separate-attester predicate.
+- Approval-binding P5 attestation is symmetric HMAC in this build (separation-of-
+  duties, not non-repudiation); the `sidecar` approval source is rejected at startup.
+  A record checked only by the party it constrains is not meaningful without the
+  separate-attester predicate. P6's single-use nonce store uses gateway `local()`
+  storage, which is per-replica and has no policy-controlled TTL; durable, global
+  single-use across replicas/restarts requires a shared store and is validated
+  end-to-end separately (`approval-execution-binding/docs/ASTRA-TASK-approval-p6-replay.md`).
 - The aggregate-risk gate ships the Stage A in-process ledger only: per-worker
   (not distributed) state, `window` accepted but not time-enforced, `ledgerEndpoint`
   reserved and unimplemented, and no cryptographic non-repudiation of decisions.
