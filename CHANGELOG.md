@@ -47,6 +47,18 @@ publication are included.
   which blocked schema generation and Exchange publication (issue #21). Verified
   locally via `pdk policy-project build-asset-files`; re-confirm on a live Exchange
   publish.
+- **Approval-to-Execution Binding** — `make build` now regenerates
+  `src/generated/config.rs` identically to the checked-in file (issue #24). The
+  `expectedAudience`/`expectedTenant`/`expectedEnvironment` properties were listed as
+  schema-`required` while also carrying `default: ""`, so `config-gen` emitted them
+  without the `#[serde(default)]` (and in a different field order) than the committed
+  file relied on — the standard build was not reproducible. These fields are
+  conditionally required (non-empty only when `P5` is in `requiredPredicates`, enforced
+  at configure time in `lib.rs`), not always-present, so they are removed from the
+  schema `required` list; `config-gen` now emits them as `Option<String>` and the two
+  read sites treat `None` as empty. Verified reproducible: a second `config-gen` run
+  yields no diff, and the full gate (fmt/clippy/lib+integration tests/release wasm)
+  is green.
 
 ### Known limitations
 

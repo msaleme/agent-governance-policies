@@ -18,14 +18,14 @@ pub struct Config {
     pub attester_keys: Vec<AttesterKeys0Config>,
     #[serde(alias = "clockSkewSeconds")]
     pub clock_skew_seconds: i64,
-    #[serde(default, alias = "expectedAudience")]
-    pub expected_audience: String,
-    #[serde(default, alias = "expectedEnvironment")]
-    pub expected_environment: String,
-    #[serde(default, alias = "expectedTenant")]
-    pub expected_tenant: String,
     #[serde(alias = "executorHeader")]
     pub executor_header: String,
+    #[serde(alias = "expectedAudience")]
+    pub expected_audience: Option<String>,
+    #[serde(alias = "expectedEnvironment")]
+    pub expected_environment: Option<String>,
+    #[serde(alias = "expectedTenant")]
+    pub expected_tenant: Option<String>,
     #[serde(alias = "mode")]
     pub mode: String,
     #[serde(alias = "onDeny")]

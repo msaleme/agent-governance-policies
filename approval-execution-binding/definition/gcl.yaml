@@ -198,9 +198,6 @@ spec:
     - requiredPredicates
     - attesterKeys
     - clockSkewSeconds
-    - expectedAudience
-    - expectedTenant
-    - expectedEnvironment
     - mode
     - onDeny
     - resultHeader
