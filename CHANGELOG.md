@@ -69,6 +69,15 @@ publication are included.
   storage, which is per-replica and has no policy-controlled TTL; durable, global
   single-use across replicas/restarts requires a shared store and is validated
   end-to-end separately (`approval-execution-binding/docs/ASTRA-TASK-approval-p6-replay.md`).
+  Connected verification recorded two related qualifications (see
+  `approval-execution-binding/docs/`): the P5/P6 enforcement paths were exercised
+  on a real Flex Gateway, but (a) cross-replica single-use is unproven on `local()`
+  by design, and (b) the storage-unavailable "other `Err` → fail closed" branch is
+  defensively correct by inspection yet **not reachably testable on `local()`** — the
+  pinned proxy-wasm SDK panics on unexpected host statuses rather than surfacing them
+  to the policy, so that branch is exercised only with a shared/remote store. A
+  shared/remote store is the single change that would close both: it makes single-use
+  global across replicas and makes the storage-unavailable branch reachable.
 - The aggregate-risk gate ships the Stage A in-process ledger only: per-worker
   (not distributed) state, `window` accepted but not time-enforced, `ledgerEndpoint`
   reserved and unimplemented, and no cryptographic non-repudiation of decisions.
