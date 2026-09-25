@@ -1,0 +1,1285 @@
+{
+  "schema_version": 1,
+  "run_date_utc": "2026-09-25",
+  "overall_disposition": "qualified_partial_verification",
+  "source_commit": "3b7d9090d1dfba63bbd3e568ead7b848f8bd1ccd",
+  "branch": "verification/approval-p6-live-20260925",
+  "runtime_and_gcl_unchanged": true,
+  "original_p1_p2_tests_unchanged": true,
+  "started_at": "2026-09-25T14:36:10.543890+00:00",
+  "finished_at": "2026-09-25T15:17:41.242627+00:00",
+  "artifact": {
+    "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+    "definition": {
+      "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+      "assetId": "approval-binding-live-20260925-dev",
+      "version": "0.0.1-20260925144221",
+      "type": "policy",
+      "confirm_get_status": 200
+    },
+    "implementation": {
+      "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+      "assetId": "approval-binding-live-20260925-flex-dev",
+      "version": "0.0.1-20260925144221",
+      "type": "policy-implementation",
+      "confirm_get_status": 200
+    },
+    "gateway_image": "mulesoft/flex-gateway:1.14.0",
+    "gateway_image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+    "architecture": "linux/amd64"
+  },
+  "publication": {
+    "cargo_anypoint": "1.10.0",
+    "rust": "1.89.0",
+    "pdk": "1.10.0",
+    "anypoint_cli_pdk_plugin": "1.9.0",
+    "make_build_exit": 0,
+    "make_publish_exit": 0,
+    "standard_publish": {
+      "exit": 0,
+      "finished": "2026-09-25T14:41:14.797700+00:00",
+      "wasm_sha256": "8f360d95df5605050dd12d5fe362c226a7c40f029b308d2c35b3c876fdf3720b",
+      "assets": [
+        {
+          "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+          "assetId": "approval-binding-live-20260925-dev",
+          "version": "0.0.1-20260925143950",
+          "type": "policy",
+          "confirm_get_status": 200
+        },
+        {
+          "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+          "assetId": "approval-binding-live-20260925-flex-dev",
+          "version": "0.0.1-20260925143950",
+          "type": "policy-implementation",
+          "confirm_get_status": 200
+        }
+      ]
+    },
+    "runtime_preserved_publish_exit": 0,
+    "runtime_preservation": {
+      "reason": "config-gen removes checked-in serde(default) on expected identity fields",
+      "make_FLAGS": "git restore --source=HEAD -- src/generated/config.rs &&",
+      "source": "HEAD:approval-execution-binding/src/generated/config.rs"
+    },
+    "sensitive_jsonld_exchange_acceptance": "confirmed",
+    "asset_types_mcp_exchange_acceptance": "confirmed",
+    "generated_config_issue": "https://github.com/msaleme/agent-governance-policies/issues/24",
+    "all_disposable_assets": [
+      {
+        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "assetId": "approval-binding-live-20260925-dev",
+        "version": "0.0.1-20260925143950",
+        "type": "policy",
+        "confirm_get_status": 200
+      },
+      {
+        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "assetId": "approval-binding-live-20260925-flex-dev",
+        "version": "0.0.1-20260925143950",
+        "type": "policy-implementation",
+        "confirm_get_status": 200
+      },
+      {
+        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "assetId": "approval-binding-live-20260925-dev",
+        "version": "0.0.1-20260925144221",
+        "type": "policy",
+        "confirm_get_status": 200
+      },
+      {
+        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "assetId": "approval-binding-live-20260925-flex-dev",
+        "version": "0.0.1-20260925144221",
+        "type": "policy-implementation",
+        "confirm_get_status": 200
+      },
+      {
+        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "assetId": "approval-binding-live-20260925-mcp",
+        "version": "0.0.1",
+        "type": "mcp",
+        "attempted": true,
+        "confirm_get_status": 200
+      }
+    ]
+  },
+  "scope": {
+    "organization_id": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+    "environment_id": "67ebd3a4-afb7-4f6f-be27-3c4a8611be15",
+    "environment": "Sandbox",
+    "api_id": 21197857,
+    "gateway_target_id": "05a29d01-d0b5-4ee3-832b-0381fdacb3cf",
+    "deployment_id": 28449921,
+    "policies": [
+      {
+        "id": 9342473,
+        "assetId": "client-id-enforcement",
+        "order": 1,
+        "create_status": 201
+      },
+      {
+        "id": 9342475,
+        "assetId": "approval-binding-live-20260925-dev",
+        "order": 2,
+        "create_status": 201
+      }
+    ],
+    "required_predicates": [
+      "P1",
+      "P2",
+      "P4",
+      "P5",
+      "P6"
+    ],
+    "mode": "block",
+    "on_deny": "rpc-error",
+    "key_minimum_bytes": 32,
+    "executor_provenance": "Client-ID Enforcement AuthenticationData; x-executor deliberately spoofed",
+    "routing": "Direct selection of each replica, not load-balancer distribution"
+  },
+  "deployment": {
+    "ui_save_apply": {
+      "at": "2026-09-25T15:08:13.853583+00:00",
+      "method": "ui",
+      "api_id": 21197857,
+      "action": "Save & Apply",
+      "observed": "UI deployment-in-progress toast"
+    },
+    "api_observations": [
+      {
+        "at": "2026-09-25T15:07:39.846475+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T14:46:36.621Z"
+      },
+      {
+        "at": "2026-09-25T15:07:42.638756+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T14:46:36.621Z"
+      },
+      {
+        "at": "2026-09-25T15:07:45.438373+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T14:46:36.621Z"
+      },
+      {
+        "at": "2026-09-25T15:07:48.288828+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T14:46:36.621Z"
+      },
+      {
+        "at": "2026-09-25T15:07:50.952769+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T14:46:36.621Z"
+      },
+      {
+        "at": "2026-09-25T15:07:53.573472+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:52.304Z"
+      },
+      {
+        "at": "2026-09-25T15:07:56.564738+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:07:59.393257+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:02.067945+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:04.871725+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:07.613679+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:10.114075+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:12.801394+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:15.276980+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:17.780573+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:20.563904+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:23.145527+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:25.821247+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:28.592564+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:31.160314+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:33.788966+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:36.477370+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:39.451641+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:41.946182+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:44.501527+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:47.022085+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:49.547352+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:52.086467+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:54.611513+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:57.170934+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:08:59.627265+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:02.263245+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:04.904425+00:00",
+        "http_status": 200,
+        "api_status": "active",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:07.654167+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:10.139821+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:12.938028+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:15.430612+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:17.967871+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:20.445191+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:23.709561+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:26.186591+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:28.666663+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:31.247313+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:33.769616+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      },
+      {
+        "at": "2026-09-25T15:09:36.229652+00:00",
+        "http_status": 200,
+        "api_status": "inactive",
+        "deployment_updated_date": "2026-09-25T15:07:53.460Z"
+      }
+    ],
+    "updating_api_status_observed": false,
+    "qualification": "UI displayed deployment-in-progress; API polling observed active before and after, not the short updating transition. Timestamp changed and applied status plus loaded runtime config/hash were independently confirmed."
+  },
+  "brief_cases": [
+    {
+      "number": 1,
+      "disposition": "passed",
+      "evidence": "Final cases 101/102: one total upstream hit; replay P6 denied."
+    },
+    {
+      "number": 2,
+      "disposition": "qualified_known_limitation",
+      "evidence": "Same approval forwarded after restart; one post-restart hit. No independent memory-pressure eviction or reschedule test."
+    },
+    {
+      "number": 3,
+      "disposition": "qualified_partial",
+      "evidence": "Second replica accepts same nonce; repeat there is P6-denied. Shared/remote remedy confirmed in documentation only, not run with this immutable local-store artifact."
+    },
+    {
+      "number": 4,
+      "disposition": "not_run",
+      "evidence": "Build hardcodes local(); no detachable store backend or supported hostcall-failure injection identified. Stopping gateway does not prove this policy error branch."
+    },
+    {
+      "number": 5,
+      "disposition": "passed",
+      "evidence": "Real upstream auth plus independent attester allows; self-attester and spoofed subject P5 deny with zero backend hits."
+    }
+  ],
+  "cases": [
+    {
+      "at": "2026-09-25T15:12:48.197897+00:00",
+      "backend_hits": 1,
+      "case": "p5_separate_attester_verified_subject",
+      "disposition": "forwarded",
+      "expected": "allow",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "",
+      "rpc_error_code": null,
+      "policy_violation_count": null
+    },
+    {
+      "at": "2026-09-25T15:12:48.217004+00:00",
+      "backend_hits": 0,
+      "case": "p6_same_replica_replay",
+      "disposition": "denied",
+      "expected": "P6",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "denied;predicate=P6",
+      "rpc_error_code": -32008,
+      "policy_violation_count": null
+    },
+    {
+      "at": "2026-09-25T15:12:48.224629+00:00",
+      "backend_hits": 1,
+      "case": "p6_second_replica_replay_known_limitation",
+      "disposition": "forwarded",
+      "expected": "allow",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "",
+      "rpc_error_code": null,
+      "policy_violation_count": null
+    },
+    {
+      "at": "2026-09-25T15:12:48.238286+00:00",
+      "backend_hits": 0,
+      "case": "p6_second_replica_repeat",
+      "disposition": "denied",
+      "expected": "P6",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "denied;predicate=P6",
+      "rpc_error_code": -32008,
+      "policy_violation_count": null
+    },
+    {
+      "at": "2026-09-25T15:12:48.252136+00:00",
+      "backend_hits": 0,
+      "case": "p5_self_attestation",
+      "disposition": "denied",
+      "expected": "P5",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "denied;predicate=P5",
+      "rpc_error_code": -32008,
+      "policy_violation_count": null
+    },
+    {
+      "at": "2026-09-25T15:12:48.256242+00:00",
+      "backend_hits": 0,
+      "case": "p5_spoofed_header_subject",
+      "disposition": "denied",
+      "expected": "P5",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "denied;predicate=P5",
+      "rpc_error_code": -32008,
+      "policy_violation_count": null
+    },
+    {
+      "at": "2026-09-25T15:14:36.394277+00:00",
+      "backend_hits": 1,
+      "case": "p6_restart_replay_known_limitation",
+      "disposition": "forwarded",
+      "expected": "allow",
+      "http_status": 200,
+      "matched_expectation": true,
+      "result_header": "",
+      "rpc_error_code": null,
+      "policy_violation_count": null
+    }
+  ],
+  "attempts": [
+    {
+      "exit": 101,
+      "started": "2026-09-25T14:46:20.743196+00:00",
+      "finished": "2026-09-25T15:08:26.010872+00:00",
+      "case_count": 6,
+      "cases": [
+        {
+          "at": "2026-09-25T15:08:17.105672+00:00",
+          "backend_hits": 1,
+          "case": "p5_separate_attester_verified_subject",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        },
+        {
+          "at": "2026-09-25T15:08:17.134528+00:00",
+          "backend_hits": 0,
+          "case": "p6_same_replica_replay",
+          "disposition": "denied",
+          "expected": "P6",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P6",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:08:17.148672+00:00",
+          "backend_hits": 1,
+          "case": "p6_second_replica_replay_known_limitation",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        },
+        {
+          "at": "2026-09-25T15:08:17.168263+00:00",
+          "backend_hits": 0,
+          "case": "p6_second_replica_repeat",
+          "disposition": "denied",
+          "expected": "P6",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P6",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:08:17.180606+00:00",
+          "backend_hits": 0,
+          "case": "p5_self_attestation",
+          "disposition": "denied",
+          "expected": "P5",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P5",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:08:17.185266+00:00",
+          "backend_hits": 0,
+          "case": "p5_spoofed_header_subject",
+          "disposition": "denied",
+          "expected": "P5",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P5",
+          "rpc_error_code": -32008
+        }
+      ],
+      "qualification": "Harness flexctl startup race after restart; no policy failure observed."
+    },
+    {
+      "started_at": "2026-09-25T15:09:13.941820+00:00",
+      "finished_at": "2026-09-25T15:10:45.576611+00:00",
+      "exit_code": 0,
+      "case_count": 7,
+      "cases": [
+        {
+          "at": "2026-09-25T15:10:22.824475+00:00",
+          "backend_hits": 1,
+          "case": "p5_separate_attester_verified_subject",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        },
+        {
+          "at": "2026-09-25T15:10:22.847088+00:00",
+          "backend_hits": 0,
+          "case": "p6_same_replica_replay",
+          "disposition": "denied",
+          "expected": "P6",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P6",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:10:22.853706+00:00",
+          "backend_hits": 1,
+          "case": "p6_second_replica_replay_known_limitation",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        },
+        {
+          "at": "2026-09-25T15:10:22.870731+00:00",
+          "backend_hits": 0,
+          "case": "p6_second_replica_repeat",
+          "disposition": "denied",
+          "expected": "P6",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P6",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:10:22.879242+00:00",
+          "backend_hits": 0,
+          "case": "p5_self_attestation",
+          "disposition": "denied",
+          "expected": "P5",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P5",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:10:22.884565+00:00",
+          "backend_hits": 0,
+          "case": "p5_spoofed_header_subject",
+          "disposition": "denied",
+          "expected": "P5",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P5",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:10:41.264795+00:00",
+          "backend_hits": 1,
+          "case": "p6_restart_replay_known_limitation",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        }
+      ],
+      "qualification": "No telemetry drain; passing wire evidence."
+    },
+    {
+      "started_at": "2026-09-25T15:11:37.517883+00:00",
+      "finished_at": "2026-09-25T15:16:11.042754+00:00",
+      "exit_code": 0,
+      "case_count": 7,
+      "cases": [
+        {
+          "at": "2026-09-25T15:12:48.197897+00:00",
+          "backend_hits": 1,
+          "case": "p5_separate_attester_verified_subject",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        },
+        {
+          "at": "2026-09-25T15:12:48.217004+00:00",
+          "backend_hits": 0,
+          "case": "p6_same_replica_replay",
+          "disposition": "denied",
+          "expected": "P6",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P6",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:12:48.224629+00:00",
+          "backend_hits": 1,
+          "case": "p6_second_replica_replay_known_limitation",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        },
+        {
+          "at": "2026-09-25T15:12:48.238286+00:00",
+          "backend_hits": 0,
+          "case": "p6_second_replica_repeat",
+          "disposition": "denied",
+          "expected": "P6",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P6",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:12:48.252136+00:00",
+          "backend_hits": 0,
+          "case": "p5_self_attestation",
+          "disposition": "denied",
+          "expected": "P5",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P5",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:12:48.256242+00:00",
+          "backend_hits": 0,
+          "case": "p5_spoofed_header_subject",
+          "disposition": "denied",
+          "expected": "P5",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "denied;predicate=P5",
+          "rpc_error_code": -32008
+        },
+        {
+          "at": "2026-09-25T15:14:36.394277+00:00",
+          "backend_hits": 1,
+          "case": "p6_restart_replay_known_limitation",
+          "disposition": "forwarded",
+          "expected": "allow",
+          "http_status": 200,
+          "matched_expectation": true,
+          "result_header": "",
+          "rpc_error_code": null
+        }
+      ],
+      "qualification": "Final run with 90-second drains before restart and teardown."
+    }
+  ],
+  "lifecycle": [
+    {
+      "at": "2026-09-25T14:46:30.555192+00:00",
+      "event": "replicas_started",
+      "replicas": {
+        "approval-replica-b": {
+          "id": "d61c22800591",
+          "started_at": "2026-09-25T14:46:22.821768097Z",
+          "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+          "network_ids": [
+            "pdk-test-network"
+          ]
+        },
+        "approval-replica-a": {
+          "id": "257e86dbc16c",
+          "started_at": "2026-09-25T14:46:22.821389514Z",
+          "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+          "network_ids": [
+            "pdk-test-network"
+          ]
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T14:46:37.578626+00:00",
+      "event": "deployment_created",
+      "http_status": 201,
+      "id": 28449921,
+      "target_id": "05a29d01-d0b5-4ee3-832b-0381fdacb3cf"
+    },
+    {
+      "at": "2026-09-25T15:08:14.969989+00:00",
+      "event": "deployment_applied",
+      "http_status": 200,
+      "before_updated_date": "2026-09-25T14:46:36.621Z",
+      "after_updated_date": "2026-09-25T15:07:53.460Z",
+      "deployment_status": "applied",
+      "api_status": "active",
+      "method": "ui"
+    },
+    {
+      "at": "2026-09-25T15:08:15.932086+00:00",
+      "event": "runtime_verified",
+      "container_id": "d61c22800591",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:08:16.662197+00:00",
+      "event": "runtime_verified",
+      "container_id": "257e86dbc16c",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:08:16.902939+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:08:17.075709+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:08:21.347563+00:00",
+      "event": "replica_restarted",
+      "container_id": "257e86dbc16c",
+      "before_started_at": "2026-09-25T14:46:22.821389514Z",
+      "after_started_at": "2026-09-25T15:08:20.946089304Z"
+    },
+    {
+      "at": "2026-09-25T15:09:23.799224+00:00",
+      "event": "replicas_started",
+      "replicas": {
+        "approval-replica-b": {
+          "id": "e1ebcd437e52",
+          "started_at": "2026-09-25T15:09:15.560757552Z",
+          "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+          "network_ids": [
+            "pdk-test-network"
+          ]
+        },
+        "approval-replica-a": {
+          "id": "620e944be3c5",
+          "started_at": "2026-09-25T15:09:15.567754843Z",
+          "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+          "network_ids": [
+            "pdk-test-network"
+          ]
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T15:09:25.983782+00:00",
+      "event": "existing_ui_deployment_reused",
+      "http_status": 200,
+      "deployment_status": "applied",
+      "updated_date": "2026-09-25T15:07:53.460Z",
+      "method": "ui"
+    },
+    {
+      "at": "2026-09-25T15:10:06.759732+00:00",
+      "event": "runtime_verified",
+      "container_id": "e1ebcd437e52",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:10:07.537164+00:00",
+      "event": "runtime_verified",
+      "container_id": "620e944be3c5",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:10:07.627610+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 401
+    },
+    {
+      "at": "2026-09-25T15:10:12.636915+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 401
+    },
+    {
+      "at": "2026-09-25T15:10:17.648208+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 401
+    },
+    {
+      "at": "2026-09-25T15:10:22.705472+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:10:22.795622+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:10:26.582250+00:00",
+      "event": "replica_restarted",
+      "container_id": "620e944be3c5",
+      "before_started_at": "2026-09-25T15:09:15.567754843Z",
+      "after_started_at": "2026-09-25T15:10:26.314971876Z"
+    },
+    {
+      "at": "2026-09-25T15:10:41.098333+00:00",
+      "event": "runtime_verified",
+      "container_id": "620e944be3c5",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:10:41.241192+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:11:49.154422+00:00",
+      "event": "replicas_started",
+      "replicas": {
+        "approval-replica-a": {
+          "id": "c927752cc205",
+          "started_at": "2026-09-25T15:11:41.62925205Z",
+          "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+          "network_ids": [
+            "pdk-test-network"
+          ]
+        },
+        "approval-replica-b": {
+          "id": "728a21635061",
+          "started_at": "2026-09-25T15:11:41.797179175Z",
+          "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+          "network_ids": [
+            "pdk-test-network"
+          ]
+        }
+      }
+    },
+    {
+      "at": "2026-09-25T15:11:52.553005+00:00",
+      "event": "existing_ui_deployment_reused",
+      "http_status": 200,
+      "deployment_status": "applied",
+      "updated_date": "2026-09-25T15:07:53.460Z",
+      "method": "ui"
+    },
+    {
+      "at": "2026-09-25T15:12:32.270225+00:00",
+      "event": "runtime_verified",
+      "container_id": "c927752cc205",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:12:32.931228+00:00",
+      "event": "runtime_verified",
+      "container_id": "728a21635061",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:12:33.014500+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 401
+    },
+    {
+      "at": "2026-09-25T15:12:38.020948+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 401
+    },
+    {
+      "at": "2026-09-25T15:12:43.031384+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 401
+    },
+    {
+      "at": "2026-09-25T15:12:48.076610+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:12:48.165137+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:12:48.514192+00:00",
+      "event": "telemetry_drain_started",
+      "seconds": 90
+    },
+    {
+      "at": "2026-09-25T15:14:18.519623+00:00",
+      "event": "telemetry_drain_completed",
+      "seconds": 90
+    },
+    {
+      "at": "2026-09-25T15:14:22.299548+00:00",
+      "event": "replica_restarted",
+      "container_id": "c927752cc205",
+      "before_started_at": "2026-09-25T15:11:41.62925205Z",
+      "after_started_at": "2026-09-25T15:14:22.032718513Z"
+    },
+    {
+      "at": "2026-09-25T15:14:36.246358+00:00",
+      "event": "runtime_verified",
+      "container_id": "c927752cc205",
+      "configuration_match_on_all_supplied_fields": true,
+      "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+      "ready": true
+    },
+    {
+      "at": "2026-09-25T15:14:36.364597+00:00",
+      "event": "auth_readiness_probe",
+      "http_status": 200
+    },
+    {
+      "at": "2026-09-25T15:14:36.676524+00:00",
+      "event": "telemetry_drain_started",
+      "seconds": 90
+    },
+    {
+      "at": "2026-09-25T15:16:06.682207+00:00",
+      "event": "telemetry_drain_completed",
+      "seconds": 90
+    }
+  ],
+  "monitoring": {
+    "queried_at": "2026-09-25T15:17:04.165413+00:00",
+    "http_status": 200,
+    "dataset": "mulesoft.api.summary",
+    "query": "SELECT timestamp, COUNT(requests), \"api.instance.id\", \"policy.violation.status\", \"policy.id\", \"http.status_code\", \"request.disposition\" FROM \"mulesoft.api.summary\" WHERE \"sub_org.id\" = '4ac1188d-b7b2-469d-9ec5-e68c760bf874' AND \"env.id\" = '67ebd3a4-afb7-4f6f-be27-3c4a8611be15' AND \"api.instance.id\" = '21197857' AND timestamp BETWEEN 1790348820000 AND 1790349423141 GROUP BY \"api.instance.id\", \"policy.violation.status\", \"policy.id\", \"http.status_code\", \"request.disposition\" TIMESERIES",
+    "rows": [
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 2,
+        "request.disposition": "PROCESSED",
+        "timestamp": 1790348880000
+      },
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 2,
+        "request.disposition": "PROCESSED",
+        "timestamp": 1790349000000
+      },
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 4,
+        "request.disposition": "PROCESSED",
+        "timestamp": 1790349180000
+      },
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 2,
+        "request.disposition": "PROCESSED",
+        "timestamp": 1790349300000
+      },
+      {
+        "http.status_code": "401",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 3,
+        "policy.id": "9342473",
+        "policy.violation.status": "Violation",
+        "request.disposition": "BLOCKED",
+        "timestamp": 1790349180000
+      },
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 1,
+        "policy.id": "9342475",
+        "policy.violation.status": "Violation",
+        "request.disposition": "BLOCKED",
+        "timestamp": 1790348880000
+      },
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 1,
+        "policy.id": "9342475",
+        "policy.violation.status": "Violation",
+        "request.disposition": "BLOCKED",
+        "timestamp": 1790349000000
+      },
+      {
+        "http.status_code": "200",
+        "api.instance.id": "21197857",
+        "COUNT(requests)": 4,
+        "policy.id": "9342475",
+        "policy.violation.status": "Violation",
+        "request.disposition": "BLOCKED",
+        "timestamp": 1790349180000
+      }
+    ],
+    "next": null,
+    "violation_count": 9,
+    "final_attempt_window_epoch_ms": [
+      1790349097517,
+      1790349371042
+    ],
+    "final_attempt_approval_violation_count": 4,
+    "per_case_policy_violation_counts": null,
+    "qualification": "Export-time minute aggregation cannot separate individual P5 and P6 probes in the same bucket; timestamps are not exact probe times. Earlier attempts lost some telemetry during immediate restart/teardown. Readiness 401s belong to the auth policy."
+  },
+  "cleanup": {
+    "started_at": "2026-09-25T15:17:15.128299+00:00",
+    "resources": [
+      {
+        "kind": "contract",
+        "id": 9424071,
+        "at": "2026-09-25T15:17:19.082065+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "api",
+        "id": 21197857,
+        "at": "2026-09-25T15:17:21.395501+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "deployment",
+        "id": 28449921,
+        "at": "2026-09-25T15:17:21.761178+00:00",
+        "delete_status": "parent_api_deleted",
+        "confirmation_status": 404
+      },
+      {
+        "kind": "policy",
+        "id": 9342473,
+        "at": "2026-09-25T15:17:22.016615+00:00",
+        "delete_status": "parent_api_deleted",
+        "confirmation_status": 404
+      },
+      {
+        "kind": "policy",
+        "id": 9342475,
+        "at": "2026-09-25T15:17:22.294881+00:00",
+        "delete_status": "parent_api_deleted",
+        "confirmation_status": 404
+      },
+      {
+        "kind": "client_application",
+        "id": 188951179,
+        "at": "2026-09-25T15:17:23.865288+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "exchange_policy-implementation",
+        "id": "approval-binding-live-20260925-flex-dev/0.0.1-20260925143950",
+        "at": "2026-09-25T15:17:25.877423+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "exchange_policy-implementation",
+        "id": "approval-binding-live-20260925-flex-dev/0.0.1-20260925144221",
+        "at": "2026-09-25T15:17:29.815304+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "exchange_policy",
+        "id": "approval-binding-live-20260925-dev/0.0.1-20260925143950",
+        "at": "2026-09-25T15:17:31.730813+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "exchange_policy",
+        "id": "approval-binding-live-20260925-dev/0.0.1-20260925144221",
+        "at": "2026-09-25T15:17:34.756656+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "exchange_mcp",
+        "id": "approval-binding-live-20260925-mcp/0.0.1",
+        "at": "2026-09-25T15:17:37.955251+00:00",
+        "delete_status": 204,
+        "confirmation_status": 404
+      },
+      {
+        "kind": "replica_containers",
+        "id": [
+          "257e86dbc16c",
+          "620e944be3c5",
+          "728a21635061",
+          "c927752cc205",
+          "d61c22800591",
+          "e1ebcd437e52"
+        ],
+        "at": "2026-09-25T15:17:38.320057+00:00",
+        "delete_status": "pdk_teardown",
+        "confirmation_status": "absent"
+      },
+      {
+        "kind": "backend_containers",
+        "id": "CreatedBy=pdk-test",
+        "at": "2026-09-25T15:17:38.356886+00:00",
+        "delete_status": "pdk_teardown",
+        "confirmation_status": "absent"
+      },
+      {
+        "kind": "docker_network",
+        "id": "pdk-test-network",
+        "at": "2026-09-25T15:17:38.389742+00:00",
+        "delete_status": "pdk_teardown",
+        "confirmation_status": "absent"
+      },
+      {
+        "kind": "registration",
+        "id": "05a29d01-d0b5-4ee3-832b-0381fdacb3cf",
+        "at": "2026-09-25T15:17:40.596866+00:00",
+        "delete_status": "flexctl_exit_0",
+        "confirmation_status": "delete_command_succeeded"
+      }
+    ],
+    "gateway_inventory": {
+      "at": "2026-09-25T15:17:41.242597+00:00",
+      "matching_target_count": 1,
+      "states": [
+        {
+          "status": "DELETED"
+        }
+      ]
+    },
+    "finished_at": "2026-09-25T15:17:41.242627+00:00",
+    "private_material": {
+      "at": "2026-09-25T15:18:41.548576+00:00",
+      "credential_scan": "passed",
+      "identity_fixture_configuration_logs_and_screenshots_removed": true,
+      "pdk_container_logs_removed": true
+    }
+  },
+  "limitations": [
+    "No live proof of global reservations on shared/remote storage.",
+    "No live proof of storage-error fail-closed.",
+    "No claim of exact per-case monitoring attribution; wire and backend observations are per-case.",
+    "API polling missed updating; actual UI action and deployment timestamp/loaded artifact were captured."
+  ],
+  "references": [
+    "https://docs.mulesoft.com/pdk/latest/policies-pdk-configure-features-data-storage"
+  ]
+}
