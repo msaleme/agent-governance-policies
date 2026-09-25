@@ -84,7 +84,9 @@ Record results as a committed pair, mirroring `agent-decoy-policies/docs/evidenc
 
 Open a PR from a fresh topic branch off `origin/main` with: the evidence doc + JSON on a
 real gateway for the brief's cases (or issues filed for any that don't hold), all disposable
-resources deleted and confirmed, CI (`policies` + GitGuardian) green, and the two
-publish-time items (cargo-anypoint 1.10.0 `make package`; GCL `security:sensitive` /
-`assetTypes: mcp` acceptance) either confirmed or recorded as still-pending. Do not merge to
-this public repo without the maintainer's explicit go.
+resources deleted and confirmed, CI (`policies` + GitGuardian) green, and the publish-time
+items (`make build`/`make publish` under cargo-anypoint 1.10.0; GCL `assetTypes: mcp`
+acceptance on a real Exchange publish) either confirmed or recorded as still-pending. The GCL
+sensitive-key syntax that first blocked the run (issue #21) is **fixed and locally verified** —
+`build-asset-files` now generates `schema.json` — but re-confirm it on a live Exchange publish.
+Do not merge to this public repo without the maintainer's explicit go.

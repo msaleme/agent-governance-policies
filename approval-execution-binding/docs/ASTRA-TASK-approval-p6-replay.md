@@ -125,11 +125,31 @@ hold), with all disposable resources deleted and deletion confirmed; the two pub
 items either confirmed or recorded as still-pending. Open a PR from a fresh topic branch; do
 **not** merge to this public repo without the maintainer's explicit go.
 
-## Publish-time items to verify on a real toolchain (not verifiable offline here)
+## Publish-time items
 
-- **`cargo-anypoint@1.10.0`** is pinned in both `Makefile`s (line 83) but was **not** exercised
-  offline on this machine — confirm `make package` succeeds with 1.10.0 before publishing.
-- **GCL `characteristics: [security:sensitive]` on `attesterKeys[].key`** and
-  **`metadata/capabilities/assetTypes: mcp`** are prescribed by the reviewer but have **no
-  in-repo precedent**; the CI gate does not lint the GCL, so these are **publish-time
-  unverified**. Confirm Exchange/Anypoint accepts them when the policy is published.
+- **GCL sensitive-key syntax — FIXED (issue #21), locally verified.** The reviewer's #1
+  sensitive-key marker was first written as a bare `characteristics: [security:sensitive]`,
+  which PDK's GCL→JSON-Schema compiler rejects (`strict mode: unknown keyword:
+  "characteristics"`) and which therefore blocked the whole connected run. It is now the
+  doc-supported JSON-LD form on `attesterKeys[].key`:
+  ```yaml
+  key:
+    type: string
+    "@context":
+      "@characteristics":
+        - "security:sensitive"
+  ```
+  Verified locally with `anypoint-cli-v4 pdk policy-project build-asset-files`:
+  `target/definition/schema.json` now generates and preserves the marker (no bare
+  `characteristics` leaks). **Re-confirm on a real Exchange publish** — the local check
+  proves the same ajv strict-mode step that Exchange runs, but only a live publish proves
+  Exchange acceptance end to end.
+- **Build/publish targets.** There is no `make package` target (an earlier draft of this brief
+  said so — corrected). The real chain is **`make build`** (→ `build-asset-files`, the step
+  that generates and validates the schema above) then **`make publish`/`make release`**.
+  `cargo-anypoint` is pinned to **1.10.0** in both `Makefile`s; the local check above ran with
+  1.9.0 (which reproduces the identical schema behaviour) — run `make build`/`publish` under
+  1.10.0 on the real toolchain before publishing.
+- **`metadata/capabilities/assetTypes: mcp`** is prescribed by the reviewer but has **no
+  in-repo precedent** and the CI gate does not lint it — confirm Exchange/Anypoint accepts it
+  when the policy is published.
