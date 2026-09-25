@@ -4,32 +4,46 @@
 // Approval-to-Execution Binding — closes the gap between "an action was approved"
 // and "the action that executed is the one that was approved."
 //
-// An Agent Fabric approval and its execution are almost always separated by time
-// and by hops: a supervising broker approves; a downstream broker executes several
-// calls later. Nothing at the gateway normally proves the two are the same action.
-// This policy checks the approval record accompanying a governed MCP/A2A JSON-RPC
-// execution against six independent predicates (P1..P6), each named in the
-// Approval Binding Vectors (ABV) v0.1 conformance corpus
+// Scope: this policy governs **MCP `tools/call`** JSON-RPC requests only. Every
+// other JSON-RPC method is out of scope and is forwarded untouched (stamped
+// `out-of-scope` on the result header) — this filter never attempts to bind an
+// approval to a non-`tools/call` method.
+//
+// An MCP approval and its execution are almost always separated by time and by
+// hops: a supervising broker approves; a downstream broker executes several calls
+// later. Nothing at the gateway normally proves the two are the same tool call.
+// This policy checks the approval record accompanying a governed `tools/call`
+// against five independent predicates, each named in the Approval Binding Vectors
+// (ABV) v0.1 conformance corpus
 // (https://github.com/msaleme/approval-binding-vectors, MIT):
 //
-//   P1  Action        the approval's scope commits to the executed action/tool.
-//   P2  Arguments      the approval's scope commits to the executed argument bytes.
-//   P3  Dereference    a reference-named argument's DEREFERENCED bytes match what
-//                       the approval committed (P3 takes precedence over P2
-//                       whenever a reference is involved).
+//   P1  Action        the approval's scope commits to the executed tool name.
+//   P2  Arguments      the approval's scope commits to the executed argument bytes
+//                       (a full canonical-byte match; referenced/`$ref` arguments
+//                       are not supported and fail closed — see below).
 //   P4  Freshness      the approval is still valid at the instant of execution
 //                       (this gateway's own wall clock, never a caller-supplied one).
-//   P5  Separate       an approval attestation exists, its attester is not the
-//       attester       executing party, its key is recognized, and it verifies
-//                       over the approval scope.
+//   P5  Separate       a versioned, domain-separated approval attestation exists,
+//       attester       its attester is not the executing party, its key is
+//                       recognized, and it authenticates the reconstructed
+//                       `mcp-v1` payload (see `check_separate_attester`).
 //   P6  Single use     (opt-in profile choice) the approval's nonce has not been
-//                       consumed by a prior execution.
+//                       consumed by a prior execution (atomic, via DataStorage).
+//
+// Referenced-argument (`$ref`) handling: a prior build resolved `$ref` argument
+// values against a caller-supplied `dereferenced` map (former "P3"). That gave the
+// executing party influence over what its own arguments were compared against, so
+// it is removed: any `$ref`-shaped object anywhere in the executed arguments now
+// fails closed under P2 ("referenced arguments are not supported").
 //
 // Honesty boundary: this corpus (and this policy) test whether the RECORD proves
 // the executed action is the approved one. Neither proves that approving the
 // action was wise, and a sound record checked by the party it constrains still
 // proves nothing — P5's separate attester is what keeps this from being a
-// document an actor wrote about itself. See README.md for the full boundary.
+// document an actor wrote about itself. P5's HMAC establishes separation of
+// duties and authentication, NOT non-repudiation (a shared symmetric key cannot);
+// an asymmetric JWS/JWKS attestation is the recommended upgrade (not built here).
+// See README.md for the full boundary.
 //
 // Unlike the sibling MCP Honeytoken Tripwire, this filter registers ONLY an
 // `on_request` handler (no `.on_response(...)`). That matters: PDK's `DualFilter`
@@ -51,6 +65,8 @@ mod generated;
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
+use pdk::authentication::{Authentication, AuthenticationHandler};
+use pdk::data_storage::{DataStorage, DataStorageBuilder, DataStorageError, StoreMode};
 use pdk::hl::*;
 use pdk::logger;
 use pdk::policy_violation::PolicyViolations;
@@ -58,9 +74,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::rc::Rc;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::generated::config::Config;
 
@@ -72,11 +86,19 @@ const MCP_BLOCKED_CODE: i64 = -32008;
 /// filter, not an observed cap on bytes Flex buffers before exposing the body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
-/// Bound on the in-process P6 nonce set, so a long-lived worker cannot grow this
-/// unboundedly. Oldest nonces are evicted first (FIFO), which trades a very old
-/// nonce's reuse-detection for bounded memory — a documented limitation, not a
-/// silent one (see README "Honesty boundaries").
-const NONCE_STORE_CAP: usize = 100_000;
+/// Minimum accepted attester-key length (bytes). A shorter shared secret is
+/// rejected at configure time rather than silently accepted — publishability
+/// finding #1. 32 bytes = the HMAC-SHA256 block-equivalent floor for a
+/// meaningful key.
+const MIN_ATTESTER_KEY_BYTES: usize = 32;
+
+/// Version tag for the domain-separated P5 attestation payload. Bumping this is
+/// how a future payload shape stays distinguishable from `mcp-v1` under the same
+/// key (a MAC over one version can never be replayed as another).
+const PAYLOAD_VERSION: &str = "mcp-v1";
+
+/// DataStorage store name for the atomic single-use (P6) nonce reservations.
+const NONCE_STORE_NAME: &str = "approval-nonces";
 
 // ---------------------------------------------------------------------------
 // Predicates
@@ -86,17 +108,15 @@ const NONCE_STORE_CAP: usize = 100_000;
 enum Predicate {
     P1,
     P2,
-    P3,
     P4,
     P5,
     P6,
 }
 
 impl Predicate {
-    const ALL: [Predicate; 6] = [
+    const ALL: [Predicate; 5] = [
         Predicate::P1,
         Predicate::P2,
-        Predicate::P3,
         Predicate::P4,
         Predicate::P5,
         Predicate::P6,
@@ -106,7 +126,6 @@ impl Predicate {
         match self {
             Predicate::P1 => "P1",
             Predicate::P2 => "P2",
-            Predicate::P3 => "P3",
             Predicate::P4 => "P4",
             Predicate::P5 => "P5",
             Predicate::P6 => "P6",
@@ -121,10 +140,9 @@ impl Predicate {
         match self {
             Predicate::P1 => 0,
             Predicate::P2 => 1,
-            Predicate::P3 => 2,
-            Predicate::P4 => 3,
-            Predicate::P5 => 4,
-            Predicate::P6 => 5,
+            Predicate::P4 => 2,
+            Predicate::P5 => 3,
+            Predicate::P6 => 4,
         }
     }
 }
@@ -133,7 +151,7 @@ impl Predicate {
 /// order is always P1..P6, which keeps "the first required predicate" and log
 /// output deterministic (a `HashSet<Predicate>` would not guarantee that).
 #[derive(Clone, Debug, Default)]
-struct PredicateSet([bool; 6]);
+struct PredicateSet([bool; 5]);
 
 impl PredicateSet {
     fn insert(&mut self, predicate: Predicate) {
@@ -151,76 +169,63 @@ impl PredicateSet {
     }
 }
 
-/// When a mismatch could be named as either P2 or P3, name it `natural` if the
-/// operator required that predicate; otherwise fall back to the other one (which
-/// this function is only called when at least one of the two is required for).
-/// The fallback reason says so explicitly rather than silently relabeling.
-fn attribute(natural: Predicate, required: &PredicateSet, reason: String) -> (Predicate, String) {
-    if required.contains(natural) {
-        (natural, reason)
-    } else {
-        let other = if natural == Predicate::P3 {
-            Predicate::P2
-        } else {
-            Predicate::P3
-        };
-        (
-            other,
-            format!(
-                "{reason} (surfaced as {} because {} is not in requiredPredicates)",
-                other.as_str(),
-                natural.as_str()
-            ),
-        )
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Canonical form (JCS-equivalent) and digests
 // ---------------------------------------------------------------------------
 
-/// Approximates RFC 8785 JCS for the JSON shapes this policy handles: objects,
-/// arrays, strings, booleans, null, and integers. Object members are sorted by
-/// key and emitted with compact separators, matching the ABV reference checker's
+/// Versioned canonical form: a fail-closed subset of RFC 8785 JCS covering the
+/// JSON shapes this policy actually needs to hash and MAC — objects, arrays,
+/// strings, booleans, null, and INTEGERS only. Object members are sorted by key
+/// and emitted with compact separators, matching the ABV reference checker's
 /// `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
 ///
-/// Honest limitation: RFC 8785 also specifies an exact ECMA-262 number-to-string
-/// form for non-integer JSON numbers, which this function does not implement —
-/// every value in the ABV corpus and in this policy's own tests is a string,
-/// bool, or integer, so that gap is real but untested here.
-fn canonical_json_string(value: &Value) -> String {
+/// RFC 8785 also specifies an exact ECMA-262 number-to-string form for
+/// non-integer JSON numbers, which this function deliberately does NOT implement.
+/// Rather than emit a form that might disagree with another canonicalizer (and so
+/// silently break byte-equality — the whole guarantee P2/P5 rest on), any
+/// non-integer number FAILS CLOSED with an error. Callers propagate that error
+/// into a malformed/denied verdict.
+fn canonical_json(value: &Value) -> Result<String, String> {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            let members: Vec<String> = keys
-                .into_iter()
-                .map(|key| {
-                    format!(
-                        "{}:{}",
-                        serde_json::to_string(key).unwrap_or_default(),
-                        canonical_json_string(&map[key])
-                    )
-                })
-                .collect();
-            format!("{{{}}}", members.join(","))
+            let mut members: Vec<String> = Vec::with_capacity(keys.len());
+            for key in keys {
+                members.push(format!(
+                    "{}:{}",
+                    serde_json::to_string(key).map_err(|_| "unencodable object key".to_string())?,
+                    canonical_json(&map[key])?
+                ));
+            }
+            Ok(format!("{{{}}}", members.join(",")))
         }
         Value::Array(items) => {
-            let members: Vec<String> = items.iter().map(canonical_json_string).collect();
-            format!("[{}]", members.join(","))
+            let mut members: Vec<String> = Vec::with_capacity(items.len());
+            for item in items {
+                members.push(canonical_json(item)?);
+            }
+            Ok(format!("[{}]", members.join(",")))
         }
-        Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => {
-            serde_json::to_string(value).unwrap_or_default()
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                Ok(n.to_string())
+            } else {
+                Err("non-integer JSON number is not canonicalizable (fail closed)".to_string())
+            }
+        }
+        Value::String(_) | Value::Bool(_) | Value::Null => {
+            serde_json::to_string(value).map_err(|_| "unencodable scalar".to_string())
         }
     }
 }
 
-fn digest_value(value: &Value) -> String {
+fn digest_value(value: &Value) -> Result<String, String> {
     use sha2::Digest;
-    let bytes = canonical_json_string(value).into_bytes();
+    let bytes = canonical_json(value)?.into_bytes();
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
-    hex_encode(&hasher.finalize())
+    Ok(hex_encode(&hasher.finalize()))
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -238,61 +243,33 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// P2 / P3: dereferencing executed arguments
+// P2: argument-byte match (referenced/$ref arguments are not supported)
 // ---------------------------------------------------------------------------
 
-/// Replaces every top-level `{"$ref": uri}` argument value with the SHA-256 hex
-/// digest of the dereferenced bytes, per the `dereferenced` map the caller
-/// supplied (this gateway has no blob store of its own — see README). Returns
-/// an error naming the unresolvable URI if the map does not cover it.
-fn resolve_arguments(
-    args: &Value,
-    dereferenced: &BTreeMap<String, String>,
-) -> Result<Value, String> {
-    let members = match args {
-        Value::Object(map) => map.clone(),
-        Value::Null => serde_json::Map::new(),
-        _ => return Err("executed arguments must be a JSON object".to_string()),
-    };
-    let mut resolved = serde_json::Map::with_capacity(members.len());
-    for (key, value) in members {
-        if let Value::Object(inner) = &value {
-            if let Some(Value::String(uri)) = inner.get("$ref") {
-                match dereferenced.get(uri) {
-                    Some(digest_hex) => {
-                        resolved.insert(key, Value::String(digest_hex.clone()));
-                        continue;
-                    }
-                    None => return Err(format!("unresolvable reference '{uri}'")),
-                }
-            }
-        }
-        resolved.insert(key, value);
-    }
-    Ok(Value::Object(resolved))
-}
-
-fn has_reference(args: &Value) -> bool {
-    match args {
-        Value::Object(map) => map
-            .values()
-            .any(|value| matches!(value, Value::Object(inner) if inner.contains_key("$ref"))),
+/// True if `value` contains, at any depth, a JSON object carrying a `$ref`
+/// member (with or without sibling members). A bare `$ref` STRING VALUE
+/// (e.g. `{"kind": "$ref"}`) is not a reference object and is allowed — only an
+/// object whose own key set includes `"$ref"` is treated as a reference.
+///
+/// Reference-shaped arguments are rejected because resolving them would require
+/// the executing party to supply what its own arguments are compared against,
+/// handing the constrained party influence over its own check (former "P3").
+fn contains_ref_object(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.contains_key("$ref") || map.values().any(contains_ref_object),
+        Value::Array(items) => items.iter().any(contains_ref_object),
         _ => false,
     }
 }
 
-/// P1 (action) and, when required, P2/P3 (arguments / dereferenced bytes).
-/// Ports the precedence rule from the ABV reference checker: when the resolved
-/// digest does not match, first check whether the approval committed the
-/// UNRESOLVED form (a P3-shaped mistake — the commitment was over a reference,
-/// never bound to bytes); otherwise, if the executed arguments carry any
-/// reference at all, the mismatch is P3 (the referenced bytes changed); only a
-/// mismatch with no reference involved is P2.
+/// P1 (action) and, when required, P2 (a full canonical argument-byte match).
+/// No dereferencing: any `$ref`-shaped object anywhere in the executed arguments
+/// fails closed. A non-canonicalizable argument value (e.g. a float) also fails
+/// closed via `digest_value`.
 fn check_action_and_arguments(
     scope: &ApprovalScope,
     executed_action: &str,
     executed_arguments: &Value,
-    dereferenced: &BTreeMap<String, String>,
     required: &PredicateSet,
 ) -> Result<(), (Predicate, String)> {
     if required.contains(Predicate::P1) && executed_action != scope.action {
@@ -305,44 +282,31 @@ fn check_action_and_arguments(
         ));
     }
 
-    if !required.contains(Predicate::P2) && !required.contains(Predicate::P3) {
+    if !required.contains(Predicate::P2) {
         return Ok(());
     }
 
-    let resolved = match resolve_arguments(executed_arguments, dereferenced) {
-        Ok(value) => value,
-        Err(reason) => {
-            return Err(attribute(
-                Predicate::P3,
-                required,
-                format!("unresolvable reference: {reason}"),
-            ));
-        }
-    };
-
-    if digest_value(&resolved) == scope.arguments_digest {
-        return Ok(());
-    }
-
-    if digest_value(executed_arguments) == scope.arguments_digest {
-        return Err(attribute(
-            Predicate::P3,
-            required,
-            "approval committed the reference, not the dereferenced bytes".to_string(),
+    if contains_ref_object(executed_arguments) {
+        return Err((
+            Predicate::P2,
+            "referenced arguments are not supported".to_string(),
         ));
     }
 
-    let natural = if has_reference(executed_arguments) {
-        Predicate::P3
+    let digest = digest_value(executed_arguments).map_err(|reason| {
+        (
+            Predicate::P2,
+            format!("arguments not canonicalizable: {reason}"),
+        )
+    })?;
+    if digest == scope.arguments_digest {
+        Ok(())
     } else {
-        Predicate::P2
-    };
-    let reason = if natural == Predicate::P3 {
-        "referenced bytes at execution are not the approved bytes".to_string()
-    } else {
-        "executed arguments are not the approved arguments".to_string()
-    };
-    Err(attribute(natural, required, reason))
+        Err((
+            Predicate::P2,
+            "executed arguments are not the approved arguments".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,23 +340,73 @@ fn check_freshness(approval: &ApprovalRecord, clock_skew_seconds: i64) -> Result
 // P5: separate attester
 // ---------------------------------------------------------------------------
 
+/// The versioned, domain-separated payload that a P5 attestation authenticates.
+/// Reconstructed identically at verify time from the approval record, this
+/// gateway's configured deployment identity (`aud`/`tenant`/`env`), the attester
+/// kid (`iss`), and the VERIFIED executor subject (`sub`). Binding all of these
+/// under one MAC means an attestation minted for one audience/tenant/env/executor
+/// cannot be replayed against another.
+#[allow(clippy::too_many_arguments)]
+fn mcp_v1_payload(
+    iss: &str,
+    aud: &str,
+    tenant: &str,
+    env: &str,
+    sub: &str,
+    action: &str,
+    arguments_digest: &str,
+    not_after: &str,
+    nonce: &str,
+) -> Value {
+    json!({
+        "v": PAYLOAD_VERSION,
+        "iss": iss,
+        "aud": aud,
+        "tenant": tenant,
+        "env": env,
+        "sub": sub,
+        "action": action,
+        "arguments_digest": arguments_digest,
+        "not_after": not_after,
+        "nonce": nonce,
+    })
+}
+
 /// An approval attestation must exist, its attester must not be the party about
-/// to execute, its key must be one this gateway recognizes, and it must verify
-/// (HMAC-SHA256) over the approval's `scope` — never the full approval, and
-/// never the executed arguments, matching the ABV reference checker exactly.
+/// to execute, its key must be one this gateway recognizes, and it must
+/// authenticate (HMAC-SHA256) the reconstructed `mcp-v1` payload — binding the
+/// approval scope to THIS gateway's audience/tenant/environment and to the
+/// verified executor subject. Requires `not_after` and `nonce` to be present
+/// (they are part of the signed payload).
 ///
 /// This establishes separateness and authentication only. It does not, and
 /// cannot, establish that the attester was ENTITLED to approve this action —
-/// that is a policy question this record cannot answer on its own.
+/// that is a policy question this record cannot answer on its own. The shared
+/// symmetric HMAC gives separation of duties, NOT non-repudiation.
 fn check_separate_attester(
-    scope: &ApprovalScope,
+    approval: &ApprovalRecord,
     attestations: &[Attestation],
     executor: &str,
     attester_keys: &BTreeMap<String, Vec<u8>>,
+    expected_audience: &str,
+    expected_tenant: &str,
+    expected_environment: &str,
 ) -> Result<(), String> {
     if executor.is_empty() {
-        return Err("executor identity header missing; cannot establish separateness".to_string());
+        return Err("executor identity missing; cannot establish separateness".to_string());
     }
+    let not_after = approval
+        .not_after
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "approval has no not_after; cannot authenticate mcp-v1 payload".to_string()
+        })?;
+    let nonce = approval
+        .nonce
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "approval has no nonce; cannot authenticate mcp-v1 payload".to_string())?;
 
     let approval_attestations: Vec<&Attestation> = attestations
         .iter()
@@ -401,12 +415,6 @@ fn check_separate_attester(
     if approval_attestations.is_empty() {
         return Err("no approval attestation".to_string());
     }
-
-    let scope_bytes = canonical_json_string(&json!({
-        "action": scope.action,
-        "arguments_digest": scope.arguments_digest,
-    }))
-    .into_bytes();
 
     for attestation in approval_attestations {
         if attestation.authority == executor {
@@ -418,42 +426,30 @@ fn check_separate_attester(
         let key = attester_keys
             .get(&attestation.authority)
             .ok_or_else(|| format!("unknown attesting authority {}", attestation.authority))?;
+        let payload = mcp_v1_payload(
+            &attestation.authority,
+            expected_audience,
+            expected_tenant,
+            expected_environment,
+            executor,
+            &approval.scope.action,
+            &approval.scope.arguments_digest,
+            not_after,
+            nonce,
+        );
+        let payload_bytes = canonical_json(&payload)
+            .map_err(|reason| format!("mcp-v1 payload not canonicalizable: {reason}"))?
+            .into_bytes();
         let mac_bytes = hex_decode(&attestation.mac)
             .ok_or_else(|| "attestation mac is not valid hex".to_string())?;
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
             .map_err(|_| "invalid attester key length".to_string())?;
-        mac.update(&scope_bytes);
-        mac.verify_slice(&mac_bytes)
-            .map_err(|_| "approval attestation does not verify over the scope".to_string())?;
+        mac.update(&payload_bytes);
+        mac.verify_slice(&mac_bytes).map_err(|_| {
+            "approval attestation does not authenticate the mcp-v1 payload".to_string()
+        })?;
     }
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// P6: single use (real, in-process, bounded — see README honesty boundary)
-// ---------------------------------------------------------------------------
-
-#[derive(Default)]
-struct NonceStore {
-    used: HashSet<String>,
-    order: VecDeque<String>,
-}
-
-impl NonceStore {
-    fn contains(&self, nonce: &str) -> bool {
-        self.used.contains(nonce)
-    }
-
-    fn mark_used(&mut self, nonce: String) {
-        if self.used.insert(nonce.clone()) {
-            self.order.push_back(nonce);
-            while self.order.len() > NONCE_STORE_CAP {
-                if let Some(oldest) = self.order.pop_front() {
-                    self.used.remove(&oldest);
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -489,14 +485,11 @@ struct RawEnvelope {
     approval: Option<ApprovalRecord>,
     #[serde(default)]
     attestations: Vec<Attestation>,
-    #[serde(default)]
-    dereferenced: BTreeMap<String, String>,
 }
 
 struct Envelope {
     approval: ApprovalRecord,
     attestations: Vec<Attestation>,
-    dereferenced: BTreeMap<String, String>,
 }
 
 /// Deserialize JSON while rejecting a duplicate member in any object, at any
@@ -572,8 +565,8 @@ fn declared_body_length(value: Option<String>) -> Option<usize> {
 // JSON-RPC single-call parsing
 // ---------------------------------------------------------------------------
 
-/// A single (non-batch) JSON-RPC 2.0 request, with the executed action and
-/// arguments already extracted (unwrapping `tools/call` if present).
+/// A single (non-batch) MCP `tools/call` JSON-RPC 2.0 request, with the executed
+/// tool name and arguments already extracted from `params`.
 struct JsonRpcCall {
     /// The whole parsed request body, so `approvalSource=rpc-param` can pull a
     /// sibling top-level member out of it.
@@ -585,7 +578,21 @@ struct JsonRpcCall {
     arguments: Value,
 }
 
-fn parse_single_jsonrpc(body: &[u8]) -> Result<JsonRpcCall, String> {
+/// The outcome of parsing one JSON-RPC request against this policy's scope.
+enum ParsedRequest {
+    /// A well-formed `tools/call` — the only method this policy binds.
+    ToolsCall(JsonRpcCall),
+    /// A well-formed JSON-RPC request whose method is not `tools/call`. It is out
+    /// of scope for approval binding and is forwarded untouched.
+    OutOfScope { method: String },
+}
+
+/// Parses a single JSON-RPC 2.0 request. Only `method == "tools/call"` produces a
+/// bindable `ToolsCall`; every other method is `OutOfScope` and forwarded. A
+/// structurally malformed body (bad JSON, batch, missing `jsonrpc`/`method`,
+/// invalid `id` type, or a malformed `tools/call` params shape) still returns
+/// `Err` so the caller fails closed.
+fn parse_single_jsonrpc(body: &[u8]) -> Result<ParsedRequest, String> {
     let root = parse_strict_json(body)?;
     let members = root.as_object().ok_or_else(|| {
         "request body is not a single JSON-RPC object (batches are out of scope for approval binding)"
@@ -604,33 +611,37 @@ fn parse_single_jsonrpc(body: &[u8]) -> Result<JsonRpcCall, String> {
         .and_then(Value::as_str)
         .ok_or_else(|| "missing \"method\" member".to_string())?
         .to_string();
+
+    if method != "tools/call" {
+        return Ok(ParsedRequest::OutOfScope { method });
+    }
+
     let params = members
         .get("params")
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
-
-    let (action, arguments) = if method == "tools/call" {
-        let name = params
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "tools/call is missing params.name".to_string())?
-            .to_string();
-        let call_arguments = params
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| Value::Object(Default::default()));
-        (name, call_arguments)
-    } else {
-        (method, params)
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tools/call is missing params.name".to_string())?
+        .to_string();
+    // `arguments` must be an object or absent; absent means the empty object.
+    // An explicit null, array, or scalar `arguments` is malformed and fails closed.
+    let arguments = match params.get("arguments") {
+        None => Value::Object(Default::default()),
+        Some(Value::Object(map)) => Value::Object(map.clone()),
+        Some(_) => {
+            return Err("tools/call params.arguments must be an object or absent".to_string())
+        }
     };
 
     let id = members.get("id").cloned();
-    Ok(JsonRpcCall {
+    Ok(ParsedRequest::ToolsCall(JsonRpcCall {
         root,
         id,
-        action,
+        action: name,
         arguments,
-    })
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -650,11 +661,13 @@ struct Binding {
     executor_header: String,
     required: PredicateSet,
     attester_keys: BTreeMap<String, Vec<u8>>,
+    expected_audience: String,
+    expected_tenant: String,
+    expected_environment: String,
     clock_skew_seconds: i64,
     block: bool,
     deny_with_rpc_error: bool,
     result_header: String,
-    nonces: Rc<RefCell<NonceStore>>,
 }
 
 impl Binding {
@@ -687,6 +700,13 @@ impl Binding {
             if entry.kid.trim().is_empty() {
                 return Err(anyhow!("attesterKeys entries must have a non-blank kid"));
             }
+            if entry.key.len() < MIN_ATTESTER_KEY_BYTES {
+                return Err(anyhow!(
+                    "attesterKeys entry '{}' has a key shorter than the {}-byte minimum",
+                    entry.kid,
+                    MIN_ATTESTER_KEY_BYTES
+                ));
+            }
             if attester_keys
                 .insert(entry.kid.clone(), entry.key.as_bytes().to_vec())
                 .is_some()
@@ -695,6 +715,23 @@ impl Binding {
                     "attesterKeys must have unique kid values ('{}' repeated)",
                     entry.kid
                 ));
+            }
+        }
+
+        // When P5 is required, the mcp-v1 payload binds this gateway's deployment
+        // identity — an empty audience/tenant/environment would make that binding
+        // vacuous, so reject it at configure time (fail closed).
+        if required.contains(Predicate::P5) {
+            for (label, value) in [
+                ("expectedAudience", config.expected_audience.trim()),
+                ("expectedTenant", config.expected_tenant.trim()),
+                ("expectedEnvironment", config.expected_environment.trim()),
+            ] {
+                if value.is_empty() {
+                    return Err(anyhow!(
+                        "{label} must be non-empty when P5 is in requiredPredicates"
+                    ));
+                }
             }
         }
 
@@ -718,11 +755,13 @@ impl Binding {
             executor_header: config.executor_header.clone(),
             required,
             attester_keys,
+            expected_audience: config.expected_audience.clone(),
+            expected_tenant: config.expected_tenant.clone(),
+            expected_environment: config.expected_environment.clone(),
             clock_skew_seconds: config.clock_skew_seconds,
             block,
             deny_with_rpc_error,
             result_header: config.result_header.clone(),
-            nonces: Rc::new(RefCell::new(NonceStore::default())),
         })
     }
 }
@@ -752,7 +791,6 @@ fn extract_envelope(
     Ok(Envelope {
         approval,
         attestations: raw_envelope.attestations,
-        dereferenced: raw_envelope.dereferenced,
     })
 }
 
@@ -769,16 +807,25 @@ enum Verdict {
 }
 
 /// Evaluates every predicate the operator required, in the fixed order
-/// P5, P6, P1/P2/P3, P4 — separate attester first (an unattested approval makes
+/// P5, P6, P1/P2, P4 — separate attester first (an unattested approval makes
 /// every later comparison a comparison against something nobody stands behind),
-/// then single-use, then action/arguments, then freshness. Does not mark the
-/// nonce used; the caller does that only once the request is actually allowed
-/// through (or, in monitor mode, forwarded).
+/// then single-use presence, then action/arguments, then freshness.
+///
+/// P6 here is PRESENCE-only: it confirms the approval carries a non-empty nonce.
+/// The atomic single-use RESERVATION happens in `request_filter` against
+/// DataStorage, and only once the request is actually being forwarded — a denied
+/// attempt must never burn a legitimate future execution's single use.
+///
+/// `executor_verified` reports whether `executor` came from verified
+/// authentication data (see #6). When P5 is required, an unverified executor
+/// fails closed under P5: the signed `sub` must equal a subject this gateway
+/// actually authenticated, never a caller-asserted header.
 fn evaluate(
     binding: &Binding,
     call: &JsonRpcCall,
     envelope: Result<Envelope, String>,
     executor: &str,
+    executor_verified: bool,
 ) -> Verdict {
     let envelope = match envelope {
         Ok(envelope) => envelope,
@@ -793,11 +840,22 @@ fn evaluate(
     };
 
     if binding.required.contains(Predicate::P5) {
+        if !executor_verified {
+            return Verdict::Deny {
+                predicate: Some(Predicate::P5),
+                reason: "executor identity is not from verified authentication; \
+                         cannot bind the signed subject (P5 fails closed)"
+                    .to_string(),
+            };
+        }
         if let Err(reason) = check_separate_attester(
-            &envelope.approval.scope,
+            &envelope.approval,
             &envelope.attestations,
             executor,
             &binding.attester_keys,
+            &binding.expected_audience,
+            &binding.expected_tenant,
+            &binding.expected_environment,
         ) {
             return Verdict::Deny {
                 predicate: Some(Predicate::P5),
@@ -808,14 +866,7 @@ fn evaluate(
 
     if binding.required.contains(Predicate::P6) {
         match envelope.approval.nonce.as_deref() {
-            Some(nonce) if !nonce.is_empty() => {
-                if binding.nonces.borrow().contains(nonce) {
-                    return Verdict::Deny {
-                        predicate: Some(Predicate::P6),
-                        reason: format!("approval nonce '{nonce}' already used"),
-                    };
-                }
-            }
+            Some(nonce) if !nonce.is_empty() => {}
             _ => {
                 return Verdict::Deny {
                     predicate: Some(Predicate::P6),
@@ -825,15 +876,11 @@ fn evaluate(
         }
     }
 
-    if binding.required.contains(Predicate::P1)
-        || binding.required.contains(Predicate::P2)
-        || binding.required.contains(Predicate::P3)
-    {
+    if binding.required.contains(Predicate::P1) || binding.required.contains(Predicate::P2) {
         if let Err((predicate, reason)) = check_action_and_arguments(
             &envelope.approval.scope,
             &call.action,
             &call.arguments,
-            &envelope.dereferenced,
             &binding.required,
         ) {
             return Verdict::Deny {
@@ -902,18 +949,53 @@ fn notification_denial(result_header: &str, tag: &str) -> Response {
     Response::new(202).with_headers([(result_header.to_string(), tag.to_string())])
 }
 
+/// Renders the correct block-mode denial for a `label`, given the request's
+/// `id`: a notification (`None`) → 202; an in-band rpc-error (when configured and
+/// an id exists) → 200 JSON-RPC error; otherwise → empty 403. Centralizes the
+/// id-echo containment rule so every block-mode denial path (predicate failure
+/// AND the P6 replay reservation) renders it identically.
+fn render_denial(binding: &Binding, id: Option<Value>, label: &str) -> Response {
+    let tag = format!("denied;predicate={label}");
+    match id {
+        None => notification_denial(&binding.result_header, &tag),
+        Some(id) if binding.deny_with_rpc_error => {
+            rpc_error_denial(&binding.result_header, &tag, id, label)
+        }
+        Some(_) => empty_denial(&binding.result_header, &tag),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Request filter
 // ---------------------------------------------------------------------------
 
-async fn request_filter(
+async fn request_filter<S: DataStorage>(
     request_state: RequestState,
+    auth: Authentication,
     binding: &Binding,
     violations: &PolicyViolations,
+    store: &S,
 ) -> Flow<()> {
     let headers_state = request_state.into_headers_state().await;
     let handler = headers_state.handler();
-    let executor = handler.header(&binding.executor_header).unwrap_or_default();
+
+    // Executor identity: prefer VERIFIED authentication data (client_id, then
+    // principal) established by an upstream authentication policy. Only when no
+    // verified subject is present do we fall back to the caller-asserted header,
+    // flagged unverified — a P5-required binding fails closed on that (see
+    // `evaluate`). This is finding #6: never let the constrained party name
+    // itself for the signed `sub`.
+    let (executor, executor_verified) = match auth
+        .authentication()
+        .and_then(|data| data.client_id.or(data.principal))
+        .filter(|subject| !subject.is_empty())
+    {
+        Some(subject) => (subject, true),
+        None => (
+            handler.header(&binding.executor_header).unwrap_or_default(),
+            false,
+        ),
+    };
     let header_value = handler.header(&binding.approval_header);
 
     if !headers_state.contains_body() {
@@ -926,6 +1008,7 @@ async fn request_filter(
         return if binding.block {
             Flow::Break(empty_denial(&binding.result_header, &tag))
         } else {
+            handler.set_header(&binding.result_header, "monitor;predicate=malformed");
             Flow::Continue(())
         };
     }
@@ -957,6 +1040,7 @@ async fn request_filter(
                 "denied;predicate=malformed",
             ))
         } else {
+            handler.set_header(&binding.result_header, "monitor;predicate=malformed");
             Flow::Continue(())
         };
     }
@@ -972,6 +1056,7 @@ async fn request_filter(
                 "denied;predicate=malformed",
             ))
         } else {
+            handler.set_header(&binding.result_header, "monitor;predicate=malformed");
             Flow::Continue(())
         };
     }
@@ -992,12 +1077,28 @@ async fn request_filter(
                 "denied;predicate=malformed",
             ))
         } else {
+            handler.set_header(&binding.result_header, "monitor;predicate=malformed");
             Flow::Continue(())
         };
     }
 
     let call = match parse_single_jsonrpc(&body) {
-        Ok(call) => call,
+        Ok(ParsedRequest::ToolsCall(call)) => call,
+        Ok(ParsedRequest::OutOfScope { method }) => {
+            // Not a tools/call — out of scope for approval binding. Forward
+            // untouched in BOTH modes, stamped so downstream can see the policy
+            // ran and deliberately did not bind this method.
+            logger::info!(
+                "{}",
+                json!({
+                    "event": "approval_execution_binding",
+                    "action": "out-of-scope",
+                    "method": method,
+                })
+            );
+            handler.set_header(&binding.result_header, "out-of-scope");
+            return Flow::Continue(());
+        }
         Err(reason) => {
             log_verdict("deny", None, &reason);
             return if binding.block {
@@ -1013,19 +1114,44 @@ async fn request_filter(
     };
 
     let envelope = extract_envelope(binding, header_value, &call);
-    let verdict = evaluate(binding, &call, envelope, &executor);
+    // Capture the signed nonce (if any) BEFORE the envelope is moved into
+    // `evaluate`; it is the DataStorage reservation key on the allowed path.
+    let reserved_nonce = envelope
+        .as_ref()
+        .ok()
+        .and_then(|env| env.approval.nonce.clone())
+        .filter(|nonce| !nonce.is_empty());
+    let verdict = evaluate(binding, &call, envelope, &executor, executor_verified);
 
     match verdict {
         Verdict::Allow => {
-            if binding.required.contains(Predicate::P6) {
-                // Only mark the nonce used once the call is actually going
-                // through — a denied attempt must not burn a legitimate
-                // future execution's single use.
-                if let Ok(envelope) =
-                    extract_envelope(binding, handler.header(&binding.approval_header), &call)
-                {
-                    if let Some(nonce) = envelope.approval.nonce {
-                        binding.nonces.borrow_mut().mark_used(nonce);
+            // Atomic single-use (P6): reserve the nonce key in DataStorage with
+            // Absent semantics, but ONLY in block mode and ONLY once the request
+            // is actually being forwarded. Monitor mode never consumes a nonce.
+            if binding.block && binding.required.contains(Predicate::P6) {
+                if let Some(nonce) = reserved_nonce {
+                    match store.store(&nonce, &StoreMode::Absent, &1u8).await {
+                        Ok(()) => {}
+                        Err(DataStorageError::CasMismatch) => {
+                            log_verdict(
+                                "deny",
+                                Some(Predicate::P6),
+                                "approval nonce already reserved (single-use replay)",
+                            );
+                            violations.generate_policy_violation();
+                            return Flow::Break(render_denial(binding, call.id.clone(), "P6"));
+                        }
+                        Err(_) => {
+                            // Storage unavailable or any other error → fail closed:
+                            // we cannot prove single use, so we do not forward.
+                            log_verdict(
+                                "deny",
+                                Some(Predicate::P6),
+                                "single-use nonce store unavailable; failing closed",
+                            );
+                            violations.generate_policy_violation();
+                            return Flow::Break(render_denial(binding, call.id.clone(), "P6"));
+                        }
                     }
                 }
             }
@@ -1050,14 +1176,7 @@ async fn request_filter(
                 );
                 return Flow::Continue(());
             }
-            let tag = format!("denied;predicate={label}");
-            match call.id {
-                None => Flow::Break(notification_denial(&binding.result_header, &tag)),
-                Some(id) if binding.deny_with_rpc_error => {
-                    Flow::Break(rpc_error_denial(&binding.result_header, &tag, id, label))
-                }
-                Some(_) => Flow::Break(empty_denial(&binding.result_header, &tag)),
-            }
+            Flow::Break(render_denial(binding, call.id, label))
         }
     }
 }
@@ -1067,6 +1186,7 @@ async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
     violations: PolicyViolations,
+    store_builder: DataStorageBuilder,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -1089,1325 +1209,13 @@ async fn configure(
         if binding.block { "block" } else { "monitor" }
     );
 
-    let filter = on_request(|rs| request_filter(rs, &binding, &violations));
+    let store = store_builder.local(NONCE_STORE_NAME);
+    let filter = on_request(|rs, auth: Authentication| {
+        request_filter(rs, auth, &binding, &violations, &store)
+    });
     launcher.launch(filter).await?;
     Ok(())
 }
 
 #[cfg(test)]
-mod test {
-    use super::*;
-    use pdk_unit::{
-        TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder,
-    };
-    use std::rc::Rc;
-
-    // -----------------------------------------------------------------
-    // Config helpers
-    // -----------------------------------------------------------------
-
-    fn attester(kid: &str, key: &str) -> Value {
-        json!({"kid": kid, "key": key})
-    }
-
-    fn config_with(overrides: Value) -> String {
-        let mut base = json!({
-            "approvalSource": "header",
-            "approvalHeader": "x-approval",
-            "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id",
-            "requiredPredicates": ["P1", "P2", "P3", "P5", "P6"],
-            "attesterKeys": [
-                attester("approver.example", "abv/approver"),
-                attester("executor.example", "abv/executor")
-            ],
-            "clockSkewSeconds": 60,
-            "mode": "block",
-            "onDeny": "rpc-error",
-            "resultHeader": "x-approval-binding"
-        });
-        for (key, value) in overrides.as_object().expect("overrides must be an object") {
-            base[key] = value.clone();
-        }
-        base.to_string()
-    }
-
-    fn block_config() -> String {
-        config_with(json!({}))
-    }
-
-    fn monitor_config() -> String {
-        config_with(json!({"mode": "monitor"}))
-    }
-
-    // -----------------------------------------------------------------
-    // Envelope / request builders — mirror the ABV neutral record shape
-    // -----------------------------------------------------------------
-
-    fn approval_envelope(
-        action: &str,
-        arguments_digest: &str,
-        not_after: &str,
-        nonce: &str,
-        attestations: Value,
-        dereferenced: Value,
-    ) -> Value {
-        json!({
-            "approval": {
-                "scope": {"action": action, "arguments_digest": arguments_digest},
-                "authority": "approver.example",
-                "not_after": not_after,
-                "nonce": nonce
-            },
-            "attestations": attestations,
-            "dereferenced": dereferenced
-        })
-    }
-
-    fn jsonrpc_call(id: i64, action: &str, arguments: Value) -> Value {
-        json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": "tools/call",
-            "params": {"name": action, "arguments": arguments}
-        })
-    }
-
-    fn request_with(envelope: &Value, executor: &str, body: &Value) -> UnitHttpRequest {
-        let body_text = body.to_string();
-        UnitHttpRequest::post()
-            .with_header("content-type", "application/json")
-            .with_header("content-length", body_text.len().to_string())
-            .with_header("x-approval", envelope.to_string())
-            .with_header("client_id", executor)
-            .with_body(body_text)
-    }
-
-    fn ok_backend(_req: UnitHttpRequest) -> UnitHttpResponse {
-        UnitHttpResponse::new(200)
-            .with_header("content-type", "application/json")
-            .with_body(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}")
-    }
-
-    fn far_future() -> String {
-        (chrono::Utc::now() + chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    }
-
-    fn far_past() -> String {
-        (chrono::Utc::now() - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-    }
-
-    // -----------------------------------------------------------------
-    // Fixture-vector driven tests: CTRL-* must ALLOW, NEG-P{1,2,3,5,6}-*
-    // must DENY for exactly the predicate they negate. P4 is excluded
-    // from these vectors' requiredPredicates (see module doc below) —
-    // ABV's vectors encode fixed calendar timestamps meant for a checker
-    // that trusts a record-supplied "at"; this policy instead binds P4 to
-    // real wall-clock time, so it is tested separately with dynamically
-    // computed timestamps (see the P4 tests further down). Testing P4
-    // against a byte-for-byte-replayed 2026-09-19 vector from "today"
-    // would either always fail (correctly, but for the wrong reason) or
-    // require trusting a caller-supplied clock — exactly what P4 exists
-    // to refuse.
-    const CTRL01_DIGEST: &str = "d0d1ec939e9bfcf5975980e0c16531326065562613a192baf9596f2398dc09b4";
-    const CTRL01_MAC: &str = "6497cb9cdddd7ac205938d8d6ab105542563f004ac991dda344343fdbd983f41";
-    const CTRL03_DIGEST: &str = "c59c75a359af15682154442e91943d4a1aeee497ec6aeb5c3a918835d2826821";
-    const CTRL03_MAC: &str = "c404872bf533275f4a9b1babe1cd4564d746d8f7ac519164c275e3792730159c";
-
-    fn vector_config() -> String {
-        config_with(json!({"requiredPredicates": ["P1", "P2", "P3", "P5", "P6"]}))
-    }
-
-    // Real SHA-256 digest of the dereferenced bytes behind `blob://plan-v1`
-    // (`{"target":"prod","replicas":3}`), independently recomputed and
-    // cross-checked against `check.py`'s own reference `BLOBS` fixture.
-    // Every CTRL/allow test below whose executed arguments carry
-    // `{"$ref": "blob://plan-v1"}` must supply this in its `dereferenced`
-    // map — the empty `{}` used in earlier drafts of these tests made P3
-    // fail closed with "unresolvable reference," which an
-    // `onDeny: rpc-error` denial then renders as HTTP 200 with a JSON-RPC
-    // error body. Because that denial shares the same HTTP 200 status as a
-    // genuine allow, a bare `assert_eq!(status_code(), 200)` cannot tell
-    // the two apart — every allow assertion below therefore also checks
-    // that the backend was actually reached and that the body is not a
-    // JSON-RPC error envelope.
-    const PLAN_V1_DIGEST: &str = "3037042beda915ee41ba5727f1899ec4e6941faae90194d6af8fdc3fb104d276";
-
-    #[test]
-    fn ctrl_01_fully_sound_record_is_allowed() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({"blob://plan-v1": PLAN_V1_DIGEST}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-        // Both a genuine allow (ok_backend's response) and an in-band
-        // `onDeny: rpc-error` denial are valid, HTTP-200 JSON bodies, so
-        // parseability alone can't distinguish them. What can: the exact
-        // bytes match ok_backend's own canned response (never this policy's
-        // own -32008 error shape), AND the request is recorded as having
-        // actually reached the upstream.
-        assert_eq!(
-            response.body(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-            "a sound record must return the upstream's own response body, not a policy-generated denial"
-        );
-        assert!(
-            backend.next().is_some(),
-            "a sound record must actually reach the upstream, not just return HTTP 200"
-        );
-    }
-
-    #[test]
-    fn ctrl_02_near_miss_member_reordering_is_still_allowed() {
-        // Same content as CTRL-01, JSON object members emitted in a different
-        // order. Canonicalization must make this indistinguishable.
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = json!({
-            "approval": {
-                "nonce": "n-0001",
-                "not_after": "2026-09-19T12:00:00Z",
-                "authority": "approver.example",
-                "scope": {"arguments_digest": CTRL01_DIGEST, "action": "deploy.apply"}
-            },
-            "attestations": [{"authority": "approver.example", "claim": "approval", "mac": CTRL01_MAC}],
-            "dereferenced": {"blob://plan-v1": PLAN_V1_DIGEST}
-        });
-        let body = json!({
-            "id": 1,
-            "jsonrpc": "2.0",
-            "params": {"arguments": {"confirm": true, "manifest": {"$ref": "blob://plan-v1"}}, "name": "deploy.apply"},
-            "method": "tools/call"
-        });
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-        // Both a genuine allow (ok_backend's response) and an in-band
-        // `onDeny: rpc-error` denial are valid, HTTP-200 JSON bodies, so
-        // parseability alone can't distinguish them. What can: the exact
-        // bytes match ok_backend's own canned response (never this policy's
-        // own -32008 error shape), AND the request is recorded as having
-        // actually reached the upstream.
-        assert_eq!(
-            response.body(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-            "a sound record must return the upstream's own response body, not a policy-generated denial"
-        );
-        assert!(
-            backend.next().is_some(),
-            "a sound record must actually reach the upstream, not just return HTTP 200"
-        );
-    }
-
-    #[test]
-    fn ctrl_03_sound_record_with_no_reference_is_allowed() {
-        // Guards against a checker that only works when a $ref is present.
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "fs.write",
-            CTRL03_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0002",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL03_MAC}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "fs.write",
-            json!({"path": "/etc/app.conf", "mode": "0644"}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-    }
-
-    #[test]
-    fn neg_p1_wrong_action_is_denied_for_p1() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            7,
-            "deploy.destroy",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert_eq!(json["error"]["code"], MCP_BLOCKED_CODE);
-        assert!(json["error"]["message"].as_str().unwrap().contains("P1"));
-        assert!(
-            backend.next().is_none(),
-            "denied execution must not reach upstream"
-        );
-    }
-
-    #[test]
-    fn neg_p2_changed_numeric_argument_is_denied_for_p2() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let digest = super::digest_value(&json!({"service": "checkout", "replicas": 3}));
-        let mac = hmac_hex(
-            "abv/approver",
-            &json!({"action": "deploy.scale", "arguments_digest": digest}),
-        );
-        let envelope = approval_envelope(
-            "deploy.scale",
-            &digest,
-            "2026-09-19T12:00:00Z",
-            "n-0003",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": mac}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            3,
-            "deploy.scale",
-            json!({"service": "checkout", "replicas": 300}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P2"));
-    }
-
-    #[test]
-    fn neg_p2_changed_string_argument_is_denied_for_p2() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "fs.write",
-            CTRL03_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0004",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL03_MAC}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            4,
-            "fs.write",
-            json!({"path": "/etc/shadow", "mode": "0644"}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P2"));
-    }
-
-    #[test]
-    fn neg_p3_dereferenced_bytes_changed_is_denied_for_p3() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({"blob://plan-v2": "dc1b41cb6999def6f863076486282f7dfeb18fc84f6cd0d2c85f720981b95c0c"}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v2"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P3"));
-    }
-
-    #[test]
-    fn neg_p3_approval_committed_reference_not_bytes_is_denied_for_p3() {
-        // The approval commits the reference as an unresolvable pointer (no
-        // dereferenced-bytes entry at all): the referenced bytes were never
-        // bound to anything this gateway can verify.
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            "75b7f88f01f41b94dd79d00488241812b1cf689c1fd2b058cf4e1fbc07c39e20",
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": "31f446c4f11971948b7f1561865b174a7312ee2e4a695c9fa7bfb0e450b870df"}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v2"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P3"));
-    }
-
-    #[test]
-    fn neg_p5_executor_is_only_attester_is_denied_for_p5() {
-        let mac = hmac_hex(
-            "abv/executor",
-            &json!({"action": "deploy.apply", "arguments_digest": CTRL01_DIGEST}),
-        );
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "executor.example", "mac": mac}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P5"));
-    }
-
-    #[test]
-    fn neg_p5_no_attestation_at_all_is_denied_for_p5() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([]),
-            json!({}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P5"));
-    }
-
-    #[test]
-    fn neg_p6_nonce_reused_across_two_executions_is_denied_for_p6() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({"blob://plan-v1": PLAN_V1_DIGEST}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let first = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(
-            first.status_code(),
-            200,
-            "first use of the nonce must be allowed"
-        );
-        // Parseability alone can't distinguish an allow from an in-band
-        // denial (both are valid JSON at HTTP 200) — check the exact
-        // upstream response bytes and that the upstream was actually hit.
-        assert_eq!(
-            first.body(),
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
-            "first use must return the upstream's own response body, not a policy-generated denial"
-        );
-        assert!(
-            backend.next().is_some(),
-            "first use must actually reach the upstream, not just return HTTP 200"
-        );
-
-        let second_body = jsonrpc_call(
-            2,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let second = tester.request(request_with(&envelope, "executor.example", &second_body));
-        let json: Value = serde_json::from_slice(second.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P6"));
-        assert!(
-            backend.next().is_none(),
-            "a nonce-reuse denial must not reach the upstream a second time"
-        );
-    }
-
-    /// Re-derives an HMAC-SHA256 the same way `check_separate_attester` does,
-    /// so hand-authored (non-vendored) test cases don't need a pre-baked mac.
-    fn hmac_hex(key: &str, scope: &Value) -> String {
-        use hmac::Mac;
-        let bytes = super::canonical_json_string(scope).into_bytes();
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.as_bytes()).unwrap();
-        mac.update(&bytes);
-        super::hex_encode(&mac.finalize().into_bytes())
-    }
-
-    // -----------------------------------------------------------------
-    // P4 freshness — dynamically computed timestamps (see module doc above)
-    // -----------------------------------------------------------------
-
-    fn p4_config() -> String {
-        config_with(json!({"requiredPredicates": ["P4"], "clockSkewSeconds": 60}))
-    }
-
-    #[test]
-    fn p4_approval_fresh_within_window_is_allowed() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(p4_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            &far_future(),
-            "n-fresh",
-            json!([]),
-            json!({}),
-        );
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-    }
-
-    #[test]
-    fn p4_approval_expired_is_denied_for_p4() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(p4_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            &far_past(),
-            "n-expired",
-            json!([]),
-            json!({}),
-        );
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P4"));
-    }
-
-    #[test]
-    fn p4_approval_with_no_not_after_is_denied_for_p4() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(p4_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = json!({
-            "approval": {"scope": {"action": "deploy.apply", "arguments_digest": CTRL01_DIGEST}, "nonce": "n-1"},
-            "attestations": [],
-            "dereferenced": {}
-        });
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P4"));
-    }
-
-    // -----------------------------------------------------------------
-    // Config validation (belt-and-suspenders; the GCL schema also enforces
-    // these enums/non-empty constraints before a policy instance is armed)
-    // -----------------------------------------------------------------
-
-    fn parse_config(json: Value) -> Result<Config> {
-        serde_json::from_value(json).map_err(|err| anyhow!("{err}"))
-    }
-
-    #[test]
-    fn empty_required_predicates_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": [], "attesterKeys": [],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        assert!(Binding::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn sidecar_approval_source_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "sidecar", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        match Binding::from_config(&config) {
-            Ok(_) => panic!("expected approvalSource=sidecar to be rejected at startup"),
-            Err(err) => assert!(err.to_string().contains("not implemented")),
-        }
-    }
-
-    #[test]
-    fn duplicate_attester_kid_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1"],
-            "attesterKeys": [attester("a", "k1"), attester("a", "k2")],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        assert!(Binding::from_config(&config).is_err());
-    }
-
-    #[test]
-    fn blank_attester_kid_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1"],
-            "attesterKeys": [attester("  ", "k1")],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        assert!(Binding::from_config(&config).is_err());
-    }
-
-    // -----------------------------------------------------------------
-    // Structural / fail-closed edge cases
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn missing_approval_header_is_denied() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_body(body.to_string()),
-        );
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert!(json["error"]["message"].as_str().unwrap().contains("P5"));
-    }
-
-    #[test]
-    fn malformed_approval_header_json_fails_closed() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_header("x-approval", "{not json")
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 200);
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert_eq!(json["error"]["code"], MCP_BLOCKED_CODE);
-    }
-
-    #[test]
-    fn non_jsonrpc_body_fails_closed_with_empty_403_in_block_mode() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let body = "{\"hello\":\"world\"}";
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.len().to_string())
-                .with_body(body),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-        assert!(
-            backend.next().is_none(),
-            "malformed input must not reach upstream in block mode"
-        );
-    }
-
-    #[test]
-    fn non_jsonrpc_body_passes_through_in_monitor_mode() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(monitor_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let body = "{\"hello\":\"world\"}";
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.len().to_string())
-                .with_body(body),
-        );
-        assert_eq!(response.status_code(), 200);
-        assert!(backend.next().is_some(), "monitor mode always forwards");
-    }
-
-    #[test]
-    fn jsonrpc_batch_is_out_of_scope_and_fails_closed_in_block_mode() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let batch =
-            json!([{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}]).to_string();
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", batch.len().to_string())
-                .with_body(batch),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-    }
-
-    #[test]
-    fn notification_without_id_is_denied_with_202_and_no_body() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = json!({
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {"name": "deploy.apply", "arguments": {}}
-        });
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 202);
-        assert!(response.body().is_empty());
-    }
-
-    #[test]
-    fn forged_short_content_length_fails_closed_as_malformed() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", "1")
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-    }
-
-    #[test]
-    fn oversized_declared_length_fails_closed_before_reading_body() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", (super::MAX_BODY_BYTES + 1).to_string())
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(backend.next().is_none());
-    }
-
-    #[test]
-    fn no_body_at_all_fails_closed_in_block_mode() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let response = tester.request(UnitHttpRequest::get());
-        assert_eq!(response.status_code(), 403);
-    }
-
-    #[test]
-    fn on_deny_empty_403_never_echoes_an_id() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(
-                json!({"onDeny": "empty-403", "requiredPredicates": ["P1"]}),
-            ))
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            &far_future(),
-            "n-1",
-            json!([]),
-            json!({}),
-        );
-        let body = jsonrpc_call(42, "deploy.destroy", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-        assert_eq!(
-            response.header("x-approval-binding"),
-            Some("denied;predicate=P1")
-        );
-    }
-
-    #[test]
-    fn monitor_mode_records_verdict_but_forwards_a_denying_request() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(
-                json!({"mode": "monitor", "requiredPredicates": ["P1"]}),
-            ))
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            &far_future(),
-            "n-1",
-            json!([]),
-            json!({}),
-        );
-        let body = jsonrpc_call(1, "deploy.destroy", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-        let forwarded = backend
-            .next()
-            .expect("monitor mode must forward the request");
-        assert_eq!(
-            forwarded.header("x-approval-binding"),
-            Some("would-deny;predicate=P1")
-        );
-    }
-
-    #[test]
-    fn allowed_request_is_stamped_and_forwarded() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-allow-1",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({"blob://plan-v1": PLAN_V1_DIGEST}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-        let forwarded = backend.next().expect("allowed request forwards upstream");
-        assert_eq!(forwarded.header("x-approval-binding"), Some("allowed"));
-    }
-
-    #[test]
-    fn rpc_param_approval_source_is_read_from_body_sibling_field() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(
-                json!({"approvalSource": "rpc-param", "requiredPredicates": ["P1", "P2", "P5"]}),
-            ))
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        // Real, freshly computed digest/MAC (not vendored constants) — this
-        // test exercises the rpc-param plumbing itself, so the cryptographic
-        // values only need to be internally consistent, computed the same
-        // way the production check_p5/check_action_and_arguments code does.
-        let arguments = json!({"confirm": true});
-        let digest = super::digest_value(&arguments);
-        let mac = hmac_hex(
-            "abv/approver",
-            &json!({"action": "deploy.apply", "arguments_digest": digest}),
-        );
-        let envelope = approval_envelope(
-            "deploy.apply",
-            &digest,
-            "2026-09-19T12:00:00Z",
-            "n-rpc-param-1",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": mac}]),
-            json!({}),
-        );
-        let mut body = jsonrpc_call(1, "deploy.apply", arguments);
-        body["approvalBinding"] = envelope;
-        let body_text = body.to_string();
-        let request = UnitHttpRequest::post()
-            .with_header("content-type", "application/json")
-            .with_header("content-length", body_text.len().to_string())
-            .with_header("client_id", "executor.example")
-            .with_body(body_text);
-        let response = tester.request(request);
-        assert_eq!(response.status_code(), 200);
-    }
-
-    #[test]
-    fn tools_call_without_matching_name_field_fails_closed() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}});
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 403);
-    }
-
-    #[test]
-    fn generic_method_uses_method_and_params_directly() {
-        // Not every governed call is tools/call — a generic JSON-RPC method's
-        // name is the action and its params are the arguments.
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let digest = super::digest_value(&json!({"target": "prod"}));
-        let mac = hmac_hex(
-            "abv/approver",
-            &json!({"action": "system.reboot", "arguments_digest": digest}),
-        );
-        let envelope = approval_envelope(
-            "system.reboot",
-            &digest,
-            "2026-09-19T12:00:00Z",
-            "n-generic-1",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": mac}]),
-            json!({}),
-        );
-        let body = json!({"jsonrpc": "2.0", "id": 1, "method": "system.reboot", "params": {"target": "prod"}});
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-    }
-
-    // -----------------------------------------------------------------
-    // PDK policy violation registration (mirrors the sibling Decoy Tool
-    // Sentinel's `violations.generate_policy_violation()` contract): a
-    // predicate-failure decision must register a policy violation whether
-    // the request is actually blocked or only flagged in monitor mode; a
-    // clean, allowed request must never register one.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn block_mode_denial_sets_policy_violation_without_upstream_execution() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-0001",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({}),
-        );
-        let body = jsonrpc_call(7, "deploy.destroy", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert!(backend.next().is_none());
-        assert!(
-            response.violation().is_some(),
-            "a block-mode predicate-failure denial must signal a policy violation"
-        );
-    }
-
-    #[test]
-    fn monitor_mode_would_deny_still_sets_policy_violation_and_forwards() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(config_with(
-                json!({"mode": "monitor", "requiredPredicates": ["P1"]}),
-            ))
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            &far_future(),
-            "n-1",
-            json!([]),
-            json!({}),
-        );
-        let body = jsonrpc_call(1, "deploy.destroy", json!({}));
-        let response = tester.request(request_with(&envelope, "executor.example", &body));
-        assert_eq!(response.status_code(), 200);
-        let forwarded = backend
-            .next()
-            .expect("monitor mode must forward a would-deny detection");
-        assert!(
-            forwarded.violation().is_some(),
-            "a monitor-mode would-deny detection must still signal a policy violation"
-        );
-    }
-
-    #[test]
-    fn allowed_request_does_not_set_a_policy_violation() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(vector_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let envelope = approval_envelope(
-            "deploy.apply",
-            CTRL01_DIGEST,
-            "2026-09-19T12:00:00Z",
-            "n-clean-1",
-            json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-            json!({"blob://plan-v1": PLAN_V1_DIGEST}),
-        );
-        let body = jsonrpc_call(
-            1,
-            "deploy.apply",
-            json!({"manifest": {"$ref": "blob://plan-v1"}, "confirm": true}),
-        );
-        tester.request(request_with(&envelope, "executor.example", &body));
-        let forwarded = backend.next().expect("a sound record must reach upstream");
-        assert!(
-            forwarded.violation().is_none(),
-            "an allowed request must never register a policy violation"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Batch (array) requests must not fail open: an unauthorized/altered
-    // call inside a batch must be denied atomically, never forwarded.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn jsonrpc_batch_with_unauthorized_call_is_denied_atomically_not_forwarded() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        // A batch mixing an approved-looking call with an unapproved one: this
-        // policy binds one approval envelope to one executed action, never to
-        // a collection of them, so the whole batch is rejected atomically —
-        // it must never be split and partially forwarded.
-        let batch = json!([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "deploy.apply", "arguments": {}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "deploy.destroy", "arguments": {}}}
-        ])
-        .to_string();
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", batch.len().to_string())
-                .with_header(
-                    "x-approval",
-                    approval_envelope(
-                        "deploy.apply",
-                        CTRL01_DIGEST,
-                        "2026-09-19T12:00:00Z",
-                        "n-batch-1",
-                        json!([{"claim": "approval", "authority": "approver.example", "mac": CTRL01_MAC}]),
-                        json!({}),
-                    )
-                    .to_string(),
-                )
-                .with_header("client_id", "executor.example")
-                .with_body(batch),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-        assert!(
-            backend.next().is_none(),
-            "a batch must be rejected atomically, never partially forwarded"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Header-phase gating: content-type / content-encoding exclusions
-    // (SSE, streaming, compressed, non-JSON bodies) — checked before the
-    // body is ever buffered, and fail-closed in block mode.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn non_json_content_type_fails_closed_in_block_mode() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "text/event-stream")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-        assert!(backend.next().is_none());
-    }
-
-    #[test]
-    fn content_encoding_present_fails_closed_in_block_mode() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-encoding", "gzip")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-        assert!(backend.next().is_none());
-    }
-
-    #[test]
-    fn uninspectable_content_type_forwards_uninspected_in_monitor_mode() {
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(monitor_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/octet-stream")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 200);
-        assert!(
-            backend.next().is_some(),
-            "monitor mode always forwards, even an uninspectable body"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Fail-closed JSON parse limits: bounded nesting depth, no lossy scan.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn deeply_nested_body_fails_closed_in_block_mode_not_a_lossy_scan() {
-        // serde_json enforces a bounded recursion depth on any Value parse
-        // (custom NoDuplicateMembers visitor included, since the limit lives
-        // in the Deserializer itself); a body nested past that limit must be
-        // rejected as unparseable, not silently truncated or scanned lossily.
-        let backend = Rc::new(TraceBackend::new(ok_backend));
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(Rc::clone(&backend))
-            .with_entrypoint(super::configure);
-        let mut nested = "0".to_string();
-        for _ in 0..300 {
-            nested = format!("[{nested}]");
-        }
-        let body = format!(
-            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"deploy.apply","arguments":{{"deep":{nested}}}}}}}"#
-        );
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.len().to_string())
-                .with_body(body),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-        assert!(backend.next().is_none());
-    }
-
-    #[test]
-    fn deeply_nested_approval_header_fails_closed_in_block_mode() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let mut nested = "0".to_string();
-        for _ in 0..300 {
-            nested = format!("[{nested}]");
-        }
-        let header_value =
-            format!(r#"{{"approval":{{"scope":{{"action":"x"}}}},"deep":{nested}}}"#);
-        let body = jsonrpc_call(1, "deploy.apply", json!({}));
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.to_string().len().to_string())
-                .with_header("x-approval", header_value)
-                .with_body(body.to_string()),
-        );
-        assert_eq!(response.status_code(), 200);
-        let json: Value = serde_json::from_slice(response.body()).expect("valid json body");
-        assert_eq!(json["error"]["code"], MCP_BLOCKED_CODE);
-    }
-
-    #[test]
-    fn numeric_overflow_in_body_does_not_panic_and_fails_closed_deterministically() {
-        // A JSON number far outside i64/u64/f64-safe range (1e400 overflows an
-        // f64) must never panic this policy's parser. In practice the strict
-        // parse pass rejects it as unparseable JSON — deterministic fail-closed
-        // handling, not a crash — and, because the whole body (including its
-        // "id") could not be confidently parsed, the denial falls back to an
-        // empty 403 rather than echoing an id salvaged from a broken parse.
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"deploy.apply","arguments":{"huge":1e400}}}"#;
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.len().to_string())
-                .with_body(body),
-        );
-        // No panic reaching this point is itself the core assertion.
-        assert_eq!(response.status_code(), 403);
-        assert!(response.body().is_empty());
-    }
-
-    // -----------------------------------------------------------------
-    // id-echo containment: a body this policy cannot confidently and
-    // unambiguously parse never has its id "salvaged" and echoed, even if
-    // a naive scan of the raw bytes could find something id-shaped.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn ambiguous_duplicate_id_never_echoes_a_salvaged_id_value() {
-        let mut tester = UnitTestBuilder::default()
-            .with_config(block_config())
-            .with_backend(ok_backend)
-            .with_entrypoint(super::configure);
-        let body = r#"{"jsonrpc":"2.0","id":1,"id":"leaked-token","method":"tools/call","params":{"name":"deploy.apply","arguments":{}}}"#;
-        let response = tester.request(
-            UnitHttpRequest::post()
-                .with_header("content-type", "application/json")
-                .with_header("content-length", body.len().to_string())
-                .with_body(body),
-        );
-        assert_eq!(response.status_code(), 403);
-        assert!(
-            response.body().is_empty(),
-            "an ambiguous body must never echo either candidate id value"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // Config fail-closed validation: every enum-shaped config field must be
-    // rejected at startup on an unknown/typo value, not fail open.
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn unknown_approval_source_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "hedaer-typo", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        match Binding::from_config(&config) {
-            Ok(_) => panic!("expected an unknown approvalSource to be rejected at startup"),
-            Err(err) => assert!(err.to_string().contains("unknown approvalSource")),
-        }
-    }
-
-    #[test]
-    fn unknown_mode_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
-            "clockSkewSeconds": 60, "mode": "blokc-typo", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        match Binding::from_config(&config) {
-            Ok(_) => panic!("expected an unknown mode to be rejected at startup"),
-            Err(err) => assert!(err.to_string().contains("unknown mode")),
-        }
-    }
-
-    #[test]
-    fn unknown_on_deny_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1"], "attesterKeys": [],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error-typo", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        match Binding::from_config(&config) {
-            Ok(_) => panic!("expected an unknown onDeny to be rejected at startup"),
-            Err(err) => assert!(err.to_string().contains("unknown onDeny")),
-        }
-    }
-
-    #[test]
-    fn unknown_predicate_value_is_rejected_at_configure_time() {
-        let config = parse_config(json!({
-            "approvalSource": "header", "approvalHeader": "x-approval", "approvalRpcField": "approvalBinding",
-            "executorHeader": "client_id", "requiredPredicates": ["P1", "P7-typo"], "attesterKeys": [],
-            "clockSkewSeconds": 60, "mode": "block", "onDeny": "rpc-error", "resultHeader": "x-approval-binding"
-        }))
-        .unwrap();
-        match Binding::from_config(&config) {
-            Ok(_) => panic!("expected an unknown predicate value to be rejected at startup"),
-            Err(err) => assert!(err.to_string().contains("unknown predicate")),
-        }
-    }
-}
+mod test;
