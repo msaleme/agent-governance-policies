@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "run_id": "approval-p6-connected-20260925",
+  "recorded_at": "2026-09-25T13:01:44.976744+00:00",
+  "attempt_started_at": "2026-09-25T12:50:47.117158+00:00",
+  "overall_disposition": "blocked_before_gateway_execution",
+  "source": {
+    "repository": "https://github.com/msaleme/agent-governance-policies",
+    "commit": "8f07a005cbbe4b7abe7cc828468489b00ae43a31",
+    "checkpoint": "1e46807",
+    "branch": "verification/approval-p6-connected-20260925",
+    "maintainer_checkout_modified": false,
+    "runtime_enum_gcl_changed": false
+  },
+  "artifact": {
+    "crate": "approval_execution_binding",
+    "version": "1.0.0",
+    "target": "wasm32-wasip1",
+    "rust": "1.89.0",
+    "pdk": "1.10.0",
+    "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
+    "source_gcl_sha256": "6434c359c704c0e8d279abd44014a483152dcd9c2c5fbd60fa4648fa99244825",
+    "deployed_wasm_sha256": null,
+    "gateway_version_planned": "1.14.0",
+    "loaded_on_gateway": false
+  },
+  "packaging": {
+    "cargo_anypoint": "1.10.0",
+    "make_package": {
+      "exit_code": 2,
+      "output": "make: *** No rule to make target `package'.  Stop."
+    },
+    "pdk_plugin_versions": [
+      "1.9.0",
+      "1.10.0"
+    ],
+    "pdk_schema_validation": "failed",
+    "pdk_error": "strict mode: unknown keyword: \"characteristics\"",
+    "direct_exchange_probe": {
+      "asset_id": "approval-p6-20260925-dev",
+      "version": "0.0.1",
+      "preserved_source_gcl": true,
+      "preserved_schema_properties": true,
+      "first_attempt": {
+        "http_status": 400,
+        "errors": [
+          "asset metadata name mismatch",
+          "unknown keyword: characteristics"
+        ]
+      },
+      "isolated_retry": {
+        "http_status": 400,
+        "error": "The asset is invalid There was an error trying to parse JSON schema, strict mode: unknown keyword: \"characteristics\""
+      },
+      "published": false
+    },
+    "sensitive_characteristic_acceptance": "rejected",
+    "mcp_asset_type_acceptance": "not_independently_proven_due_to_schema_rejection"
+  },
+  "cases": [
+    {
+      "id": "p6_cross_request",
+      "description": "Real local-store reservation and same-replica replay",
+      "disposition": "blocked",
+      "reason": "Unchanged definition cannot be published; Exchange HTTP 400, issue #21.",
+      "executed": false,
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p6_restart",
+      "description": "Observe replay after gateway restart",
+      "disposition": "blocked",
+      "reason": "Unchanged definition cannot be published; Exchange HTTP 400, issue #21.",
+      "executed": false,
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p6_cross_replica",
+      "description": "Observe replay on a second replica",
+      "disposition": "blocked",
+      "reason": "Unchanged definition cannot be published; Exchange HTTP 400, issue #21.",
+      "executed": false,
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p5_verified_executor",
+      "description": "Real upstream Client-ID auth and separate attester",
+      "disposition": "blocked",
+      "reason": "Unchanged definition cannot be published; Exchange HTTP 400, issue #21.",
+      "executed": false,
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p5_self_attestation",
+      "description": "Self-attester must be denied",
+      "disposition": "blocked",
+      "reason": "Unchanged definition cannot be published; Exchange HTTP 400, issue #21.",
+      "executed": false,
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p5_spoofed_header",
+      "description": "Caller header must not replace verified subject",
+      "disposition": "blocked",
+      "reason": "Unchanged definition cannot be published; Exchange HTTP 400, issue #21.",
+      "executed": false,
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p6_shared_store_fix_path",
+      "disposition": "not_run",
+      "executed": false,
+      "reason": "Source hardcodes local(); switching to remote() changes runtime behavior and is outside this verification task. Existing issue #3.",
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    },
+    {
+      "id": "p6_storage_unavailable",
+      "disposition": "not_run",
+      "executed": false,
+      "reason": "Local store uses in-process proxy-WASM shared data; no remote endpoint to withdraw. No supported real-store fault injection identified. Publication also blocked. No simulated/unit result substituted.",
+      "http_statuses": [],
+      "backend_hits": null,
+      "policy_violation_count": null
+    }
+  ],
+  "policy_violations": {
+    "count": null,
+    "queried": false,
+    "reason": "No policy/API deployment or case traffic; do not report an observed zero."
+  },
+  "tests": {
+    "new_composite": "connected_p5_p6_identity_replay_replica_and_restart",
+    "compiled": true,
+    "executed": false,
+    "original_two_tests_preserved": true,
+    "local_unit_suite_rerun": false,
+    "lifecycle_adapter": "not implemented; external prerequisite documented in tests/CONNECTED.md"
+  },
+  "issues": [
+    "https://github.com/msaleme/agent-governance-policies/issues/21",
+    "https://github.com/msaleme/agent-governance-policies/issues/3"
+  ],
+  "cleanup": {
+    "status": "complete",
+    "registration_delete_exit": 0,
+    "registration_delete_success_message": true,
+    "active_matching_gateway_targets": 0,
+    "assets": [
+      {
+        "asset": "approval-p6-20260925-flex-dev",
+        "version": "0.0.1",
+        "delete_status": 404,
+        "confirm_get_status": 404
+      },
+      {
+        "asset": "approval-p6-20260925-dev",
+        "version": "0.0.1",
+        "delete_status": 404,
+        "confirm_get_status": 404
+      },
+      {
+        "asset": "approval-p6-20260925-mcp",
+        "version": "0.0.1",
+        "delete_status": 404,
+        "confirm_get_status": 404
+      }
+    ],
+    "api_instances_created": 0,
+    "client_apps_created": 0,
+    "contracts_created": 0,
+    "upstream_containers_created": 0,
+    "test_networks_created": 0,
+    "gateway_service_containers_created": 0,
+    "registration_helper_containers": "ephemeral --rm; none remain",
+    "unrelated_stopped_containers_left_untouched": 3,
+    "private_identity_removed": true,
+    "private_staging_removed": true,
+    "temporary_tool_installations_removed": true,
+    "confirmed_at": "2026-09-25T13:03:38.133784+00:00"
+  },
+  "ci": {
+    "required_checks": [
+      "policies",
+      "GitGuardian"
+    ],
+    "results_location": "pull request checks for the evidence commit",
+    "is_connected_runtime_evidence": false
+  }
+}
