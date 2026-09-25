@@ -38,6 +38,16 @@ publication are included.
   harness) and a Protocol specifications section citing the governed wire formats
   (MCP, A2A, JSON-RPC 2.0).
 
+### Fixed
+
+- **Approval-to-Execution Binding** — the `attesterKeys[].key` sensitive-parameter
+  marker now uses the doc-supported JSON-LD form (`"@context": { "@characteristics":
+  ["security:sensitive"] }`). The earlier bare `characteristics: [security:sensitive]`
+  was rejected by PDK's GCL→JSON-Schema compiler (ajv strict mode: unknown keyword),
+  which blocked schema generation and Exchange publication (issue #21). Verified
+  locally via `pdk policy-project build-asset-files`; re-confirm on a live Exchange
+  publish.
+
 ### Known limitations
 
 - Approval-binding P5 attestation is symmetric HMAC in this build (separation-of-

@@ -99,8 +99,9 @@ spec:
             type: string
           key:
             type: string
-            characteristics:
-              - security:sensitive
+            "@context":
+              "@characteristics":
+                - "security:sensitive"
         required:
           - kid
           - key
