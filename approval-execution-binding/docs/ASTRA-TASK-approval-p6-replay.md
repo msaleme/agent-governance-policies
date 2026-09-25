@@ -70,6 +70,16 @@ hand-written edge cases) covers, deterministically and offline:
    and proves an approval attested by a *different* authority than the verified executor passes
    P5 while a self-attested one fails.
 
+## Baseline to build on
+
+- Fetch `origin/main`; the verified checkpoint is squash commit **`1e46807`** (PR #19, which
+  merged reviewer findings #1–#7). Branch fresh off it; confirm `git rev-parse --show-toplevel`
+  is this repo before staging. See `../../docs/CODEX-HANDOFF.md` for authorization/handling.
+- `approval-execution-binding/tests/requests.rs` already ships **two** `#[pdk_test]` composite
+  cases that bind **P1+P2 only** (`sound_approval_reaches_the_real_upstream_end_to_end` allow +
+  `action_mismatch_is_denied_end_to_end_and_never_reaches_upstream` P1-deny). Extend that file
+  for the P5/P6 cases below — do not rewrite the existing two.
+
 ## How to run (disposable, authorized gateway only)
 
 - Use a **disposable, authorized** Flex Gateway — never a shared/customer gateway. Churn is
@@ -78,6 +88,42 @@ hand-written edge cases) covers, deterministically and offline:
   `HttpMock`). Extend it; do not run it on this machine (no Docker `pdk_test` runtime here).
 - **Never churn a live MCP instance** with repeated API PATCH + Save&Apply — it corrupts
   gateway route state (empty-body 503). If an instance wedges, **delete and recreate** it.
+- **API PATCH ≠ enforcement:** config reaches the running gateway only after a **UI Save &
+  Apply** (watch `deployment.updatedDate` bump, status Active→Updating→Active). Assert
+  enforcement only after that push, never off the PATCH alone.
+
+## Boundaries (load-bearing)
+
+- **Verification only.** Do not change runtime behaviour, the `Predicate` enum, or the GCL
+  schema. If a prescribed expectation fails on a real gateway, **file a GitHub issue with the
+  captured evidence — do not patch the policy to make it pass.**
+- Keep everything inside the explicitly-authorized disposable scope; do not infer shared-API
+  or production-mutation authority. **Delete every test resource afterward and confirm it.**
+- **Never print, log, or copy identity/credential material** (registration YAML, tokens, the
+  ≥32-byte attester key) into evidence, commits, or issues. Never treat headers as trusted
+  provenance.
+
+## Evidence artifact (mirror `agent-decoy-policies/docs/evidence/`)
+
+Commit a pair:
+
+1. A human-readable evidence doc (per case: coordinator/policy config, request, **actual**
+   wire result, backend hit-count, disposition, and for #2/#3 the observed restart/replica
+   behaviour stated honestly).
+2. A machine-readable `docs/evidence/approval-p6-connected-<UTC-date>.json` capturing:
+   artifact identity, **WASM SHA-256** of the built policy, UTC timestamps, HTTP statuses,
+   per-case dispositions, `PolicyViolation` counts, and **resource-deletion status**.
+
+State plainly which cases passed, which are qualified, and which failed — do not present a
+partial run as all-green.
+
+## Definition of done
+
+CI (`policies` + GitGuardian) green; a committed, reproducible evidence doc + JSON produced
+on a real disposable gateway for cases 1–5 above (or GitHub issues filed for any that don't
+hold), with all disposable resources deleted and deletion confirmed; the two publish-time
+items either confirmed or recorded as still-pending. Open a PR from a fresh topic branch; do
+**not** merge to this public repo without the maintainer's explicit go.
 
 ## Publish-time items to verify on a real toolchain (not verifiable offline here)
 
