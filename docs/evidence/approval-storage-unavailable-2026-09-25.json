@@ -1,0 +1,271 @@
+{
+  "schema_version": 1,
+  "case": "approval-storage-unavailable",
+  "brief_case": 4,
+  "scope": "Storage-error fail-closed only; cross-replica behavior and fix excluded",
+  "recorded_at": "2026-09-25T16:03:10.628313+00:00",
+  "disposition": "qualified",
+  "finding": "not reachably testable on local()",
+  "source_commit": "c1da6056244a697c9b8cf8dcfdc34ecf85de191f",
+  "branch": "verification/approval-storage-unavailable-20260925",
+  "runtime_predicates_and_gcl_modified": false,
+  "artifact": {
+    "crate": "approval_execution_binding",
+    "crate_version": "1.0.0",
+    "target": "wasm32-wasip1",
+    "rust_toolchain": "1.89.0",
+    "build_command": "cargo +1.89.0 build --release --target wasm32-wasip1 --locked --offline",
+    "build_exit_code": 0,
+    "wasm_sha256": "f8eb361ca514ab727b4153a5ea3141764b80ead6be2d63664c530017abfd91f1",
+    "wasm_file_modified_at": "2026-09-25T15:58:53.597564+00:00",
+    "published": false,
+    "deployed": false,
+    "source_sha256": "f79aa5364dbd448b3f69a65d96a474ad440e347b7af374e90f27c115bef77d1d",
+    "cargo_lock_sha256": "e69f2e361ce14aadea44ba14b11adef3f551bad0678022ac1cf30617b001cc79"
+  },
+  "inducibility": {
+    "supported_non_cas_store_error_inducible_on_unchanged_local_path": false,
+    "non_cas_error_observed": false,
+    "fault_injection_attempted": false,
+    "basis": "Locked source-path audit, dependency archive validation, official storage documentation, and offline gateway image identification. No new connected enforcement run.",
+    "local_backend": "Envoy shared data via proxy_get_shared_data/proxy_set_shared_data; no network-addressable backend",
+    "sdk_behavior": "proxy-wasm 0.2.5 set_shared_data returns Ok or CasMismatch; other statuses panic instead of returning Err to the policy.",
+    "other_error_paths": "Absent does not parse a CAS string. Default serialization of the fixed 1u8 value succeeds; request data cannot select another type/format.",
+    "limits": "No assertion that arbitrary host corruption or exhaustion is impossible; trap behavior was not tested and is not a P6 denial proof.",
+    "future_work": "A remote/shared-store selection requires a separately authorized runtime change, then a real backend-withdrawal test; not performed here."
+  },
+  "code_path": [
+    {
+      "file": "approval-execution-binding/src/lib.rs",
+      "line": 1221,
+      "finding": "Entrypoint always selects local(NONCE_STORE_NAME)."
+    },
+    {
+      "file": "approval-execution-binding/src/lib.rs",
+      "line": 1142,
+      "finding": "Block mode plus required P6 invokes store with Absent and a fixed 1u8 value after the otherwise-Allow verdict."
+    },
+    {
+      "file": "approval-execution-binding/src/lib.rs",
+      "line": 1159,
+      "finding": "Catch-all Err logs storage-unavailable, generates PolicyViolation, and returns Flow::Break(render_denial(..., P6)) before Continue."
+    },
+    {
+      "crate": "pdk-data-storage-lib@1.10.0",
+      "file": "src/lib.rs",
+      "symbols": [
+        "LocalDataStorage::store",
+        "convert_store_mode",
+        "DataStorageBuilder::local"
+      ],
+      "finding": "Local storage uses the SharedData implementation; Absent conversion is infallible."
+    },
+    {
+      "crate": "pdk-data-storage-lib@1.10.0",
+      "file": "src/local.rs",
+      "symbol": "SharedData::set",
+      "finding": "Pre-read enforces Absent; set maps CasMismatch separately and would map other returned statuses to Unexpected."
+    },
+    {
+      "crate": "pdk-classy@1.10.0",
+      "file": "src/lib.rs",
+      "line": 68,
+      "finding": "wasm32 selects actual proxy-wasm SDK; native builds use a stub."
+    },
+    {
+      "crate": "proxy-wasm@0.2.5",
+      "file": "src/hostcalls.rs",
+      "line": 537,
+      "finding": "Write wrapper only returns Ok/CasMismatch; unexpected status panics. Read wrapper also panics on unexpected status."
+    },
+    {
+      "crate": "pdk-serde-fixint@1.11.0",
+      "files": [
+        "src/ser.rs",
+        "src/size.rs"
+      ],
+      "finding": "Both u8 size and encoding passes return Ok for the fixed one-byte value."
+    }
+  ],
+  "planned_case_not_executed": {
+    "configuration": {
+      "mode": "block",
+      "requiredPredicates": [
+        "P1",
+        "P2",
+        "P6"
+      ],
+      "onDeny": "rpc-error",
+      "approvalSource": "header",
+      "approvalHeader": "x-approval",
+      "resultHeader": "x-approval-binding"
+    },
+    "request": {
+      "jsonrpc": "2.0",
+      "id": 1,
+      "method": "tools/call",
+      "params": {
+        "name": "deploy.apply",
+        "arguments": {
+          "confirm": true
+        }
+      }
+    },
+    "approval_requirements": "Matching action/canonical argument digest and a fresh nonempty nonce; no actual approval or credentials were created.",
+    "expected_if_real_error_returned": {
+      "http_status": 200,
+      "jsonrpc_error_code": -32008,
+      "result_header": "denied;predicate=P6",
+      "backend_hit_count": 0,
+      "policy_violation_count": 1
+    },
+    "empty_403_alternative": "With onDeny=empty-403 and a request id, denial should be HTTP 403 with the P6 result header; not exercised."
+  },
+  "observed": {
+    "new_connected_gateway_run": false,
+    "ui_save_apply_performed": false,
+    "http_requests_sent": 0,
+    "http_status": null,
+    "jsonrpc_error_code": null,
+    "result_header": null,
+    "backend_hit_count": null,
+    "policy_violation_count": null,
+    "policy_branch_executed": false,
+    "null_reason": "No supported fault could deliver the required Err on this unchanged local path, so no live API or upstream was provisioned and no denial was observed. Expected zero hits is not an observed zero."
+  },
+  "image_inspection": {
+    "started_at": "2026-09-25T15:59:55.606840+00:00",
+    "finished_at": "2026-09-25T15:59:55.882170+00:00",
+    "purpose": "Offline image inspection only; no gateway policy request or registration",
+    "exit_code": 0,
+    "envoy_version": "envoy  version: f97695a50e11f5ff6719e129a466bf9204b64a7f/1.37.5/Modified/RELEASE/BoringSSL",
+    "container_name": "approval-storage-inspect-20260925",
+    "network_mode": "none",
+    "image_id": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+    "container_absent_after_inspection": true
+  },
+  "dependency_source_audit": {
+    "at": "2026-09-25T16:00:37.176193+00:00",
+    "dependencies": [
+      {
+        "crate": "pdk-data-storage-lib",
+        "version": "1.10.0",
+        "archive_sha256": "f270cba494fdde4b7a0b8dd9848e614e84bc42677072cb78a17e933a189c229b",
+        "matches_cargo_lock": true,
+        "files": [
+          {
+            "path": "src/lib.rs",
+            "sha256": "db23c6e4ad6210044eaeefdc00d6bcec9713865e189824538182105de967a43e",
+            "matches_verified_crate_archive": true
+          },
+          {
+            "path": "src/local.rs",
+            "sha256": "65bafd103b52797c889443611f69f07fff41fd2b3d8f9c9300a9d69d8f6fa816",
+            "matches_verified_crate_archive": true
+          },
+          {
+            "path": "src/format.rs",
+            "sha256": "a16cd25116d4beb1e5e3fc89be94c039ede8dba5e81e4c74c98ddcc9714fb261",
+            "matches_verified_crate_archive": true
+          }
+        ]
+      },
+      {
+        "crate": "pdk-classy",
+        "version": "1.10.0",
+        "archive_sha256": "d291af50759ca650f60613eeccedbff85bcf912ccc90079730aa53292e5ab5dc",
+        "matches_cargo_lock": true,
+        "files": [
+          {
+            "path": "src/lib.rs",
+            "sha256": "fc9a3b8f90a8c74c56d42d948e83c80c9bd4220529db33034c6db203db465adb",
+            "matches_verified_crate_archive": true
+          },
+          {
+            "path": "src/host/shared_data.rs",
+            "sha256": "5e91c78af35ca7ff7c706b7a3060118202a38167a0e9d3efdeca565947dcd2b2",
+            "matches_verified_crate_archive": true
+          }
+        ]
+      },
+      {
+        "crate": "proxy-wasm",
+        "version": "0.2.5",
+        "archive_sha256": "de8f6564bd52c2f4ff79fa5d1bd3bc10d8f822162af8d527e121e46703496aa0",
+        "matches_cargo_lock": true,
+        "files": [
+          {
+            "path": "src/hostcalls.rs",
+            "sha256": "c4e9491fe9e2f48c0ae92f58a10472e8e05c12882b7a40e7b862b96e750686fa",
+            "matches_verified_crate_archive": true
+          }
+        ]
+      },
+      {
+        "crate": "pdk-serde-fixint",
+        "version": "1.11.0",
+        "archive_sha256": "579560cad7ed85d7983c388b4ee76d1fdfa6d50534a9ef4b83d0d7c5c2ea5c3e",
+        "matches_cargo_lock": true,
+        "files": [
+          {
+            "path": "src/ser.rs",
+            "sha256": "96bc942f04db357600dc6254cb6ff696332610515776b61dc748e389b42e6fbf",
+            "matches_verified_crate_archive": true
+          },
+          {
+            "path": "src/size.rs",
+            "sha256": "626fcbf92c8356124f2f6fd716699a74a9c93e528bb2a4a880f12313e8b53e73",
+            "matches_verified_crate_archive": true
+          }
+        ]
+      }
+    ]
+  },
+  "upstream_sdk_source_verification": {
+    "url": "https://raw.githubusercontent.com/proxy-wasm/proxy-wasm-rust-sdk/4930296ed8e3601f062196ede46603ae755d565c/src/hostcalls.rs",
+    "http_status": 200,
+    "matches_locked_local_source": true
+  },
+  "cleanup": {
+    "confirmed_at": "2026-09-25T16:03:10.629983+00:00",
+    "status": "confirmed",
+    "inspection_containers_created": 3,
+    "inspection_containers_removed": 3,
+    "inspection_container_name": "approval-storage-inspect-20260925",
+    "docker_inspect_exit_after_removal": 1,
+    "exploratory_inspection_exit_codes": [
+      1,
+      1
+    ],
+    "exploratory_inspection_notes": "Initial version/layout checks encountered a stopped Flex control endpoint and nonexistent image paths; these were not policy requests. Each --rm container exited. Final Envoy version inspection exited 0.",
+    "cloud_resources_created": [],
+    "registration_created": false,
+    "credentials_or_attester_key_created": false,
+    "upstream_created": false,
+    "docker_network_created": false,
+    "volume_created": false,
+    "cloud_deletion": "not applicable: no cloud resources created",
+    "existing_gateway_image": "pre-existing cached image retained",
+    "prior_run_resources_reused": false
+  },
+  "issue_filed": false,
+  "issue_reason": "No live assertion failed; qualified inability to trigger this branch is explicitly an accepted outcome. SDK panic behavior is source analysis, not a reproduced gateway interoperability defect.",
+  "references": [
+    {
+      "url": "https://docs.mulesoft.com/pdk/latest/policies-pdk-configure-features-data-storage",
+      "purpose": "Documented distinction between in-memory local and remote Redis-backed storage."
+    },
+    {
+      "url": "https://dev-portal.mulesoft.com/skills/omni-gateway-config.html",
+      "purpose": "sharedStorage config is a Redis connection, not a local-store withdrawal control."
+    },
+    {
+      "url": "https://github.com/proxy-wasm/proxy-wasm-rust-sdk/blob/4930296ed8e3601f062196ede46603ae755d565c/src/hostcalls.rs#L537",
+      "purpose": "Pinned upstream hostcall return/panic behavior."
+    }
+  ],
+  "prior_evidence": {
+    "path": "docs/evidence/approval-p6-connected-2026-09-25.json",
+    "usage": "Historical context only; prior successful probes are not claimed for this newly built artifact."
+  }
+}
