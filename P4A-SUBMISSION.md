@@ -1,6 +1,7 @@
 # P4A submission package — Agent Governance Policies
 
-Prepared 2026-09-24. Turnkey pack for submitting the two policies in this repo to the
+Prepared 2026-09-24; updated 2026-09-25 (visibility blocker resolved; reviewer findings #1–#7
+resolved & merged; connected verification complete). Turnkey pack for submitting the two policies in this repo to the
 **P4A (Policies for Agents)** marketplace, mirroring the path the three published
 `agent-decoy-policies` siblings took. Submission itself is **UI-gated** (the P4A wizard) —
 this doc is everything a human needs to drive it; nothing here submits automatically.
@@ -19,20 +20,16 @@ unified project roots) a `.project.yaml`. Status per that list:
 | PDK pinned >= 1.8.0 | OK — **1.10.0** | OK — **1.10.0** |
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
-| CI green (fmt/clippy -D warnings/test/wasm build) | OK — run 35650711340 success | OK — same run |
+| CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
 | Lib tests | 46 pass | 74 pass |
-| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 implemented (see below) | OK (issue #6 wired + tested) |
-| **Public accessibility** | **BLOCKER** — repo is PRIVATE | **BLOCKER** — repo is PRIVATE |
+| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26) | OK — no open findings |
+| **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
-### The one open blocker: repo visibility
-The repo `github.com/msaleme/agent-governance-policies` is **private** (chosen deliberately).
-P4A's guide checks public accessibility of the submitted project. To submit, either:
-1. Make the repo public (irreversible/indexable — the published siblings are public MIT), **or**
-2. Grant P4A read access to the private repo via the connection flow, if the wizard supports it
-   for source ingestion (verify in the wizard; the one-click *deploy* path connects an Anypoint
-   org via a Connected App, which is a separate mechanism from source ingestion).
-
-Do not flip visibility without an explicit decision — that call is the maintainer's.
+### Repo visibility — RESOLVED (2026-09-24)
+The repo `github.com/msaleme/agent-governance-policies` is now **public** (`gh repo edit --visibility public`),
+so P4A's public-accessibility check is satisfied. The pre-flip secret scan was clean (no real org id —
+`group_id` is the placeholder `REPLACE_WITH_YOUR_ANYPOINT_ORG_ID` — no UUIDs/emails/keys; `.gitignore`
+excludes all Flex identity material). No further visibility action is required to submit.
 
 ## Per-policy submission facts
 
@@ -58,11 +55,18 @@ Do not flip visibility without an explicit decision — that call is the maintai
   - **#6** Executor from **verified** `AuthenticationData` (client_id→principal); absent + P5-required
     fails closed; header is fallback only. — DONE
   - **#3** Atomic single-use via gateway data storage (`StoreMode::Absent`); replay denied; other
-    storage error fails closed; monitor does not reserve. Cross-replica / restart / storage-unavailable
-    end-to-end validation **handed to Astra** (`docs/ASTRA-TASK-approval-p6-replay.md`). — DONE (unit) / Astra (e2e)
-  - **#1** Publishability: `attesterKeys[].key` marked `security:sensitive`; ≥32-byte key enforced at
-    startup; gcl `description` ≤256 chars; cargo-anypoint 1.10.0; fixture tests deserialize every ABV
-    vector; monitor stamps the result header on every forwarded path. — DONE
+    storage error fails closed; monitor does not reserve. Connected P5/P6 enforcement **verified on a
+    real Flex Gateway by Astra** (evidence in `docs/APPROVAL-P6-CONNECTED-2026-09-25.*`). Two items are
+    documented qualifications, not defects: cross-replica single-use is unproven on `local()` by design,
+    and the storage-unavailable fail-closed branch is correct by inspection but not reachably testable on
+    `local()` (pinned proxy-wasm SDK panics on unexpected host statuses; see
+    `docs/APPROVAL-STORAGE-UNAVAILABLE-2026-09-25.*`). A shared/remote store closes both — future feature.
+    — DONE (unit + connected e2e; two documented `local()` limitations)
+  - **#1** Publishability: `attesterKeys[].key` marked `security:sensitive` via the doc-supported JSON-LD
+    `@context`/`@characteristics` form (bare `characteristics:` is rejected by the GCL compiler — fix #21/PR #23);
+    ≥32-byte key enforced at startup; gcl `description` ≤256 chars; cargo-anypoint 1.10.0; fixture tests
+    deserialize every ABV vector; monitor stamps the result header on every forwarded path. `make build`
+    reproduces the generated config (fix #24/PR #26), so the standard build/publish pipeline is clean. — DONE
 - **Framework refs (supporting-measure, never certification):** NIST SP 800-53 Rev5 AC-3/AC-4/AU-10/AU-2
   (AU-10 supported by separation-of-duties, *not* non-repudiation — symmetric HMAC); OWASP LLM06
   Excessive Agency; MITRE ATLAS + Engage (design vocabulary); EU AI Act Art 14. Full text in README.
@@ -87,7 +91,7 @@ Do not flip visibility without an explicit decision — that call is the maintai
   (distributed, signed decision records) is unshipped roadmap. Response leg is headers-only.
 
 ## Wizard steps (HUMAN)
-1. Resolve the visibility blocker above.
+1. No visibility blocker — the repo is public (see above). Proceed.
 2. In the P4A dashboard, add a new policy; point it at this repo, subdirectory
    `approval-execution-binding` (then repeat for `aggregate-risk-gate`). Nested/unified roots are
    supported, but **submit and validate each project explicitly** — one root URL does not guarantee
@@ -95,9 +99,10 @@ Do not flip visibility without an explicit decision — that call is the maintai
 3. Set catalog copy from each policy's `gcl.yaml` description + the one-line hook above.
 4. Set applicability (MCP/A2A/API-LLM as noted per policy).
 5. Submit; reviewer **Tommaso Bolis** runs the same review loop the three decoy policies went through.
-   His findings #1–#7 on approval-execution-binding are implemented on branch
-   `fix/approval-binding-1-7-reviewer-findings` (see the per-finding resolution table above); expect
-   fewer round-trips once that branch is reviewed and merged.
+   His findings #1–#7 on approval-execution-binding are **resolved and merged to `main`** (PR #19, plus
+   publish/build fixes #23 and #26; per-finding resolution table above), and the policy has been
+   verified connected on a real gateway — so expect fewer round-trips. Close his OPEN #1–#7 with the
+   resolution note when you resubmit so he can re-review against merged `main`.
 
 ## Not claimed
 No P4A submission, acceptance, dashboard ID, or publication is asserted here — those come from an actual
