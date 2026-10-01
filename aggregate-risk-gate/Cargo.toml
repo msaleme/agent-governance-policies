@@ -23,8 +23,8 @@ serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 anyhow = "1.0"
 futures-lite = "2.6.1"
 uuid = { version = "1.26.1", features = ["v4"] }
-pdk-data-storage-lib = "1.10.0"
 async-trait = "0.1.92"
+pdk-data-storage-lib = "1.10.0"
 
 [dev-dependencies]
 pdk-test = { version = "=1.10.0" }
