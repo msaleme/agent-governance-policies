@@ -1,0 +1,622 @@
+// Copyright (c) 2026 msaleme. Licensed under the MIT License.
+
+//! Real-gateway validation cases 2–8 from
+//! `docs/ASTRA-TASK-aggregate-risk-connected.md`. Every test drives a real
+//! Flex 1.14.0 container (local mode) and a real HTTP mock upstream. Each case
+//! appends one sanitized JSON line to the file named by `AGP_E2E_EVIDENCE`
+//! (no credentials, registration data or digest keys are written).
+//!
+//! Run, one case at a time, on a Docker daemon hosting no other PDK test:
+//! `DOCKER_DEFAULT_PLATFORM=linux/amd64 AGP_E2E_EVIDENCE=/private/cases.jsonl \
+//!  cargo test --test connected_e2e -- --ignored --test-threads=1 --nocapture`
+//! Run the case 5 tests with `PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY=1`, so all calls
+//! share one worker ledger. Results are in `docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`.
+
+mod common;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use std::io::Write;
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use pdk_test::port::Port;
+use pdk_test::services::flex::{ApiConfig, Flex, FlexConfig, PolicyConfig};
+use pdk_test::services::httpmock::{HttpMock, HttpMockConfig};
+use pdk_test::{pdk_test, TestComposite};
+use serde_json::{json, Value};
+
+use common::*;
+
+const FLEX_PORT: Port = 8081;
+const RESULT_HEADER: &str = "x-aggregate-risk-gate";
+
+fn gate(overrides: Value) -> PolicyConfig {
+    let mut config = json!({
+        "budgetScope": "agent",
+        "identitySource": "trusted-header",
+        "identityField": "client_id",
+        "scopeHeader": "x-agent-id",
+        "maxScopes": 10000,
+        "reservationTimeoutMs": 60000,
+        "scopeDisclosure": "raw",
+        "scopeDigestKey": "",
+        "aggregateBudget": 3000,
+        "window": "fixed-period",
+        "windowMs": 86400000,
+        "contribution": "fixed-weight",
+        "fixedWeight": 800,
+        "spendAmountField": "params.amount",
+        "spendCurrency": "USD",
+        "estimatedTokens": 500,
+        "mode": "block",
+        "onDeny": "rpc-error",
+        "resultHeader": RESULT_HEADER
+    });
+    for (key, value) in overrides.as_object().unwrap() {
+        config[key] = value.clone();
+    }
+    PolicyConfig::builder()
+        .name(POLICY_NAME)
+        .configuration(config)
+        .build()
+}
+
+async fn start(policies: Vec<PolicyConfig>) -> anyhow::Result<(TestComposite, String, HttpMock)> {
+    let httpmock_config = HttpMockConfig::builder()
+        .port(80)
+        .version("latest")
+        .hostname("backend")
+        .build();
+    let api_config = ApiConfig::builder()
+        .name("myApi")
+        .upstream(&httpmock_config)
+        .path("/mcp/")
+        .port(FLEX_PORT)
+        .policies(policies)
+        .build();
+    let flex_config = FlexConfig::builder()
+        .version("1.14.0")
+        .hostname("local-flex")
+        .with_api(api_config)
+        .config_mounts([
+            (POLICY_DIR, "custom-policies"),
+            (COMMON_CONFIG_DIR, "common"),
+        ])
+        .build();
+    let composite = TestComposite::builder()
+        .with_service(flex_config)
+        .with_service(httpmock_config)
+        .build()
+        .await?;
+    let flex: Flex = composite.service()?;
+    let url = flex.external_url(FLEX_PORT).unwrap();
+    let httpmock: HttpMock = composite.service()?;
+    Ok((composite, url, httpmock))
+}
+
+fn call(id: u64) -> String {
+    json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+           "params":{"name":"get_orders","arguments":{}}})
+    .to_string()
+}
+
+#[derive(Debug, Clone)]
+struct Wire {
+    status: u16,
+    stamp: String,
+    rpc_error: Option<i64>,
+    at_ms: u128,
+}
+
+impl Wire {
+    fn json(&self) -> Value {
+        json!({"status": self.status, "stamp": self.stamp,
+               "rpc_error": self.rpc_error, "at_ms": self.at_ms})
+    }
+}
+
+fn epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
+async fn send(
+    client: &reqwest::Client,
+    url: &str,
+    id: u64,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<Wire> {
+    let mut request = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(call(id));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await?;
+    let status = response.status().as_u16();
+    let stamp = response
+        .headers()
+        .get(RESULT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = response.text().await?;
+    let rpc_error = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|v| v["error"]["code"].as_i64());
+    Ok(Wire {
+        status,
+        stamp,
+        rpc_error,
+        at_ms: epoch_ms(),
+    })
+}
+
+fn client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?)
+}
+
+fn record(case: &str, disposition: &str, detail: Value) {
+    let path = std::env::var("AGP_E2E_EVIDENCE").expect("set AGP_E2E_EVIDENCE");
+    let line = json!({"case": case, "disposition": disposition, "detail": detail});
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{line}").unwrap();
+}
+
+fn flex_container() -> anyhow::Result<String> {
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "-q",
+            "--filter",
+            "label=CreatedBy=pdk-test",
+            "--filter",
+            "ancestor=mulesoft/flex-gateway:1.14.0",
+        ])
+        .output()?;
+    let ids = String::from_utf8(out.stdout)?;
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    anyhow::ensure!(
+        ids.len() == 1,
+        "expected one pdk-test Flex container, got {ids:?}"
+    );
+    Ok(ids[0].to_string())
+}
+
+fn docker(args: &[&str]) -> anyhow::Result<String> {
+    let out = Command::new("docker").args(args).output()?;
+    anyhow::ensure!(out.status.success(), "docker {args:?} failed");
+    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+}
+
+fn ok_mock(server: &httpmock::MockServer) -> httpmock::Mock<'_> {
+    server.mock(|when, then| {
+        when.any_request();
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    })
+}
+
+/// Case 2: a real authentication policy (built-in HTTP Basic Authentication,
+/// which sets the authenticated principal) runs before the gate. The gate keys
+/// on `principal`, so a spoofed, ever-changing scope header has no effect.
+#[pdk_test]
+#[ignore]
+async fn case2_real_auth_policy_runs_first_and_spoofed_headers_are_ignored() -> anyhow::Result<()> {
+    // A throwaway password generated per run, never recorded.
+    let password: String = (0..24)
+        .map(|i| (b'a' + ((epoch_ms() as u64 + i * 11) % 26) as u8) as char)
+        .collect();
+    let basic = PolicyConfig::builder()
+        .name("http-basic-authentication-flex")
+        .configuration(json!({"username": "agent-alpha", "password": password}))
+        .build();
+    let (_c, url, httpmock) = start(vec![
+        basic,
+        gate(json!({"identitySource": "authentication", "identityField": "principal"})),
+    ])
+    .await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let upstream = ok_mock(&server);
+    let client = client()?;
+
+    // (a) No credentials: the auth policy refuses before the gate runs.
+    let no_creds = send(&client, &url, 1, &[]).await?;
+    upstream.assert_hits(0);
+
+    // (b) Valid credentials, a different spoofed scope header on every call.
+    let auth = format!(
+        "Basic {}",
+        STANDARD.encode(format!("agent-alpha:{password}"))
+    );
+    let mut calls = Vec::new();
+    for id in 1..=4u64 {
+        let spoof = format!("spoofed-{id}");
+        calls.push(
+            send(
+                &client,
+                &url,
+                id,
+                &[("authorization", &auth), ("x-agent-id", &spoof)],
+            )
+            .await?,
+        );
+    }
+    let hits = upstream.hits();
+
+    let pass = no_creds.status == 401
+        && calls[..3]
+            .iter()
+            .all(|w| w.status == 200 && w.rpc_error.is_none())
+        && calls[3].rpc_error == Some(-32008)
+        && calls.iter().all(|w| !w.stamp.contains("spoofed"))
+        && hits == 3;
+    record(
+        "2-auth-ordering",
+        if pass { "qualified" } else { "fail" },
+        json!({
+            "auth_policy": "http-basic-authentication-flex (Client ID Enforcement needs control-plane contracts, not available in local mode)",
+            "no_credentials": no_creds.json(),
+            "spoofed_calls": calls.iter().map(Wire::json).collect::<Vec<_>>(),
+            "upstream_hits": hits
+        }),
+    );
+    anyhow::ensure!(pass, "case 2 expectations not met");
+    Ok(())
+}
+
+/// Case 3: with `scopeDisclosure: digest` the result header and the gateway
+/// logs never carry the raw identity.
+#[pdk_test]
+#[ignore]
+async fn case3_digest_disclosure_never_exposes_the_identity() -> anyhow::Result<()> {
+    let key: String = (0..48)
+        .map(|i| (b'a' + ((epoch_ms() as u64 + i * 7) % 26) as u8) as char)
+        .collect();
+    let identity = "broker-digest-check-7";
+    let (_c, url, httpmock) = start(vec![gate(json!({
+        "scopeDisclosure": "digest", "scopeDigestKey": key
+    }))])
+    .await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let _upstream = ok_mock(&server);
+    let client = client()?;
+    let mut calls = Vec::new();
+    for id in 1..=4u64 {
+        calls.push(send(&client, &url, id, &[("x-agent-id", identity)]).await?);
+    }
+    let logs = Command::new("docker")
+        .args(["logs", &flex_container()?])
+        .output()?;
+    let mut all_logs = String::from_utf8_lossy(&logs.stdout).to_string();
+    all_logs.push_str(&String::from_utf8_lossy(&logs.stderr));
+    let in_logs = all_logs.contains(identity);
+    let key_in_logs = all_logs.contains(&key);
+    let in_headers = calls.iter().any(|w| w.stamp.contains(identity));
+    let pass = !in_logs && !key_in_logs && !in_headers && calls[3].rpc_error == Some(-32008);
+    // The stamp's scope is a keyed digest; record its shape, not the key.
+    record(
+        "3-digest-disclosure",
+        if pass { "pass" } else { "fail" },
+        json!({
+            "stamps": calls.iter().map(|w| w.stamp.clone()).collect::<Vec<_>>(),
+            "identity_in_headers": in_headers,
+            "identity_in_gateway_logs": in_logs,
+            "digest_key_in_gateway_logs": key_in_logs,
+            "gateway_log_bytes": all_logs.len()
+        }),
+    );
+    anyhow::ensure!(pass, "case 3 expectations not met");
+    Ok(())
+}
+
+/// Case 4: monitor mode forwards everything and stamps the over-budget calls.
+#[pdk_test]
+#[ignore]
+async fn case4_monitor_mode_forwards_and_stamps() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({"mode": "monitor"}))]).await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let upstream = ok_mock(&server);
+    let client = client()?;
+    let mut calls = Vec::new();
+    for id in 1..=5u64 {
+        calls.push(send(&client, &url, id, &[("x-agent-id", "broker-7")]).await?);
+    }
+    let hits = upstream.hits();
+    let pass = hits == 5
+        && calls
+            .iter()
+            .all(|w| w.status == 200 && w.rpc_error.is_none())
+        && calls[3].stamp.starts_with("monitor;")
+        && calls[3].stamp.contains("total=3200/3000")
+        && calls[4].stamp.contains("total=4000/3000");
+    record(
+        "4-monitor-mode",
+        if pass { "pass" } else { "fail" },
+        json!({"calls": calls.iter().map(Wire::json).collect::<Vec<_>>(), "upstream_hits": hits}),
+    );
+    anyhow::ensure!(pass, "case 4 expectations not met");
+    Ok(())
+}
+
+/// Case 5: a slow call's reservation is reclaimed after `reservationTimeoutMs`
+/// and frees budget for fast calls. Its response then settles late, or not at
+/// all once its tombstone has been dropped. Tombstones are dropped lazily, when
+/// a later call touches the scope, so `touch_at_ms` optionally sends one more
+/// call past two TTLs before the slow response lands. D's `would-be-total`
+/// shows whether the slow call was charged (3200) or not (2400).
+async fn reclaim_case(
+    case: &str,
+    slow_ms: u64,
+    touch_at_ms: Option<u64>,
+    expected: &str,
+    disposition_if_met: &str,
+) -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({
+        "reservationTimeoutMs": 1000, "aggregateBudget": 1600
+    }))])
+    .await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let slow = server.mock(|when, then| {
+        when.header("x-slow", "1");
+        then.status(200)
+            .header("content-type", "application/json")
+            .delay(Duration::from_millis(slow_ms))
+            .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    });
+    let fast = server.mock(|when, then| {
+        when.header("x-slow", "0");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+    });
+    let fast_headers = [("x-agent-id", "broker-7"), ("x-slow", "0")];
+    let client = client()?;
+    let started = Instant::now();
+    let slow_url = url.clone();
+    let slow_client = client.clone();
+    let slow_call = tokio::spawn(async move {
+        send(
+            &slow_client,
+            &slow_url,
+            1,
+            &[("x-agent-id", "broker-7"), ("x-slow", "1")],
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let b = send(&client, &url, 2, &fast_headers).await?;
+    let c = send(&client, &url, 3, &fast_headers).await?;
+    let touch = match touch_at_ms {
+        Some(at) => {
+            let wait = at.saturating_sub(started.elapsed().as_millis() as u64);
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            Some(send(&client, &url, 5, &fast_headers).await?)
+        }
+        None => None,
+    };
+    let a = slow_call.await??;
+    let elapsed = started.elapsed().as_millis();
+    let d = send(&client, &url, 4, &fast_headers).await?;
+    let charged = expected == "late-committed";
+    let want_d = if charged {
+        "would-be-total=3200"
+    } else {
+        "would-be-total=2400"
+    };
+    let pass = b.rpc_error.is_none()
+        && c.rpc_error.is_none()
+        && a.status == 200
+        && a.stamp.ends_with(&format!("settlement={expected}"))
+        && d.rpc_error == Some(-32008)
+        && d.stamp.contains(want_d);
+    record(
+        case,
+        if pass { disposition_if_met } else { "fail" },
+        json!({
+            "envoy_concurrency": std::env::var("PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY").ok(),
+            "slow_delay_ms": slow_ms, "ttl_ms": 1000, "touch_at_ms": touch_at_ms,
+            "expected_settlement": expected,
+            "slow": a.json(), "fast_b": b.json(), "fast_c": c.json(),
+            "touch": touch.as_ref().map(Wire::json),
+            "after_settlement_d": d.json(), "slow_elapsed_ms": elapsed,
+            "upstream_hits": {"slow": slow.hits(), "fast": fast.hits()}
+        }),
+    );
+    anyhow::ensure!(pass, "{case} expectations not met");
+    Ok(())
+}
+
+#[pdk_test]
+#[ignore]
+async fn case5a_late_commit_inside_one_extra_ttl() -> anyhow::Result<()> {
+    reclaim_case("5a-late-committed", 1500, None, "late-committed", "pass").await
+}
+
+/// No call touches the scope after reclaim, so the tombstone is still held
+/// when the slow response lands at 2.6 s and it settles late, even though that
+/// is past the README's "within one more timeout".
+#[pdk_test]
+#[ignore]
+async fn case5b_untouched_tombstone_still_settles_late_after_two_ttls() -> anyhow::Result<()> {
+    reclaim_case(
+        "5b-untouched-tombstone",
+        2600,
+        None,
+        "late-committed",
+        "qualified",
+    )
+    .await
+}
+
+/// A call at 2.3 s (past two TTLs) drops the tombstone, so the slow response
+/// at 3.5 s settles `not-active` and is not charged.
+#[pdk_test]
+#[ignore]
+async fn case5c_not_active_once_a_touch_drops_the_tombstone() -> anyhow::Result<()> {
+    reclaim_case("5c-not-active", 3500, Some(2300), "not-active", "pass").await
+}
+
+/// Case 6: a 60 s fixed window resets committed exposure at the next
+/// epoch-aligned minute boundary.
+#[pdk_test]
+#[ignore]
+async fn case6_fixed_window_resets_at_the_epoch_aligned_boundary() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({"windowMs": 60000}))]).await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let _upstream = ok_mock(&server);
+    let client = client()?;
+    // Start early in a minute so all four calls land in one period.
+    let into_minute = epoch_ms() % 60_000;
+    if into_minute > 40_000 {
+        tokio::time::sleep(Duration::from_millis((60_000 - into_minute + 1_000) as u64)).await;
+    }
+    let mut before = Vec::new();
+    for id in 1..=4u64 {
+        before.push(send(&client, &url, id, &[("x-agent-id", "broker-7")]).await?);
+    }
+    let boundary = (before[3].at_ms / 60_000 + 1) * 60_000;
+    let wait = boundary.saturating_sub(epoch_ms()) + 1_500;
+    tokio::time::sleep(Duration::from_millis(wait as u64)).await;
+    let after = send(&client, &url, 5, &[("x-agent-id", "broker-7")]).await?;
+    let pass = before[3].rpc_error == Some(-32008)
+        && after.rpc_error.is_none()
+        && after.at_ms >= boundary
+        && after.stamp.contains("total=800/3000");
+    record(
+        "6-fixed-window",
+        if pass { "pass" } else { "fail" },
+        json!({
+            "window_ms": 60000, "boundary_ms": boundary,
+            "before": before.iter().map(Wire::json).collect::<Vec<_>>(),
+            "after_boundary": after.json()
+        }),
+    );
+    anyhow::ensure!(pass, "case 6 expectations not met");
+    Ok(())
+}
+
+/// Case 7: a gateway restart resets the in-process ledger (documented).
+#[pdk_test]
+#[ignore]
+async fn case7_restart_resets_the_ledger() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let _upstream = ok_mock(&server);
+    let client = client()?;
+    let mut before = Vec::new();
+    for id in 1..=4u64 {
+        before.push(send(&client, &url, id, &[("x-agent-id", "broker-7")]).await?);
+    }
+    let container = flex_container()?;
+    docker(&["restart", &container])?;
+    let port = docker(&["port", &container, &format!("{FLEX_PORT}/tcp")])?;
+    let socket = port
+        .lines()
+        .next()
+        .unwrap_or("")
+        .replace("0.0.0.0", "127.0.0.1");
+    let new_url = format!("http://{socket}/mcp/");
+    let fresh = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let after = loop {
+        match send(&fresh, &new_url, 5, &[("x-agent-id", "broker-7")]).await {
+            Ok(w) if w.status == 200 => break w,
+            _ if Instant::now() < deadline => tokio::time::sleep(Duration::from_secs(2)).await,
+            other => anyhow::bail!("gateway not ready after restart: {other:?}"),
+        }
+    };
+    let pass = before[3].rpc_error == Some(-32008) && after.rpc_error.is_none();
+    record(
+        "7-restart",
+        if pass { "pass" } else { "fail" },
+        json!({
+            "before_restart": before.iter().map(Wire::json).collect::<Vec<_>>(),
+            "after_restart": after.json(),
+            "note": "expected: in-process ledger is reset by a restart (documented limitation)"
+        }),
+    );
+    anyhow::ensure!(pass, "case 7 expectations not met");
+    Ok(())
+}
+
+/// Case 8: fire many parallel calls over separate connections and record how
+/// many the per-worker ledgers admit. Observational: no fixed number asserted.
+#[pdk_test]
+#[ignore]
+async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let upstream = ok_mock(&server);
+    let container = flex_container()?;
+    let nproc = docker(&["exec", &container, "nproc"]).unwrap_or_default();
+    let envoy_args = docker(&[
+        "exec",
+        &container,
+        "sh",
+        "-c",
+        "ps -eo args | grep -m1 '[e]nvoy'",
+    ])
+    .unwrap_or_default();
+    let concurrency = envoy_args
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--concurrency")
+        .map(|w| w[1].to_string());
+
+    let total = 200u64;
+    let mut handles = Vec::new();
+    for id in 1..=total {
+        let url = url.clone();
+        handles.push(tokio::spawn(async move {
+            // One client per call: a fresh connection each time, so calls can
+            // land on different worker threads.
+            let c = reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap();
+            send(&c, &url, id, &[("x-agent-id", "broker-7")]).await
+        }));
+    }
+    let mut admitted = 0u64;
+    let mut refused = 0u64;
+    let mut other = 0u64;
+    for handle in handles {
+        match handle.await? {
+            Ok(w) if w.status == 200 && w.rpc_error.is_none() => admitted += 1,
+            Ok(w) if w.rpc_error == Some(-32008) => refused += 1,
+            _ => other += 1,
+        }
+    }
+    let hits = upstream.hits();
+    record(
+        "8-per-worker-budget",
+        "observed",
+        json!({
+            "calls": total, "admitted": admitted, "refused": refused, "other": other,
+            "upstream_hits": hits, "per_worker_admit_limit": 3,
+            "container_nproc": nproc, "envoy_concurrency_flag": concurrency,
+            "implied_workers_with_traffic_at_least": admitted.div_ceil(3)
+        }),
+    );
+    anyhow::ensure!(
+        other == 0 && admitted == hits as u64,
+        "case 8 transport errors or hit mismatch"
+    );
+    Ok(())
+}

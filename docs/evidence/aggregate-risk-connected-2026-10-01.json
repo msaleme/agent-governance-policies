@@ -1,0 +1,443 @@
+{
+  "artifact": "aggregate-risk-gate",
+  "run_date_utc": "2026-10-01",
+  "source_commit": "5b71d80",
+  "policy_source_changed": false,
+  "wasm_sha256": "33443716859f371bead629ab61cf326cb6b63496442fab0688e3898b4cce5ff9",
+  "gateway": {
+    "image": "mulesoft/flex-gateway:1.14.0",
+    "image_digest": "sha256:b21e1d901492bc2d2604848eff63e8c887c44a599f749d68212c5d19471452d1",
+    "mode": "local (pdk_test harness, disposable local-mode registration)",
+    "platform": "linux/amd64 under Rosetta on macOS",
+    "container_nproc": 14,
+    "envoy_concurrency_default": 4,
+    "envoy_concurrency_single_worker_runs": 1
+  },
+  "toolchain": {
+    "rustc": "1.89.0",
+    "pdk-test": "1.10.0",
+    "cargo-anypoint": "1.9.0 (Makefile pins 1.10.0)",
+    "anypoint-pdk-plugin": "1.9.0"
+  },
+  "harness": "aggregate-risk-gate/tests/connected_e2e.rs (cases 2-8, #[ignore]); case 1 = unmodified tests/requests.rs",
+  "cases": [
+    {
+      "case": "1-committed-pdk-test",
+      "disposition": "pass",
+      "utc": "2026-10-01T21:13:47Z",
+      "detail": {
+        "result": "2 passed; 0 failed",
+        "tests": [
+          "sequential_composition_through_a_real_gateway_refuses_the_fourth_call",
+          "a_different_agent_has_an_independent_budget_through_a_real_gateway"
+        ]
+      }
+    },
+    {
+      "case": "2-auth-ordering",
+      "detail": {
+        "auth_policy": "http-basic-authentication-flex (Client ID Enforcement needs control-plane contracts, not available in local mode)",
+        "no_credentials": {
+          "at_ms": 1790892243386,
+          "rpc_error": null,
+          "stamp": "",
+          "status": 401
+        },
+        "spoofed_calls": [
+          {
+            "at_ms": 1790892243905,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:agent-alpha;contribution=800;total=800/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790892243948,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:agent-alpha;contribution=800;total=1600/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790892244049,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:agent-alpha;contribution=800;total=2400/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790892244096,
+            "rpc_error": -32008,
+            "stamp": "denied;scope=agent:agent-alpha;would-be-total=3200;budget=3000;unit=points",
+            "status": 200
+          }
+        ],
+        "upstream_hits": 3
+      },
+      "disposition": "qualified"
+    },
+    {
+      "case": "3-digest-disclosure",
+      "detail": {
+        "digest_key_in_gateway_logs": false,
+        "gateway_log_bytes": 60766,
+        "identity_in_gateway_logs": false,
+        "identity_in_headers": false,
+        "stamps": [
+          "allowed;scope=agent:hmac-ffc8f4c46b0d8b16;contribution=800;total=800/3000;unit=points;settlement=committed",
+          "allowed;scope=agent:hmac-ffc8f4c46b0d8b16;contribution=800;total=1600/3000;unit=points;settlement=committed",
+          "allowed;scope=agent:hmac-ffc8f4c46b0d8b16;contribution=800;total=2400/3000;unit=points;settlement=committed",
+          "denied;scope=agent:hmac-ffc8f4c46b0d8b16;would-be-total=3200;budget=3000;unit=points"
+        ]
+      },
+      "disposition": "pass"
+    },
+    {
+      "case": "4-monitor-mode",
+      "detail": {
+        "calls": [
+          {
+            "at_ms": 1790889725279,
+            "rpc_error": null,
+            "stamp": "monitor;scope=agent:broker-7;contribution=800;total=800/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790889725281,
+            "rpc_error": null,
+            "stamp": "monitor;scope=agent:broker-7;contribution=800;total=1600/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790889725282,
+            "rpc_error": null,
+            "stamp": "monitor;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790889725283,
+            "rpc_error": null,
+            "stamp": "monitor;scope=agent:broker-7;contribution=800;total=3200/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790889725283,
+            "rpc_error": null,
+            "stamp": "monitor;scope=agent:broker-7;contribution=800;total=4000/3000;unit=points;settlement=committed",
+            "status": 200
+          }
+        ],
+        "upstream_hits": 5
+      },
+      "disposition": "pass"
+    },
+    {
+      "case": "5a-late-committed",
+      "detail": {
+        "after_settlement_d": {
+          "at_ms": 1790890749401,
+          "rpc_error": -32008,
+          "stamp": "denied;scope=agent:broker-7;would-be-total=3200;budget=1600;unit=points",
+          "status": 200
+        },
+        "envoy_concurrency": "1",
+        "expected_settlement": "late-committed",
+        "fast_b": {
+          "at_ms": 1790890749061,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/1600;unit=points;settlement=committed",
+          "status": 200
+        },
+        "fast_c": {
+          "at_ms": 1790890749065,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=1600/1600;unit=points;settlement=committed",
+          "status": 200
+        },
+        "slow": {
+          "at_ms": 1790890749393,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/1600;unit=points;settlement=late-committed",
+          "status": 200
+        },
+        "slow_delay_ms": 1500,
+        "slow_elapsed_ms": 1559,
+        "touch": null,
+        "touch_at_ms": null,
+        "ttl_ms": 1000,
+        "upstream_hits": {
+          "fast": 2,
+          "slow": 1
+        }
+      },
+      "disposition": "pass"
+    },
+    {
+      "case": "5b-untouched-tombstone",
+      "detail": {
+        "after_settlement_d": {
+          "at_ms": 1790890765721,
+          "rpc_error": -32008,
+          "stamp": "denied;scope=agent:broker-7;would-be-total=3200;budget=1600;unit=points",
+          "status": 200
+        },
+        "envoy_concurrency": "1",
+        "expected_settlement": "late-committed",
+        "fast_b": {
+          "at_ms": 1790890764275,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/1600;unit=points;settlement=committed",
+          "status": 200
+        },
+        "fast_c": {
+          "at_ms": 1790890764277,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=1600/1600;unit=points;settlement=committed",
+          "status": 200
+        },
+        "slow": {
+          "at_ms": 1790890765706,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/1600;unit=points;settlement=late-committed",
+          "status": 200
+        },
+        "slow_delay_ms": 2600,
+        "slow_elapsed_ms": 2651,
+        "touch": null,
+        "touch_at_ms": null,
+        "ttl_ms": 1000,
+        "upstream_hits": {
+          "fast": 2,
+          "slow": 1
+        }
+      },
+      "disposition": "qualified"
+    },
+    {
+      "case": "5c-not-active",
+      "detail": {
+        "after_settlement_d": {
+          "at_ms": 1790890783509,
+          "rpc_error": -32008,
+          "stamp": "denied;scope=agent:broker-7;would-be-total=2400;budget=1600;unit=points",
+          "status": 200
+        },
+        "envoy_concurrency": "1",
+        "expected_settlement": "not-active",
+        "fast_b": {
+          "at_ms": 1790890781164,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/1600;unit=points;settlement=committed",
+          "status": 200
+        },
+        "fast_c": {
+          "at_ms": 1790890781166,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=1600/1600;unit=points;settlement=committed",
+          "status": 200
+        },
+        "slow": {
+          "at_ms": 1790890783506,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/1600;unit=points;settlement=not-active",
+          "status": 200
+        },
+        "slow_delay_ms": 3500,
+        "slow_elapsed_ms": 3570,
+        "touch": {
+          "at_ms": 1790890782251,
+          "rpc_error": -32008,
+          "stamp": "denied;scope=agent:broker-7;would-be-total=2400;budget=1600;unit=points",
+          "status": 200
+        },
+        "touch_at_ms": 2300,
+        "ttl_ms": 1000,
+        "upstream_hits": {
+          "fast": 2,
+          "slow": 1
+        }
+      },
+      "disposition": "pass"
+    },
+    {
+      "case": "6-fixed-window",
+      "detail": {
+        "after_boundary": {
+          "at_ms": 1790890861516,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/3000;unit=points;settlement=committed",
+          "status": 200
+        },
+        "before": [
+          {
+            "at_ms": 1790890814509,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790890814512,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:broker-7;contribution=800;total=1600/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790890814514,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790890814523,
+            "rpc_error": -32008,
+            "stamp": "denied;scope=agent:broker-7;would-be-total=3200;budget=3000;unit=points",
+            "status": 200
+          }
+        ],
+        "boundary_ms": 1790890860000,
+        "window_ms": 60000
+      },
+      "disposition": "pass"
+    },
+    {
+      "case": "7-restart",
+      "detail": {
+        "after_restart": {
+          "at_ms": 1790890885827,
+          "rpc_error": null,
+          "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/3000;unit=points;settlement=committed",
+          "status": 200
+        },
+        "before_restart": [
+          {
+            "at_ms": 1790890874348,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:broker-7;contribution=800;total=800/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790890874351,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:broker-7;contribution=800;total=1600/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790890874353,
+            "rpc_error": null,
+            "stamp": "allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points;settlement=committed",
+            "status": 200
+          },
+          {
+            "at_ms": 1790890874361,
+            "rpc_error": -32008,
+            "stamp": "denied;scope=agent:broker-7;would-be-total=3200;budget=3000;unit=points",
+            "status": 200
+          }
+        ],
+        "note": "expected: in-process ledger is reset by a restart (documented limitation)"
+      },
+      "disposition": "pass"
+    },
+    {
+      "case": "8-per-worker-budget",
+      "disposition": "observed",
+      "runs": [
+        {
+          "admitted": 12,
+          "calls": 200,
+          "container_nproc": "14",
+          "envoy_concurrency_flag": "4",
+          "implied_workers_with_traffic_at_least": 4,
+          "other": 0,
+          "per_worker_admit_limit": 3,
+          "refused": 188,
+          "upstream_hits": 12
+        },
+        {
+          "admitted": 3,
+          "calls": 200,
+          "container_nproc": "14",
+          "envoy_concurrency_flag": "1",
+          "implied_workers_with_traffic_at_least": 1,
+          "other": 0,
+          "per_worker_admit_limit": 3,
+          "refused": 197,
+          "upstream_hits": 3
+        }
+      ]
+    },
+    {
+      "case": "9-exchange-publication",
+      "disposition": "qualified",
+      "utc": "2026-10-01T21:46:03Z",
+      "detail": {
+        "asset_ids": "disposable aggregate-risk-gate-livetest-dev / aggregate-risk-gate-livetest-flex-dev (make publish dev publish)",
+        "make_publish_exit": 0,
+        "check_exchange_metadata_assets": "OK",
+        "definition_get": 200,
+        "implementation_get": 200,
+        "published_metadata": {
+          "assetTypes": [
+            "mcp"
+          ],
+          "description_length": 232,
+          "injectionPoint": "inbound",
+          "category": "Security"
+        },
+        "qualification": "built with cargo-anypoint 1.9.0, not the pinned 1.10.0; dev publish (not a release version)",
+        "finding": "PDK CLI build-asset-files rejects asset ids containing any digit (\"Invalid asset-id\"), contrary to its own message"
+      }
+    }
+  ],
+  "superseded_runs": [
+    {
+      "case": "4",
+      "reason": "harness assertion copied the brief's wrong expectation (reason=budget-exceeded); policy output matched the README's documented format; assertion corrected, rerun passed"
+    },
+    {
+      "case": "5a/5b at envoy concurrency 4",
+      "reason": "slow and fast calls landed on different worker ledgers; rerun with FLEX_SERVICE_ENVOY_CONCURRENCY=1"
+    },
+    {
+      "case": "2 (first run)",
+      "reason": "used a hardcoded test-only Basic Auth password; the harness now generates it per run. Same wire results on rerun."
+    },
+    {
+      "case": "2 (rerun 1)",
+      "reason": "stale target/ assets from the case 9 publish build renamed the policy, so Flex loaded no gate (empty stamps, 4 hits); the case predicate failed it. Rebuilt with the original asset ids (WASM SHA-256 unchanged) and reran: pass."
+    }
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "case": "5b",
+      "summary": "An untouched tombstone still settles late-committed after 2 x TTL (slow call 2.65 s, TTL 1 s); README says late settlement applies only 'within one more timeout' and not-active after. Tombstones drop lazily on the next call that touches the scope. Over-counts (safe direction); docs/behaviour mismatch.",
+      "issue_filed": false
+    },
+    {
+      "id": "F2",
+      "case": "8",
+      "summary": "Observed 12/200 admitted at envoy concurrency 4 (= 4 x 3) and 3/200 at concurrency 1, matching README's N x aggregateBudget. FLEX_SERVICE_ENVOY_CONCURRENCY=1 gives one budget per replica; README could say so.",
+      "issue_filed": false
+    },
+    {
+      "id": "F3",
+      "case": "2",
+      "summary": "Client ID Enforcement could not be exercised in local mode (needs control-plane contracts); http-basic-authentication-flex used as the upstream authentication policy. Ordering and spoof-resistance proven; Client-ID-specific run still pending on a connected gateway.",
+      "issue_filed": false
+    }
+  ],
+  "resource_deletion": {
+    "exchange_assets": {
+      "deleted": true,
+      "method": "DELETE x-delete-type: hard-delete -> 204",
+      "confirmed": "GET by version and by asset -> 404"
+    },
+    "flex_registration": {
+      "deleted": true,
+      "note": "two local-mode registrations (original + one for the case 2 rerun); local mode creates no Runtime Manager record (verified absent from both env gateway lists and ARM servers); certificates + keys securely removed from disk"
+    },
+    "containers_networks": {
+      "deleted": true,
+      "confirmed": "0 containers / 0 networks labelled CreatedBy=pdk-test"
+    },
+    "shared_resources_touched": false
+  }
+}

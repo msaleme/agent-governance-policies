@@ -42,6 +42,14 @@ window reset, restart, the observed per-worker budget, and Exchange publication.
 authorization, handling and honesty rules below apply unchanged. The brief adds a mandatory
 redaction grep because this repo is public.
 
+**Status (2026-10-01):** run on the maintainer's Mac in local mode, not on Astra. Evidence is in
+`docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`, and the harness is
+`aggregate-risk-gate/tests/connected_e2e.rs`. Three items are still open:
+
+- a case 2 rerun with real Client ID Enforcement on a connected gateway;
+- a case 9 rerun under cargo-anypoint 1.10.0;
+- finding F1 (lazy tombstones) and F2 (single-worker note), not yet filed.
+
 ## Earlier task (done): approval-binding P5/P6
 
 **Prove — on a real, disposable, explicitly-authorized Flex/Omni Gateway — the small set
