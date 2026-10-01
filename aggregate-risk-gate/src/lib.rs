@@ -8,8 +8,9 @@
 // it.
 //
 // Mechanism: reserve-then-authorize. On each governed call this policy computes
-// the call's exposure contribution (a token-cost estimate, a spend amount read
-// from the request body, or a fixed per-call weight), atomically reserves that
+// the call's exposure contribution as an exact integer (an estimated-token
+// weight, a spend amount in currency minor units read from the request body, or
+// a fixed per-call weight), atomically reserves that
 // contribution against a serialized ledger keyed by budget scope (agent, fabric,
 // or tenant) BEFORE authorizing, allows the call only if committed-plus-reserved
 // exposure stays within the aggregate budget, commits the reservation once the
@@ -48,6 +49,7 @@ use pdk::policy_violation::PolicyViolations;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::TryFrom;
 
 use crate::generated::config::Config;
 use crate::ledger::{Denial, Ledger, LedgerStore, Reservation};
@@ -64,6 +66,13 @@ const MCP_BLOCKED_CODE: i64 = -32008;
 /// fallback (treat the call as unpriceable, or fall back to the estimate) rather
 /// than a risk of missing a hidden secret.
 const MAX_INSPECT_BYTES: usize = 64 * 1024;
+
+/// The largest budget or contribution this policy accepts: 2^53 - 1, the
+/// largest integer every JSON implementation represents exactly. Every amount
+/// is an exact non-negative integer (points, estimated tokens, or currency
+/// minor units); anything above this is rejected as out of range rather than
+/// rounded, so ledger arithmetic can never lose precision (P4A review #18).
+const MAX_UNITS: u64 = 9_007_199_254_740_991;
 
 /// The request body available to this policy for pricing/batch-shape
 /// inspection, resolved at the HEADER phase, before any buffering decision.
@@ -291,9 +300,19 @@ enum OnDeny {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Contribution {
-    TokenCost,
+    EstimatedTokenWeight,
     SpendAmount,
     FixedWeight,
+}
+
+/// Validates a configured amount as an exact integer in `0..=MAX_UNITS`.
+/// Fractional and non-numeric values never get this far: the generated
+/// `Config` types these fields as `i64`, so serde rejects them first.
+fn config_units(name: &str, value: i64) -> Result<u64> {
+    u64::try_from(value)
+        .ok()
+        .filter(|units| *units <= MAX_UNITS)
+        .ok_or_else(|| anyhow!("{name} must be an integer between 0 and {MAX_UNITS}"))
 }
 
 /// Compiled, validated policy state, built once at configuration time and
@@ -303,11 +322,14 @@ struct Gate {
     budget_scope: String,
     needs_scope_header: bool,
     scope_header: String,
-    aggregate_budget: f64,
+    aggregate_budget: u64,
     contribution: Contribution,
-    fixed_weight: f64,
+    /// The unit every amount is counted in, stamped into `resultHeader` so a
+    /// downstream reader never has to guess what "800" means.
+    unit: String,
+    fixed_weight: u64,
     spend_amount_field: String,
-    estimated_tokens: f64,
+    estimated_tokens: u64,
     mode: Mode,
     on_deny: OnDeny,
     result_header: String,
@@ -325,12 +347,18 @@ impl Gate {
             }
         };
         let contribution = match config.contribution.as_str() {
-            "token-cost" => Contribution::TokenCost,
+            "estimated-token-weight" => Contribution::EstimatedTokenWeight,
             "spend-amount" => Contribution::SpendAmount,
             "fixed-weight" => Contribution::FixedWeight,
+            "token-cost" => {
+                return Err(anyhow!(
+                    "contribution \"token-cost\" was renamed to \"estimated-token-weight\": it \
+                     charges a fixed estimate per call and never measures actual token usage"
+                ))
+            }
             other => {
                 return Err(anyhow!(
-                    "contribution must be token-cost, spend-amount, or fixed-weight, got {other:?}"
+                    "contribution must be estimated-token-weight, spend-amount, or fixed-weight, got {other:?}"
                 ))
             }
         };
@@ -356,19 +384,20 @@ impl Gate {
                 ))
             }
         };
-        if !config.aggregate_budget.is_finite() || config.aggregate_budget < 0.0 {
+        let aggregate_budget = config_units("aggregateBudget", config.aggregate_budget)?;
+        let fixed_weight = config_units("fixedWeight", config.fixed_weight)?;
+        let estimated_tokens = config_units("estimatedTokens", config.estimated_tokens)?;
+        let spend_currency = config.spend_currency.trim();
+        if spend_currency.len() != 3 || !spend_currency.bytes().all(|b| b.is_ascii_uppercase()) {
             return Err(anyhow!(
-                "aggregateBudget must be a non-negative finite number"
+                "spendCurrency must be an ISO 4217 code of three uppercase letters, got {spend_currency:?}"
             ));
         }
-        if !config.fixed_weight.is_finite() || config.fixed_weight < 0.0 {
-            return Err(anyhow!("fixedWeight must be a non-negative finite number"));
-        }
-        if !config.estimated_tokens.is_finite() || config.estimated_tokens < 0.0 {
-            return Err(anyhow!(
-                "estimatedTokens must be a non-negative finite number"
-            ));
-        }
+        let unit = match contribution {
+            Contribution::FixedWeight => "points".to_string(),
+            Contribution::EstimatedTokenWeight => "estimated-tokens".to_string(),
+            Contribution::SpendAmount => format!("{spend_currency}-minor"),
+        };
 
         let needs_scope_header = budget_scope != "fabric";
         let scope_header = config.scope_header.trim().to_string();
@@ -413,11 +442,12 @@ impl Gate {
             budget_scope,
             needs_scope_header,
             scope_header,
-            aggregate_budget: config.aggregate_budget,
+            aggregate_budget,
             contribution,
-            fixed_weight: config.fixed_weight,
+            unit,
+            fixed_weight,
             spend_amount_field,
-            estimated_tokens: config.estimated_tokens,
+            estimated_tokens,
             mode,
             on_deny,
             result_header,
@@ -456,17 +486,39 @@ fn dot_path_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 
 /// What this call's exposure contribution turned out to be, pre-flight.
 enum ContributionOutcome {
-    /// The real, known-now contribution (fixed-weight, or a parsed spend
-    /// amount).
-    Known(f64),
-    /// A pre-flight ESTIMATE (token-cost). This build never reads the
-    /// response body to learn a real usage figure (see `response_filter`),
-    /// so the estimate itself is what ultimately gets committed in
-    /// `response_filter` — settled, not reconciled against anything real.
-    Estimate(f64),
+    /// The exact contribution, in `0..=MAX_UNITS`: fixed-weight points, the
+    /// estimated-token weight, or a parsed spend amount in minor units. Every
+    /// mode charges exactly this on success; nothing is trued up afterwards.
+    Known(u64),
     /// contribution=spend-amount and the body was missing, unparseable, or
-    /// missing/non-numeric at `spendAmountField`.
+    /// had no exact non-negative integer at `spendAmountField`.
     Unpriceable,
+    /// The amount was a valid integer, but it (or the batch total) exceeds
+    /// `MAX_UNITS`, so it cannot be charged exactly.
+    OutOfRange,
+}
+
+/// Reads a spend amount as an exact count of minor units. Only a JSON integer
+/// literal qualifies: serde_json parses `12.34`, `1234.0`, and `1e3` as floats
+/// and `-5` as a negative integer, so all of them fail `as_u64` and are
+/// rejected rather than rounded. `Err(())` means a valid integer above
+/// `MAX_UNITS`.
+fn exact_minor_units(value: &Value) -> Option<Result<u64, ()>> {
+    let units = value.as_u64()?;
+    Some(if units <= MAX_UNITS {
+        Ok(units)
+    } else {
+        Err(())
+    })
+}
+
+/// `per_item * items`, or `OutOfRange` if that exceeds `MAX_UNITS`.
+fn per_item_total(per_item: u64, items: usize) -> ContributionOutcome {
+    u64::try_from(items)
+        .ok()
+        .and_then(|items| per_item.checked_mul(items))
+        .filter(|total| *total <= MAX_UNITS)
+        .map_or(ContributionOutcome::OutOfRange, ContributionOutcome::Known)
 }
 
 /// How many JSON-RPC calls `body` represents, for contribution accounting. A
@@ -491,13 +543,12 @@ fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
     };
     match gate.contribution {
         Contribution::FixedWeight => {
-            let items = body.map(body_item_count).unwrap_or(1) as f64;
-            ContributionOutcome::Known(gate.fixed_weight * items)
+            per_item_total(gate.fixed_weight, body.map(body_item_count).unwrap_or(1))
         }
-        Contribution::TokenCost => {
-            let items = body.map(body_item_count).unwrap_or(1) as f64;
-            ContributionOutcome::Estimate(gate.estimated_tokens * items)
-        }
+        Contribution::EstimatedTokenWeight => per_item_total(
+            gate.estimated_tokens,
+            body.map(body_item_count).unwrap_or(1),
+        ),
         Contribution::SpendAmount => {
             let Some(body) = body else {
                 return ContributionOutcome::Unpriceable;
@@ -509,14 +560,18 @@ fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
                 Value::Array(items) if !items.is_empty() => items.iter().collect(),
                 _ => vec![&value],
             };
-            let mut total = 0.0;
+            let mut total: u64 = 0;
             for item in &items {
-                match dot_path_value(item, &gate.spend_amount_field).and_then(Value::as_f64) {
-                    Some(amount) if amount.is_finite() && amount >= 0.0 => total += amount,
+                match dot_path_value(item, &gate.spend_amount_field).and_then(exact_minor_units) {
+                    Some(Ok(amount)) => match total.checked_add(amount) {
+                        Some(sum) if sum <= MAX_UNITS => total = sum,
+                        _ => return ContributionOutcome::OutOfRange,
+                    },
+                    Some(Err(())) => return ContributionOutcome::OutOfRange,
                     // Fail closed on the WHOLE batch if any one item is
                     // unpriceable — never silently price the batch at only
                     // the items that happened to parse.
-                    _ => return ContributionOutcome::Unpriceable,
+                    None => return ContributionOutcome::Unpriceable,
                 }
             }
             ContributionOutcome::Known(total)
@@ -530,24 +585,26 @@ fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
 enum DenyReason {
     MissingScopeHeader,
     Unpriceable,
+    OutOfRange,
     BudgetExceeded(Denial),
 }
 
 impl DenyReason {
-    fn stamp(&self, scope: &str) -> String {
+    fn stamp(&self, scope: &str, unit: &str) -> String {
         match self {
             DenyReason::MissingScopeHeader => {
                 format!("denied;scope={scope};reason=missing-scope-header")
             }
             DenyReason::Unpriceable => format!("denied;scope={scope};reason=unpriceable"),
+            DenyReason::OutOfRange => format!("denied;scope={scope};reason=out-of-range"),
             DenyReason::BudgetExceeded(denial) => format!(
-                "denied;scope={scope};would-be-total={:.2};budget={:.2}",
+                "denied;scope={scope};would-be-total={};budget={};unit={unit}",
                 denial.would_be_total, denial.budget
             ),
         }
     }
 
-    fn message(&self, scope: &str) -> String {
+    fn message(&self, scope: &str, unit: &str) -> String {
         match self {
             DenyReason::MissingScopeHeader => {
                 format!("aggregate risk gate: missing the required scope-identity header for scope \"{scope}\"")
@@ -555,8 +612,11 @@ impl DenyReason {
             DenyReason::Unpriceable => {
                 format!("aggregate risk gate: call could not be priced for scope \"{scope}\"")
             }
+            DenyReason::OutOfRange => format!(
+                "aggregate risk gate: call contribution for scope \"{scope}\" exceeds the maximum of {MAX_UNITS} {unit}"
+            ),
             DenyReason::BudgetExceeded(denial) => format!(
-                "aggregate risk gate: call would compose scope \"{scope}\" to {:.2}, over its aggregate budget of {:.2}",
+                "aggregate risk gate: call would compose scope \"{scope}\" to {} {unit}, over its aggregate budget of {}",
                 denial.would_be_total, denial.budget
             ),
         }
@@ -570,17 +630,15 @@ impl DenyReason {
 /// request to the upstream, not the response the caller sees.
 #[derive(Clone, Debug)]
 enum Ticket {
-    /// Nothing was reserved (a monitor-mode unpriceable call) — the response
-    /// filter only needs to stamp the header.
+    /// Nothing was reserved (a monitor-mode unpriceable or out-of-range
+    /// call) — the response filter only needs to stamp the header.
     None(String),
-    /// A reservation for a KNOWN contribution (fixed-weight or spend-amount):
-    /// commit on a successful response, release otherwise.
+    /// A reservation for the call's exact contribution: commit on a
+    /// successful response, release otherwise. Every contribution mode,
+    /// including estimated-token-weight, settles at exactly the reserved
+    /// amount — this build never reads the response body (see
+    /// `response_filter`).
     Reserved(String, Reservation),
-    /// A reservation made against an ESTIMATE (token-cost): settled at the
-    /// pre-flight estimate itself on success (this build never reads the
-    /// response body to learn a real usage figure — see `response_filter`),
-    /// or released on failure.
-    Estimated(String, Reservation),
 }
 
 fn is_success(status: u32) -> bool {
@@ -590,14 +648,11 @@ fn is_success(status: u32) -> bool {
 /// Reserves (block mode) or force-reserves (monitor mode, which never denies)
 /// `contribution` against `scope`, builds the allow/monitor header stamp, and
 /// returns the ticket to carry into the response phase — where the stamp is
-/// actually applied to the client-facing response. `estimate` selects whether
-/// the resulting ticket is `Reserved` (known amount) or `Estimated`
-/// (token-cost).
+/// actually applied to the client-facing response.
 fn admit(
     gate: &Gate,
     scope: &str,
-    contribution: f64,
-    estimate: bool,
+    contribution: u64,
     echo_bytes: Option<&[u8]>,
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
@@ -615,13 +670,13 @@ fn admit(
                 // key off one signal across the whole gateway.
                 violations.generate_policy_violation();
                 let reason = DenyReason::BudgetExceeded(denial);
-                let stamp = reason.stamp(scope);
+                let stamp = reason.stamp(scope, &gate.unit);
                 let response = deny_response(
                     gate.on_deny,
                     echo_bytes,
                     &gate.result_header,
                     &stamp,
-                    &reason.message(scope),
+                    &reason.message(scope, &gate.unit),
                 );
                 return Flow::Break(response);
             }
@@ -647,14 +702,10 @@ fn admit(
         "monitor"
     };
     let stamp = format!(
-        "{verb};scope={scope};contribution={contribution:.2};total={total_after:.2}/{:.2}",
-        gate.aggregate_budget
+        "{verb};scope={scope};contribution={contribution};total={total_after}/{};unit={}",
+        gate.aggregate_budget, gate.unit
     );
-    Flow::Continue(if estimate {
-        Ticket::Estimated(stamp, reservation)
-    } else {
-        Ticket::Reserved(stamp, reservation)
-    })
+    Flow::Continue(Ticket::Reserved(stamp, reservation))
 }
 
 fn decide(
@@ -676,48 +727,44 @@ fn decide(
 
     if missing_header && gate.mode == Mode::Block {
         let reason = DenyReason::MissingScopeHeader;
-        let stamp = reason.stamp(&scope);
+        let stamp = reason.stamp(&scope, &gate.unit);
         let response = deny_response(
             gate.on_deny,
             echo_bytes,
             &gate.result_header,
             &stamp,
-            &reason.message(&scope),
+            &reason.message(&scope, &gate.unit),
         );
         return Flow::Break(response);
     }
 
-    match compute_contribution(gate, raw_body) {
-        ContributionOutcome::Unpriceable => {
-            if gate.mode == Mode::Block {
-                let reason = DenyReason::Unpriceable;
-                let stamp = reason.stamp(&scope);
-                let response = deny_response(
-                    gate.on_deny,
-                    echo_bytes,
-                    &gate.result_header,
-                    &stamp,
-                    &reason.message(&scope),
-                );
-                Flow::Break(response)
-            } else {
-                // Monitor mode: the call still happened, so it is recorded (at a
-                // zero contribution — its real exposure is unknown, not zero, but
-                // there is nothing safe to guess) so the scope shows up in the
-                // ledger and an operator can see the gap; the gap itself is made
-                // visible on the header rather than silently inflating or
-                // deflating the running total.
-                gate.ledger.record(&scope, 0.0);
-                let stamp = format!("monitor;scope={scope};reason=unpriceable");
-                Flow::Continue(Ticket::None(stamp))
-            }
-        }
+    let (reason, label) = match compute_contribution(gate, raw_body) {
         ContributionOutcome::Known(amount) => {
-            admit(gate, &scope, amount, false, echo_bytes, violations)
+            return admit(gate, &scope, amount, echo_bytes, violations)
         }
-        ContributionOutcome::Estimate(estimate) => {
-            admit(gate, &scope, estimate, true, echo_bytes, violations)
-        }
+        ContributionOutcome::Unpriceable => (DenyReason::Unpriceable, "unpriceable"),
+        ContributionOutcome::OutOfRange => (DenyReason::OutOfRange, "out-of-range"),
+    };
+    if gate.mode == Mode::Block {
+        let stamp = reason.stamp(&scope, &gate.unit);
+        let response = deny_response(
+            gate.on_deny,
+            echo_bytes,
+            &gate.result_header,
+            &stamp,
+            &reason.message(&scope, &gate.unit),
+        );
+        Flow::Break(response)
+    } else {
+        // Monitor mode: the call still happened, so it is recorded (at a zero
+        // contribution — its real exposure is unknown or unrepresentable, not
+        // zero, but there is nothing exact to charge) so the scope shows up in
+        // the ledger and an operator can see the gap; the gap itself is made
+        // visible on the header rather than silently inflating or deflating the
+        // running total.
+        gate.ledger.record(&scope, 0);
+        let stamp = format!("monitor;scope={scope};reason={label}");
+        Flow::Continue(Ticket::None(stamp))
     }
 }
 
@@ -766,39 +813,30 @@ async fn response_filter(
     // never to the request-phase handler, whose `set_header` would instead
     // mutate the outbound request to the upstream tool.
     let headers_state = response_state.into_headers_state().await;
-    let (stamp, resolution) = match ticket {
+    let (stamp, reservation) = match ticket {
         Ticket::None(stamp) => (stamp, None),
-        Ticket::Reserved(stamp, reservation) => (stamp, Some((reservation, false))),
-        Ticket::Estimated(stamp, reservation) => (stamp, Some((reservation, true))),
+        Ticket::Reserved(stamp, reservation) => (stamp, Some(reservation)),
     };
     headers_state
         .handler()
         .set_header(&gate.result_header, &stamp);
 
-    let Some((reservation, is_estimate)) = resolution else {
+    let Some(reservation) = reservation else {
         return;
     };
 
-    if !is_success(headers_state.status_code()) {
-        gate.ledger.release(reservation);
-        return;
-    }
-
-    if !is_estimate {
+    // Every contribution mode settles at exactly the reserved amount. In
+    // particular estimated-token-weight is NOT reconciled against real usage:
+    // this filter never calls `into_headers_body_state()` on the response leg
+    // (headers-only, by design — buffering a large/streamed upstream reply
+    // here would risk a 504 for no gain worth that risk), so there is no real
+    // `usage.total_tokens` to read. See the Honesty boundaries section in
+    // README.md and the `contribution` field doc in gcl.yaml.
+    if is_success(headers_state.status_code()) {
         gate.ledger.commit(reservation);
-        return;
+    } else {
+        gate.ledger.release(reservation);
     }
-
-    // Token-cost is estimate-then-SETTLE, not estimate-then-reconcile against
-    // a real figure: this filter never calls `into_headers_body_state()` on
-    // the response leg (headers-only, by design — buffering a large/streamed
-    // upstream reply here would risk a 504 for no gain worth that risk), so
-    // there is no real `usage.total_tokens` to read. The reservation's own
-    // contribution — the pre-flight estimate — is what gets committed. See
-    // the Honesty boundaries section in README.md and the `contribution`
-    // field doc in gcl.yaml.
-    let estimate = reservation.contribution;
-    gate.ledger.reconcile(reservation, estimate);
 }
 
 #[entrypoint]
@@ -853,6 +891,7 @@ mod test {
             "contribution": "fixed-weight",
             "fixedWeight": 800,
             "spendAmountField": "params.amount",
+            "spendCurrency": "USD",
             "estimatedTokens": 500,
             "ledgerEndpoint": "",
             "mode": "block",
@@ -890,7 +929,7 @@ mod test {
         )
     }
 
-    fn rpc_request_with_amount(id: i64, agent: &str, amount: f64) -> UnitHttpRequest {
+    fn rpc_request_with_amount(id: i64, agent: &str, amount: u64) -> UnitHttpRequest {
         jsonrpc_request(
             json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {"amount": amount}}),
             Some(agent),
@@ -936,13 +975,16 @@ mod test {
             .with_body(body.to_vec())
     }
 
-    fn usage_backend(tokens: f64) -> impl Fn(UnitHttpRequest) -> UnitHttpResponse {
+    /// A 200 whose body reports `usage` — any JSON value, so tests can send
+    /// under-, over-, and malformed usage figures and show none of them
+    /// changes what the estimated-token-weight mode charges.
+    fn usage_backend(usage: Value) -> impl Fn(UnitHttpRequest) -> UnitHttpResponse {
         move |_req| {
             let body = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "result": {"text": "ok"},
-                "usage": {"total_tokens": tokens}
+                "usage": usage
             })
             .to_string();
             UnitHttpResponse::new(200)
@@ -1154,10 +1196,10 @@ mod test {
             .with_backend(ok_backend)
             .with_entrypoint(super::configure);
         for i in 0..3 {
-            let response = tester.request(rpc_request_with_amount(i, "broker-7", 800.0));
+            let response = tester.request(rpc_request_with_amount(i, "broker-7", 800));
             assert_eq!(response_error_code(&response), None);
         }
-        let response = tester.request(rpc_request_with_amount(4, "broker-7", 800.0));
+        let response = tester.request(rpc_request_with_amount(4, "broker-7", 800));
         assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
     }
 
@@ -1211,10 +1253,10 @@ mod test {
     }
 
     #[test]
-    fn token_cost_contribution_commits_the_full_estimate_and_never_reads_the_response_body() {
+    fn estimated_token_weight_commits_the_full_estimate_and_never_reads_the_response_body() {
         let mut tester = UnitTestBuilder::default()
-            .with_config(config(json!({"contribution": "token-cost", "estimatedTokens": 600, "aggregateBudget": 1000})))
-            .with_backend(usage_backend(50.0))
+            .with_config(config(json!({"contribution": "estimated-token-weight", "estimatedTokens": 600, "aggregateBudget": 1000})))
+            .with_backend(usage_backend(json!({"total_tokens": 50})))
             .with_entrypoint(super::configure);
         // The backend reports a real usage.total_tokens of 50, far below the
         // 600-token estimate — but the response leg is headers-only and never
@@ -1223,7 +1265,8 @@ mod test {
         let first = tester.request(rpc_request(1, "broker-7"));
         assert_eq!(response_error_code(&first), None);
         let header = first.header("x-aggregate-risk-gate").unwrap();
-        assert!(header.contains("600.00"));
+        assert!(header.contains("contribution=600;"));
+        assert!(header.ends_with(";unit=estimated-tokens"));
         // A 2nd 600-token estimate only denies (600 + 600 = 1200 > 1000) if
         // the 1st call's estimate was committed IN FULL — a true-up to the
         // real 50-token usage would leave 50 + 600 = 650, still under budget.
@@ -1303,7 +1346,7 @@ mod test {
         assert_eq!(response_error_code(&response), None);
         let header = response.header("x-aggregate-risk-gate").unwrap();
         assert!(
-            header.contains("2400.00"),
+            header.contains("total=2400/3000;unit=points"),
             "3 items at 800 each must commit as 2400, not as a single 800"
         );
         // A follow-up single call only denies (2400 + 800 = 3200 > 3000) if
@@ -1320,17 +1363,17 @@ mod test {
             .with_backend(ok_backend)
             .with_entrypoint(super::configure);
         let batch = json!([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 800.0}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"amount": 800.0}},
-            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"amount": 800.0}},
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 800}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"amount": 800}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"amount": 800}},
         ]);
         let response = tester.request(jsonrpc_request(batch, Some("broker-7")));
         assert_eq!(response_error_code(&response), None);
         let header = response.header("x-aggregate-risk-gate").unwrap();
-        assert!(header.contains("2400.00"));
+        assert!(header.contains("total=2400/3000;unit=USD-minor"));
         // Only denies (2400 + 800 = 3200 > 3000) if the batch truly summed to
         // 2400 rather than, say, pricing the whole batch as a single item.
-        let response = tester.request(rpc_request_with_amount(4, "broker-7", 800.0));
+        let response = tester.request(rpc_request_with_amount(4, "broker-7", 800));
         assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
     }
 
@@ -1343,7 +1386,7 @@ mod test {
             .with_entrypoint(super::configure);
         // The 2nd item has no params.amount at all.
         let batch = json!([
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 100.0}},
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 100}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}},
         ]);
         let response = tester.request(jsonrpc_request(batch, Some("broker-7")));
@@ -1464,9 +1507,9 @@ mod test {
     }
 
     #[test]
-    fn token_cost_contribution_falls_back_to_the_estimate_when_usage_is_absent() {
+    fn estimated_token_weight_charges_the_estimate_when_usage_is_absent() {
         let mut tester = UnitTestBuilder::default()
-            .with_config(config(json!({"contribution": "token-cost", "estimatedTokens": 300, "aggregateBudget": 1000})))
+            .with_config(config(json!({"contribution": "estimated-token-weight", "estimatedTokens": 300, "aggregateBudget": 1000})))
             .with_backend(ok_backend) // no usage block in the body
             .with_entrypoint(super::configure);
         for i in 0..3 {
@@ -1485,9 +1528,9 @@ mod test {
     }
 
     #[test]
-    fn token_cost_contribution_releases_the_estimate_on_upstream_failure() {
+    fn estimated_token_weight_releases_the_estimate_on_upstream_failure() {
         let mut tester = UnitTestBuilder::default()
-            .with_config(config(json!({"contribution": "token-cost", "estimatedTokens": 900, "aggregateBudget": 1000})))
+            .with_config(config(json!({"contribution": "estimated-token-weight", "estimatedTokens": 900, "aggregateBudget": 1000})))
             .with_backend(failing_backend)
             .with_entrypoint(super::configure);
         tester.request(rpc_request(1, "broker-7"));
@@ -1497,7 +1540,7 @@ mod test {
         assert_eq!(
             response_error_code(&response),
             None,
-            "a failed token-cost call must release its estimate"
+            "a failed estimated-token-weight call must release its estimate"
         );
     }
 
@@ -1511,7 +1554,7 @@ mod test {
         let header = response.header("x-aggregate-risk-gate").unwrap();
         assert!(header.contains("allowed"));
         assert!(header.contains("scope=agent:broker-7"));
-        assert!(header.contains("800.00"));
+        assert!(header.contains("contribution=800;total=800/3000;unit=points"));
     }
 
     #[test]
@@ -1527,7 +1570,225 @@ mod test {
         let header = response.header("x-aggregate-risk-gate").unwrap();
         assert!(header.contains("denied"));
         assert!(header.contains("scope=agent:broker-7"));
-        assert!(header.contains("3200.00"));
+        assert!(header.contains("would-be-total=3200;budget=3000;unit=points"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Exact integer units (P4A review #18): amounts are counted, never
+    // rounded; anything that is not an exact in-range integer is refused.
+    // -----------------------------------------------------------------------
+
+    fn spend_body(amount_literal: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"amount":{amount_literal}}}}}"#
+        )
+    }
+
+    #[test]
+    fn spend_amount_rejects_every_non_integer_or_negative_amount_in_block_mode() {
+        // 12.34 and 1234.0 are decimals, 1e3 is an exponent, -5 is negative,
+        // "1234" is a string, and 18446744073709551616 (2^64) does not fit a
+        // u64 at all. Each must be refused before it reaches upstream, never
+        // rounded or coerced into a charge.
+        for literal in [
+            "12.34",
+            "1234.0",
+            "1e3",
+            "-5",
+            "\"1234\"",
+            "18446744073709551616",
+        ] {
+            let backend = Rc::new(TraceBackend::new(ok_backend));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({"contribution": "spend-amount"})))
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            let response = tester.request(raw_request(&spend_body(literal), Some("broker-7")));
+            assert!(
+                backend.next().is_none(),
+                "amount {} must never reach upstream",
+                literal
+            );
+            assert_eq!(
+                response_error_code(&response),
+                Some(MCP_BLOCKED_CODE),
+                "amount {literal}"
+            );
+            let header = response.header("x-aggregate-risk-gate").unwrap();
+            assert!(
+                header.contains("reason=unpriceable"),
+                "amount {}: {}",
+                literal,
+                header
+            );
+        }
+    }
+
+    #[test]
+    fn spend_amount_above_max_units_is_denied_as_out_of_range() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"contribution": "spend-amount", "aggregateBudget": MAX_UNITS}),
+            ))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let over = (MAX_UNITS + 1).to_string();
+        let response = tester.request(raw_request(&spend_body(&over), Some("broker-7")));
+        assert!(backend.next().is_none());
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("reason=out-of-range"), "{}", header);
+
+        // Exactly MAX_UNITS is still an exact, chargeable amount.
+        let response = tester.request(raw_request(
+            &spend_body(&MAX_UNITS.to_string()),
+            Some("broker-8"),
+        ));
+        assert_eq!(response_error_code(&response), None);
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(
+            header.contains(&format!("contribution={MAX_UNITS};")),
+            "{}",
+            header
+        );
+    }
+
+    #[test]
+    fn a_spend_amount_batch_whose_sum_overflows_is_denied_as_out_of_range() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"contribution": "spend-amount", "aggregateBudget": MAX_UNITS}),
+            ))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // Each item is individually in range; their sum is not.
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": MAX_UNITS}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"amount": 1}},
+        ]);
+        let response = tester.request(jsonrpc_request(batch, Some("broker-7")));
+        assert!(backend.next().is_none());
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("reason=out-of-range"), "{}", header);
+    }
+
+    #[test]
+    fn a_fixed_weight_batch_whose_product_overflows_is_denied_as_out_of_range() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"fixedWeight": MAX_UNITS, "aggregateBudget": MAX_UNITS}),
+            ))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let response = tester.request(batch_request(&[1, 2], "broker-7"));
+        assert!(backend.next().is_none());
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("reason=out-of-range"), "{}", header);
+    }
+
+    #[test]
+    fn monitor_mode_forwards_an_out_of_range_call_and_stamps_the_gap() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"contribution": "spend-amount", "mode": "monitor"}),
+            ))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let over = (MAX_UNITS + 1).to_string();
+        let response = tester.request(raw_request(&spend_body(&over), Some("broker-7")));
+        assert!(backend.next().is_some(), "monitor mode never blocks");
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert_eq!(header, "monitor;scope=agent:broker-7;reason=out-of-range");
+    }
+
+    #[test]
+    fn small_spend_amounts_accumulate_exactly_onto_the_budget() {
+        // 10 + 20 minor units against a budget of 30: in binary floating point
+        // 0.1 + 0.2 > 0.3, so a float ledger refuses this budget-exact call.
+        // An integer ledger lands on the budget exactly and admits it; one
+        // more minor unit is then refused.
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"contribution": "spend-amount", "aggregateBudget": 30}),
+            ))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request_with_amount(1, "broker-7", 10))),
+            None
+        );
+        let response = tester.request(rpc_request_with_amount(2, "broker-7", 20));
+        assert_eq!(response_error_code(&response), None);
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert_eq!(
+            header,
+            "allowed;scope=agent:broker-7;contribution=20;total=30/30;unit=USD-minor"
+        );
+        let response = tester.request(rpc_request_with_amount(3, "broker-7", 1));
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+    }
+
+    #[test]
+    fn the_spend_currency_is_stamped_as_the_unit() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"contribution": "spend-amount", "spendCurrency": "EUR"}),
+            ))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let response = tester.request(rpc_request_with_amount(1, "broker-7", 1234));
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(
+            header.ends_with("contribution=1234;total=1234/3000;unit=EUR-minor"),
+            "{}",
+            header
+        );
+    }
+
+    #[test]
+    fn estimated_token_weight_ignores_over_and_malformed_usage_figures() {
+        // Under-usage is covered above; here the backend reports usage far
+        // OVER the estimate, and several malformed shapes. None of them may
+        // change the charge: each first call commits exactly the 600 estimate,
+        // so a second 600 call fits a 1200 budget and a third is refused.
+        for usage in [
+            json!({"total_tokens": 5000}),
+            json!({"total_tokens": "lots"}),
+            json!({"total_tokens": -1}),
+            json!({"total_tokens": 12.5}),
+            json!(null),
+            json!("not-an-object"),
+        ] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({"contribution": "estimated-token-weight", "estimatedTokens": 600, "aggregateBudget": 1200})))
+                .with_backend(usage_backend(usage.clone()))
+                .with_entrypoint(super::configure);
+            for id in 1..=2 {
+                let response = tester.request(rpc_request(id, "broker-7"));
+                assert_eq!(
+                    response_error_code(&response),
+                    None,
+                    "usage {usage}, call {id}"
+                );
+                let header = response.header("x-aggregate-risk-gate").unwrap();
+                assert!(
+                    header.contains("contribution=600;"),
+                    "usage {}: {}",
+                    usage,
+                    header
+                );
+            }
+            let response = tester.request(rpc_request(3, "broker-7"));
+            assert_eq!(
+                response_error_code(&response),
+                Some(MCP_BLOCKED_CODE),
+                "usage {usage}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1536,17 +1797,18 @@ mod test {
 
     fn valid_config_struct() -> Config {
         Config {
-            aggregate_budget: 3000.0,
+            aggregate_budget: 3000,
             budget_scope: "agent".to_string(),
             contribution: "fixed-weight".to_string(),
-            estimated_tokens: 500.0,
-            fixed_weight: 800.0,
+            estimated_tokens: 500,
+            fixed_weight: 800,
             ledger_endpoint: String::new(),
             mode: "block".to_string(),
             on_deny: "rpc-error".to_string(),
             result_header: "x-aggregate-risk-gate".to_string(),
             scope_header: "x-agent-id".to_string(),
             spend_amount_field: "params.amount".to_string(),
+            spend_currency: "USD".to_string(),
             window: "rolling-24h".to_string(),
         }
     }
@@ -1599,30 +1861,86 @@ mod test {
     }
 
     #[test]
-    fn negative_aggregate_budget_is_rejected() {
+    fn the_old_token_cost_contribution_name_is_rejected_with_its_new_name() {
         let mut cfg = valid_config_struct();
-        cfg.aggregate_budget = -1.0;
+        cfg.contribution = "token-cost".to_string();
+        let err = Gate::from_config(&cfg)
+            .err()
+            .expect("token-cost must be rejected");
+        assert!(
+            err.to_string().contains("estimated-token-weight"),
+            "{}",
+            err
+        );
+    }
+
+    #[test]
+    fn estimated_token_weight_contribution_is_accepted() {
+        let mut cfg = valid_config_struct();
+        cfg.contribution = "estimated-token-weight".to_string();
+        assert!(Gate::from_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn spend_currency_must_be_three_uppercase_letters() {
+        for bad in ["", "usd", "US", "USDX", "U$D", "€UR"] {
+            let mut cfg = valid_config_struct();
+            cfg.spend_currency = bad.to_string();
+            assert!(Gate::from_config(&cfg).is_err(), "spendCurrency {:?}", bad);
+        }
+        let mut cfg = valid_config_struct();
+        cfg.spend_currency = "JPY".to_string();
+        assert!(Gate::from_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_amounts_above_max_units_are_rejected() {
+        let mut cfg = valid_config_struct();
+        cfg.fixed_weight = MAX_UNITS as i64 + 1;
+        assert!(Gate::from_config(&cfg).is_err());
+        let mut cfg = valid_config_struct();
+        cfg.estimated_tokens = i64::MAX;
         assert!(Gate::from_config(&cfg).is_err());
     }
 
     #[test]
-    fn non_finite_aggregate_budget_is_rejected() {
+    fn a_fractional_config_amount_fails_to_deserialize() {
+        // The generated Config types amounts as i64, so a fractional budget
+        // never reaches Gate::from_config — serde refuses it outright.
+        let mut value: Value = serde_json::from_str(&config(json!({}))).unwrap();
+        value["aggregateBudget"] = json!(3000.5);
+        assert!(serde_json::from_value::<Config>(value).is_err());
+    }
+
+    #[test]
+    fn negative_aggregate_budget_is_rejected() {
         let mut cfg = valid_config_struct();
-        cfg.aggregate_budget = f64::NAN;
+        cfg.aggregate_budget = -1;
         assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn aggregate_budget_above_max_units_is_rejected() {
+        // Replaces the old non-finite (NaN) check: config amounts are now
+        // integers, so the out-of-range edge is anything past 2^53 - 1.
+        let mut cfg = valid_config_struct();
+        cfg.aggregate_budget = MAX_UNITS as i64 + 1;
+        assert!(Gate::from_config(&cfg).is_err());
+        cfg.aggregate_budget = MAX_UNITS as i64;
+        assert!(Gate::from_config(&cfg).is_ok());
     }
 
     #[test]
     fn negative_fixed_weight_is_rejected() {
         let mut cfg = valid_config_struct();
-        cfg.fixed_weight = -1.0;
+        cfg.fixed_weight = -1;
         assert!(Gate::from_config(&cfg).is_err());
     }
 
     #[test]
     fn negative_estimated_tokens_is_rejected() {
         let mut cfg = valid_config_struct();
-        cfg.estimated_tokens = -1.0;
+        cfg.estimated_tokens = -1;
         assert!(Gate::from_config(&cfg).is_err());
     }
 

@@ -55,6 +55,7 @@ fn policy_config(scope_header: &str) -> PolicyConfig {
             "contribution": "fixed-weight",
             "fixedWeight": 800,
             "spendAmountField": "params.amount",
+            "spendCurrency": "USD",
             "estimatedTokens": 500,
             "ledgerEndpoint": "",
             "mode": "block",

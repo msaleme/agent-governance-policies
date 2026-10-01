@@ -24,6 +24,14 @@
 // process that holds it; nothing here should be read as a claim of durability,
 // multi-worker sharing, or non-repudiation.
 
+// Units: every amount here is an exact, non-negative integer (`u64`) in the
+// policy's configured unit (fixed-weight points, estimated tokens, or a
+// currency's minor unit). There is no floating point anywhere in the decision
+// path. `lib.rs` bounds every budget and contribution to `MAX_UNITS` (2^53 - 1)
+// before it reaches this module; additions here saturate at `u64::MAX`, far
+// above any admissible budget, so a sum that would overflow always compares as
+// over budget instead of wrapping around.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -35,24 +43,24 @@ use std::sync::Mutex;
 /// — that is the whole mechanism.
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
 struct ScopeState {
-    committed: f64,
-    reserved: f64,
+    committed: u64,
+    reserved: u64,
 }
 
 impl ScopeState {
-    fn total(&self) -> f64 {
-        self.committed + self.reserved
+    fn total(&self) -> u64 {
+        self.committed.saturating_add(self.reserved)
     }
 }
 
 /// A held reservation against a scope, returned by a successful `reserve` or
-/// `force_reserve`. Must be resolved with exactly one of `commit`, `release`, or
-/// `reconcile` — holding it longer than necessary keeps `reserved` inflated and
+/// `force_reserve`. Must be resolved with exactly one of `commit` or `release`
+/// — holding it longer than necessary keeps `reserved` inflated and
 /// makes the scope look more exposed than it is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reservation {
     pub scope: String,
-    pub contribution: f64,
+    pub contribution: u64,
 }
 
 /// A denied reservation attempt: the call was NOT reserved and NOT mutated into
@@ -61,26 +69,26 @@ pub struct Reservation {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Denial {
     pub scope: String,
-    pub contribution: f64,
+    pub contribution: u64,
     /// `committed + reserved` for this scope at the moment of the check, before
     /// this call's own contribution.
-    pub current_total: f64,
+    pub current_total: u64,
     /// What the total would have become had this call been admitted.
-    pub would_be_total: f64,
-    pub budget: f64,
+    pub would_be_total: u64,
+    pub budget: u64,
 }
 
 /// A point-in-time view of one scope's ledger state, for tests and for stamping
 /// diagnostic headers. Not itself part of the decision engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Snapshot {
-    pub committed: f64,
-    pub reserved: f64,
+    pub committed: u64,
+    pub reserved: u64,
 }
 
 impl Snapshot {
-    pub fn total(&self) -> f64 {
-        self.committed + self.reserved
+    pub fn total(&self) -> u64 {
+        self.committed.saturating_add(self.reserved)
     }
 }
 
@@ -93,7 +101,7 @@ pub trait LedgerStore {
     /// Atomically checks `scope`'s committed-plus-reserved exposure against
     /// `budget` and, only if `contribution` fits, reserves it. On denial, the
     /// ledger is left completely unmutated for `scope`.
-    fn reserve(&self, scope: &str, contribution: f64, budget: f64) -> Result<Reservation, Denial>;
+    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Denial>;
 
     /// Reserves `contribution` against `scope` unconditionally, ignoring
     /// `budget` — the monitor-mode primitive: composition is still tracked
@@ -109,7 +117,7 @@ pub trait LedgerStore {
     /// module's whole correctness story is about) — hence `#[allow(dead_code)]`
     /// rather than deleting a real, tested API.
     #[allow(dead_code)]
-    fn force_reserve(&self, scope: &str, contribution: f64) -> Reservation;
+    fn force_reserve(&self, scope: &str, contribution: u64) -> Reservation;
 
     /// `force_reserve`, plus a breach signal: reserves `contribution`
     /// against `scope` unconditionally (never denies — monitor mode still
@@ -120,8 +128,8 @@ pub trait LedgerStore {
     fn force_reserve_checked(
         &self,
         scope: &str,
-        contribution: f64,
-        budget: f64,
+        contribution: u64,
+        budget: u64,
     ) -> (Reservation, bool);
 
     /// Resolves a reservation as successful: moves its contribution from
@@ -138,19 +146,7 @@ pub trait LedgerStore {
     /// exposure is known only after it already happened and so can no longer be
     /// denied (e.g. monitor mode's unpriceable-at-request-time cases, or a
     /// direct audit correction).
-    fn record(&self, scope: &str, contribution: f64);
-
-    /// Resolves an ESTIMATED reservation once its final amount is known:
-    /// releases the estimate from `reserved`, then commits
-    /// `actual_contribution` in its place — never re-checking the budget,
-    /// because the call already happened and its exposure cannot be
-    /// retroactively denied. A general estimate-then-settle primitive: this
-    /// build's token-cost contribution mode calls it with
-    /// `actual_contribution` equal to the original estimate itself (it never
-    /// learns a different real figure — see `response_filter` in `lib.rs`),
-    /// but the primitive is written generally enough to also serve a true
-    /// reconcile-to-a-different-value, for a caller that has one.
-    fn reconcile(&self, reservation: Reservation, actual_contribution: f64);
+    fn record(&self, scope: &str, contribution: u64);
 
     /// A read-only view of one scope's current state, for diagnostics/tests.
     fn snapshot(&self, scope: &str) -> Snapshot;
@@ -189,10 +185,10 @@ impl Ledger {
 }
 
 impl LedgerStore for Ledger {
-    fn reserve(&self, scope: &str, contribution: f64, budget: f64) -> Result<Reservation, Denial> {
+    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Denial> {
         self.with_state(scope, |state| {
             let current_total = state.total();
-            let would_be_total = current_total + contribution;
+            let would_be_total = current_total.saturating_add(contribution);
             if would_be_total > budget {
                 return Err(Denial {
                     scope: scope.to_string(),
@@ -202,7 +198,7 @@ impl LedgerStore for Ledger {
                     budget,
                 });
             }
-            state.reserved += contribution;
+            state.reserved = state.reserved.saturating_add(contribution);
             Ok(Reservation {
                 scope: scope.to_string(),
                 contribution,
@@ -210,9 +206,9 @@ impl LedgerStore for Ledger {
         })
     }
 
-    fn force_reserve(&self, scope: &str, contribution: f64) -> Reservation {
+    fn force_reserve(&self, scope: &str, contribution: u64) -> Reservation {
         self.with_state(scope, |state| {
-            state.reserved += contribution;
+            state.reserved = state.reserved.saturating_add(contribution);
         });
         Reservation {
             scope: scope.to_string(),
@@ -223,11 +219,11 @@ impl LedgerStore for Ledger {
     fn force_reserve_checked(
         &self,
         scope: &str,
-        contribution: f64,
-        budget: f64,
+        contribution: u64,
+        budget: u64,
     ) -> (Reservation, bool) {
         self.with_state(scope, |state| {
-            state.reserved += contribution;
+            state.reserved = state.reserved.saturating_add(contribution);
             let breached = state.total() > budget;
             (
                 Reservation {
@@ -241,27 +237,20 @@ impl LedgerStore for Ledger {
 
     fn commit(&self, reservation: Reservation) {
         self.with_state(&reservation.scope, |state| {
-            state.reserved = (state.reserved - reservation.contribution).max(0.0);
-            state.committed += reservation.contribution;
+            state.reserved = state.reserved.saturating_sub(reservation.contribution);
+            state.committed = state.committed.saturating_add(reservation.contribution);
         });
     }
 
     fn release(&self, reservation: Reservation) {
         self.with_state(&reservation.scope, |state| {
-            state.reserved = (state.reserved - reservation.contribution).max(0.0);
+            state.reserved = state.reserved.saturating_sub(reservation.contribution);
         });
     }
 
-    fn record(&self, scope: &str, contribution: f64) {
+    fn record(&self, scope: &str, contribution: u64) {
         self.with_state(scope, |state| {
-            state.committed += contribution;
-        });
-    }
-
-    fn reconcile(&self, reservation: Reservation, actual_contribution: f64) {
-        self.with_state(&reservation.scope, |state| {
-            state.reserved = (state.reserved - reservation.contribution).max(0.0);
-            state.committed += actual_contribution;
+            state.committed = state.committed.saturating_add(contribution);
         });
     }
 
@@ -290,8 +279,8 @@ mod test {
     // itself was invalid.
     // ---------------------------------------------------------------------
 
-    const CAP_BUDGET: f64 = 3000.0;
-    const CAP_CONTRIBUTION: f64 = 800.0;
+    const CAP_BUDGET: u64 = 3000;
+    const CAP_CONTRIBUTION: u64 = 800;
 
     #[test]
     fn sequential_composition_refuses_the_call_that_would_exceed_budget() {
@@ -305,19 +294,19 @@ mod test {
                 .expect("first three sessions must be admitted");
             ledger.commit(reservation);
         }
-        assert_eq!(ledger.snapshot(scope).total(), 2400.0);
+        assert_eq!(ledger.snapshot(scope).total(), 2400);
 
         // Session 4: locally valid (800 <= a 1000 per-session cap enforced above
         // this ledger), but 2400 + 800 = 3200 > 3000 — refused.
         let denial = ledger
             .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET)
             .expect_err("fourth session composes past the aggregate budget");
-        assert_eq!(denial.current_total, 2400.0);
-        assert_eq!(denial.would_be_total, 3200.0);
+        assert_eq!(denial.current_total, 2400);
+        assert_eq!(denial.would_be_total, 3200);
         assert_eq!(denial.budget, CAP_BUDGET);
 
         // The refusal must not have mutated the ledger.
-        assert_eq!(ledger.snapshot(scope).total(), 2400.0);
+        assert_eq!(ledger.snapshot(scope).total(), 2400);
     }
 
     #[test]
@@ -332,7 +321,7 @@ mod test {
         for _ in 0..2 {
             assert!(ledger.reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET).is_err());
         }
-        assert_eq!(ledger.snapshot(scope).total(), 2400.0);
+        assert_eq!(ledger.snapshot(scope).total(), 2400);
     }
 
     // ---------------------------------------------------------------------
@@ -350,13 +339,13 @@ mod test {
     /// checked-then-acted bug reserve-then-authorize exists to fix, so the
     /// contrast is a real, executable difference rather than an assertion.
     struct NaiveCounter {
-        total: Mutex<f64>,
+        total: Mutex<u64>,
     }
 
     impl NaiveCounter {
         fn new() -> Self {
             Self {
-                total: Mutex::new(0.0),
+                total: Mutex::new(0),
             }
         }
 
@@ -365,16 +354,17 @@ mod test {
         /// threads' reads can land inside the window and observe the same
         /// pre-write snapshot. This is what makes the naive counter breach: the
         /// check and the mutation are two steps, not one.
-        fn naive_check_then_add(&self, amount: f64, budget: f64) -> bool {
+        fn naive_check_then_add(&self, amount: u64, budget: u64) -> bool {
             let current = *self.total.lock().unwrap();
-            let would_be = current + amount;
+            let would_be = current.saturating_add(amount);
             if would_be > budget {
                 return false;
             }
             // The gap a real read-then-write counter has: another thread's read
             // can land here, before this thread's write is visible.
             thread::yield_now();
-            *self.total.lock().unwrap() += amount;
+            let mut total = self.total.lock().unwrap();
+            *total = total.saturating_add(amount);
             true
         }
     }
@@ -453,7 +443,7 @@ mod test {
             );
             assert_eq!(
                 ledger.snapshot(scope).total(),
-                2400.0,
+                2400,
                 "committed total must never exceed the 3000 budget"
             );
         }
@@ -467,8 +457,8 @@ mod test {
         // leak exposure into one another.
         let ledger = Arc::new(Ledger::new());
         let scopes = ["agent:a", "agent:b", "agent:c"];
-        let per_call = 250.0;
-        let budget = 1000.0; // holds at most 4 of the 10 attempts per scope
+        let per_call = 250;
+        let budget = 1000; // holds at most 4 of the 10 attempts per scope
 
         let mut handles = Vec::new();
         for scope in scopes {
@@ -492,33 +482,33 @@ mod test {
                 format!("scope {scope} total {total} exceeded budget {budget}")
             );
             assert_eq!(
-                total, 1000.0,
+                total, 1000,
                 "scope {scope} should have admitted exactly 4 of 10 calls"
             );
         }
     }
 
     // ---------------------------------------------------------------------
-    // Reservation lifecycle: commit / release / reconcile.
+    // Reservation lifecycle: commit / release.
     // ---------------------------------------------------------------------
 
     #[test]
     fn commit_moves_contribution_from_reserved_to_committed() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 100.0, 1000.0).unwrap();
+        let reservation = ledger.reserve("s", 100, 1000).unwrap();
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
-                committed: 0.0,
-                reserved: 100.0
+                committed: 0,
+                reserved: 100
             }
         );
         ledger.commit(reservation);
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
-                committed: 100.0,
-                reserved: 0.0
+                committed: 100,
+                reserved: 0
             }
         );
     }
@@ -526,13 +516,13 @@ mod test {
     #[test]
     fn release_removes_reservation_without_committing() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 100.0, 1000.0).unwrap();
+        let reservation = ledger.reserve("s", 100, 1000).unwrap();
         ledger.release(reservation);
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
-                committed: 0.0,
-                reserved: 0.0
+                committed: 0,
+                reserved: 0
             }
         );
     }
@@ -540,54 +530,15 @@ mod test {
     #[test]
     fn a_released_reservation_frees_budget_for_a_later_call() {
         let ledger = Ledger::new();
-        let first = ledger.reserve("s", 900.0, 1000.0).unwrap();
+        let first = ledger.reserve("s", 900, 1000).unwrap();
         assert!(
-            ledger.reserve("s", 200.0, 1000.0).is_err(),
+            ledger.reserve("s", 200, 1000).is_err(),
             "900 reserved leaves no room for 200"
         );
         ledger.release(first);
         assert!(
-            ledger.reserve("s", 200.0, 1000.0).is_ok(),
+            ledger.reserve("s", 200, 1000).is_ok(),
             "releasing the first reservation must free its budget"
-        );
-    }
-
-    #[test]
-    fn reconcile_replaces_estimate_with_actual_contribution() {
-        let ledger = Ledger::new();
-        // Reserve against a 500-token estimate...
-        let reservation = ledger.reserve("s", 500.0, 1000.0).unwrap();
-        assert_eq!(
-            ledger.snapshot("s"),
-            Snapshot {
-                committed: 0.0,
-                reserved: 500.0
-            }
-        );
-        // ...but the real usage.total_tokens turns out to be 340.
-        ledger.reconcile(reservation, 340.0);
-        assert_eq!(
-            ledger.snapshot("s"),
-            Snapshot {
-                committed: 340.0,
-                reserved: 0.0
-            }
-        );
-    }
-
-    #[test]
-    fn reconcile_with_an_actual_higher_than_the_estimate_still_lands_the_real_amount() {
-        // The estimate is a pre-flight guess, not a cap on the real cost — an
-        // under-estimate must not silently truncate the true exposure.
-        let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 200.0, 1000.0).unwrap();
-        ledger.reconcile(reservation, 900.0);
-        assert_eq!(
-            ledger.snapshot("s"),
-            Snapshot {
-                committed: 900.0,
-                reserved: 0.0
-            }
         );
     }
 
@@ -595,25 +546,25 @@ mod test {
     fn record_bypasses_the_budget_check_entirely() {
         let ledger = Ledger::new();
         // record() has no budget parameter: it cannot be denied by construction.
-        ledger.record("s", 10_000.0);
-        assert_eq!(ledger.snapshot("s").committed, 10_000.0);
+        ledger.record("s", 10_000);
+        assert_eq!(ledger.snapshot("s").committed, 10_000);
     }
 
     #[test]
     fn force_reserve_always_succeeds_even_over_a_notional_budget() {
         let ledger = Ledger::new();
-        let reservation = ledger.force_reserve("s", 10_000.0);
-        assert_eq!(ledger.snapshot("s").reserved, 10_000.0);
+        let reservation = ledger.force_reserve("s", 10_000);
+        assert_eq!(ledger.snapshot("s").reserved, 10_000);
         ledger.commit(reservation);
-        assert_eq!(ledger.snapshot("s").committed, 10_000.0);
+        assert_eq!(ledger.snapshot("s").committed, 10_000);
     }
 
     #[test]
     fn force_reserve_checked_reports_no_breach_when_within_budget() {
         let ledger = Ledger::new();
-        let (reservation, breached) = ledger.force_reserve_checked("s", 500.0, 1000.0);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 500, 1000);
         assert!(!breached);
-        assert_eq!(ledger.snapshot("s").reserved, 500.0);
+        assert_eq!(ledger.snapshot("s").reserved, 500);
         ledger.commit(reservation);
     }
 
@@ -622,26 +573,26 @@ mod test {
         let ledger = Ledger::new();
         // Never denies (monitor-mode primitive), but must still truthfully
         // report that this reservation pushed the scope over budget.
-        let (reservation, breached) = ledger.force_reserve_checked("s", 1500.0, 1000.0);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 1500, 1000);
         assert!(breached);
         assert_eq!(
             ledger.snapshot("s").reserved,
-            1500.0,
+            1500,
             "force_reserve_checked must still reserve the full amount despite the breach"
         );
         ledger.commit(reservation);
-        assert_eq!(ledger.snapshot("s").committed, 1500.0);
+        assert_eq!(ledger.snapshot("s").committed, 1500);
     }
 
     #[test]
     fn force_reserve_checked_breach_reflects_prior_committed_exposure_too() {
         let ledger = Ledger::new();
-        let first = ledger.force_reserve_checked("s", 800.0, 1000.0);
+        let first = ledger.force_reserve_checked("s", 800, 1000);
         assert!(!first.1);
         ledger.commit(first.0);
         // 800 committed + 300 more reserved = 1100 > 1000: a breach, even
         // though this second call's OWN amount is well within budget alone.
-        let (reservation, breached) = ledger.force_reserve_checked("s", 300.0, 1000.0);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 300, 1000);
         assert!(breached);
         ledger.commit(reservation);
     }
@@ -652,13 +603,13 @@ mod test {
         // actually landed upstream should not count against the running total,
         // even though force_reserve never denies up front.
         let ledger = Ledger::new();
-        let reservation = ledger.force_reserve("s", 500.0);
+        let reservation = ledger.force_reserve("s", 500);
         ledger.release(reservation);
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
-                committed: 0.0,
-                reserved: 0.0
+                committed: 0,
+                reserved: 0
             }
         );
     }
@@ -670,12 +621,12 @@ mod test {
     #[test]
     fn different_scopes_have_independent_totals() {
         let ledger = Ledger::new();
-        let a = ledger.reserve("agent:a", 900.0, 1000.0).unwrap();
+        let a = ledger.reserve("agent:a", 900, 1000).unwrap();
         ledger.commit(a);
         // A different scope key starts fresh even though it shares a budget.
-        assert!(ledger.reserve("agent:b", 900.0, 1000.0).is_ok());
-        assert_eq!(ledger.snapshot("agent:a").total(), 900.0);
-        assert_eq!(ledger.snapshot("agent:b").total(), 900.0);
+        assert!(ledger.reserve("agent:b", 900, 1000).is_ok());
+        assert_eq!(ledger.snapshot("agent:a").total(), 900);
+        assert_eq!(ledger.snapshot("agent:b").total(), 900);
     }
 
     #[test]
@@ -685,10 +636,10 @@ mod test {
         // the key. This test documents that contract at the ledger layer (the
         // filter is what actually builds these keys; see lib.rs).
         let ledger = Ledger::new();
-        let agent_res = ledger.reserve("agent:x", 900.0, 1000.0).unwrap();
+        let agent_res = ledger.reserve("agent:x", 900, 1000).unwrap();
         ledger.commit(agent_res);
         assert!(
-            ledger.reserve("tenant:x", 900.0, 1000.0).is_ok(),
+            ledger.reserve("tenant:x", 900, 1000).is_ok(),
             "a different scope dimension for the same identity value must not share budget"
         );
     }
@@ -701,7 +652,7 @@ mod test {
     fn a_call_landing_exactly_on_budget_is_admitted() {
         let ledger = Ledger::new();
         assert!(
-            ledger.reserve("s", 1000.0, 1000.0).is_ok(),
+            ledger.reserve("s", 1000, 1000).is_ok(),
             "exactly-at-budget must be admitted"
         );
     }
@@ -709,31 +660,31 @@ mod test {
     #[test]
     fn a_call_one_unit_over_budget_is_denied() {
         let ledger = Ledger::new();
-        let denial = ledger.reserve("s", 1000.01, 1000.0).unwrap_err();
-        assert_eq!(denial.would_be_total, 1000.01);
+        let denial = ledger.reserve("s", 1001, 1000).unwrap_err();
+        assert_eq!(denial.would_be_total, 1001);
     }
 
     #[test]
     fn a_zero_contribution_call_is_always_admitted_even_at_zero_budget() {
         let ledger = Ledger::new();
-        assert!(ledger.reserve("s", 0.0, 0.0).is_ok());
+        assert!(ledger.reserve("s", 0, 0).is_ok());
     }
 
     #[test]
     fn a_zero_budget_denies_any_positive_contribution() {
         let ledger = Ledger::new();
-        assert!(ledger.reserve("s", 0.01, 0.0).is_err());
+        assert!(ledger.reserve("s", 1, 0).is_err());
     }
 
     #[test]
     fn committed_exposure_from_a_prior_call_counts_against_a_new_reservation() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 1000.0, 1000.0).unwrap();
+        let reservation = ledger.reserve("s", 1000, 1000).unwrap();
         ledger.commit(reservation);
         // The scope is now fully committed; even a zero-sized new call is fine,
         // but anything positive must be denied.
-        assert!(ledger.reserve("s", 0.0, 1000.0).is_ok());
-        assert!(ledger.reserve("s", 0.01, 1000.0).is_err());
+        assert!(ledger.reserve("s", 0, 1000).is_ok());
+        assert!(ledger.reserve("s", 1, 1000).is_err());
     }
 
     #[test]
@@ -741,13 +692,13 @@ mod test {
         // The core of reserve-then-authorize: a RESERVED (not yet committed)
         // amount must block a composing call exactly as if it had landed.
         let ledger = Ledger::new();
-        let first = ledger.reserve("s", 600.0, 1000.0).unwrap();
+        let first = ledger.reserve("s", 600, 1000).unwrap();
         assert!(
-            ledger.reserve("s", 500.0, 1000.0).is_err(),
+            ledger.reserve("s", 500, 1000).is_err(),
             "an in-flight reservation must count against the budget check"
         );
         ledger.release(first);
-        assert!(ledger.reserve("s", 500.0, 1000.0).is_ok());
+        assert!(ledger.reserve("s", 500, 1000).is_ok());
     }
 
     #[test]
@@ -758,13 +709,13 @@ mod test {
         let ledger = Ledger::new();
         ledger.release(Reservation {
             scope: "s".to_string(),
-            contribution: 500.0,
+            contribution: 500,
         });
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
-                committed: 0.0,
-                reserved: 0.0
+                committed: 0,
+                reserved: 0
             }
         );
     }
@@ -772,14 +723,62 @@ mod test {
     #[test]
     fn denial_report_carries_the_scope_and_amounts_for_diagnostics() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("agent:z", 700.0, 1000.0).unwrap();
+        let reservation = ledger.reserve("agent:z", 700, 1000).unwrap();
         ledger.commit(reservation);
-        let denial = ledger.reserve("agent:z", 400.0, 1000.0).unwrap_err();
+        let denial = ledger.reserve("agent:z", 400, 1000).unwrap_err();
         assert_eq!(denial.scope, "agent:z");
-        assert_eq!(denial.contribution, 400.0);
-        assert_eq!(denial.current_total, 700.0);
-        assert_eq!(denial.would_be_total, 1100.0);
-        assert_eq!(denial.budget, 1000.0);
+        assert_eq!(denial.contribution, 400);
+        assert_eq!(denial.current_total, 700);
+        assert_eq!(denial.would_be_total, 1100);
+        assert_eq!(denial.budget, 1000);
+    }
+
+    // ---------------------------------------------------------------------
+    // Exact integer arithmetic (P4A review #18).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn cumulative_small_contributions_land_exactly_on_budget() {
+        // The f64 build's failure mode: ten 0.1 contributions sum to
+        // 0.9999999999999999, and 0.1 + 0.2 > 0.3. In exact minor units, ten
+        // contributions of 1 against a budget of 10 admit exactly ten, and the
+        // eleventh is denied.
+        let ledger = Ledger::new();
+        for _ in 0..10 {
+            let reservation = ledger.reserve("s", 1, 10).expect("within budget");
+            ledger.commit(reservation);
+        }
+        assert_eq!(ledger.snapshot("s").total(), 10);
+        assert!(ledger.reserve("s", 1, 10).is_err());
+
+        let ledger = Ledger::new();
+        ledger.commit(ledger.reserve("s", 10, 30).unwrap());
+        ledger.commit(ledger.reserve("s", 20, 30).unwrap());
+        assert_eq!(ledger.snapshot("s").total(), 30, "10 + 20 is exactly 30");
+    }
+
+    #[test]
+    fn an_overflowing_sum_is_denied_rather_than_wrapping() {
+        let ledger = Ledger::new();
+        ledger.record("s", u64::MAX - 1);
+        let denial = ledger.reserve("s", 10, u64::MAX - 1).unwrap_err();
+        assert_eq!(
+            denial.would_be_total,
+            u64::MAX,
+            "the sum saturates instead of wrapping to a small number"
+        );
+        assert_eq!(ledger.snapshot("s").total(), u64::MAX - 1);
+    }
+
+    #[test]
+    fn force_reserve_checked_saturates_and_reports_the_breach() {
+        let ledger = Ledger::new();
+        ledger.record("s", u64::MAX);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 5, 1000);
+        assert!(breached);
+        assert_eq!(ledger.snapshot("s").total(), u64::MAX);
+        ledger.release(reservation);
+        assert_eq!(ledger.snapshot("s").reserved, 0);
     }
 
     #[test]
@@ -788,8 +787,8 @@ mod test {
         assert_eq!(
             ledger.snapshot("never-seen"),
             Snapshot {
-                committed: 0.0,
-                reserved: 0.0
+                committed: 0,
+                reserved: 0
             }
         );
     }
