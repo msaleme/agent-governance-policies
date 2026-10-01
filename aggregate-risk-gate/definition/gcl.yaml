@@ -6,35 +6,12 @@ metadata:
     title: Cross-Session Aggregate-Risk Gate
     category: Security
     description: >-
-      Individually valid calls can still compose past a budget nobody ever handed
-      to a single decision: a broker fleet where each session clears its own
-      per-session cap, but the fleet's totals blow an aggregate exposure budget
-      no per-call control ever sees — slow spend drift, distributed data pulls
-      that sum to an exfiltration, or a concurrent burst that a naive running
-      counter waves through because every reader sees the same pre-commit
-      snapshot. This policy closes that gap with reserve-then-authorize: on every
-      governed call it computes the call's exposure contribution (token cost,
-      a spend amount read from the request body, or a fixed per-call weight),
-      reserves that contribution against a serialized ledger keyed by budget
-      scope (per agent, per fabric, per tenant) BEFORE authorizing, allows the
-      call only if committed-plus-reserved exposure stays within the aggregate
-      budget, commits the reservation on a successful upstream response, and
-      releases it on failure. Reserve-then-authorize is the load-bearing
-      property: a read-then-write counter breaches under concurrency because
-      concurrent callers all check the same stale total before anyone writes;
-      only serializing the check-and-reserve into one step holds the budget.
-      Honesty boundary (Stage A vs Stage B): this build ships Stage A — an
-      in-process, serialized ledger scoped to a single gateway worker. It is a
-      real, atomic reserve-then-authorize engine, exhaustively tested including
-      the concurrent-race case, but it is a single serialization point, not a
-      distributed multi-region ledger. A distributed, replay-consistent ledger
-      with signed decision records (Stage B) is unshipped roadmap work and is
-      not implemented here; do not present Stage A as that. Deploys as an
-      inbound policy on the same MCP/A2A/LLM-proxy instances Agent Fabric
-      already fronts, keyed to the identity header the fabric already carries,
-      and reuses the token-usage signal the gateway's cost dashboards already
-      produce for the token-cost contribution mode.
+      Reserve-then-authorize exposure gate for MCP: atomically reserves each
+      call's contribution against a per-scope aggregate budget before
+      forwarding, refusing calls that compose past it. In-process ledger,
+      scoped to one gateway worker.
     metadata/capabilities/injectionPoint: inbound
+    metadata/capabilities/assetTypes: mcp
     metadata/interfaceScope: api,resource
 spec:
   extends:

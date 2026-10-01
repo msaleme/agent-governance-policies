@@ -69,6 +69,31 @@ what holds the budget — this is proven directly (see Testing, below) with a un
 both designs against the same concurrent load and shows the naive counter breach while the
 reserve-then-authorize ledger holds.
 
+## Applicability and Exchange listing
+
+The Exchange listing carries only the short `metadata.labels.description` in
+`definition/gcl.yaml` (Exchange caps it at 256 characters). This README is the full explanation.
+
+| Label | Value | Meaning |
+|---|---|---|
+| `metadata/capabilities/assetTypes` | `mcp` | Attaches to MCP server instances only. |
+| `metadata/capabilities/injectionPoint` | `inbound` | Runs on the request path, before the upstream. |
+| `metadata/interfaceScope` | `api,resource` | Applies to a whole API instance or to selected resources. |
+
+MCP is the only target declared because it is the only one this build's tests cover: every
+filter test drives JSON-RPC 2.0 request bodies, and denials render as JSON-RPC `-32008` errors. An
+earlier draft also claimed agent-to-agent and model-proxy instances. Neither was ever tested, so
+neither is declared. Adding either one back needs its own test coverage first.
+
+On an MCP instance this policy prices **every** JSON-RPC request it sees, not only `tools/call`.
+That includes `initialize` and `tools/list`, so size `aggregateBudget` with that in mind.
+
+`scripts/check_exchange_metadata.py` (repo root) enforces all of this. It rejects a description
+over 256 characters, placeholder text, an undeclared or untested asset type, and a
+`P4A-SUBMISSION.md` applicability line that disagrees with `gcl.yaml`. With `--assets` it also
+checks the files `make build` generates: a real org UUID in `exchange.json`, `minRuntimeVersion
+1.14.0`, and generated definition labels identical to the source.
+
 ## Inspection boundary
 
 **What this policy reads.** On the request, exactly two things, both from the JSON-RPC body: the
@@ -249,6 +274,14 @@ Gateway — but Docker-based integration coverage was explicitly **out of scope*
 required verification gate (`fmt --check` / `clippy --lib` / `test --lib`, all of which are
 native and none of which touch this file), so these were written and confirmed to compile
 (`cargo test --no-run`) but were not executed against a live container in this environment.
+They still have not been executed. Running them needs a Flex Gateway registration, and CI is
+deliberately given none (see `.github/workflows/verify.yml`). Until they run, there is **no**
+runtime evidence for this policy on a real gateway.
+
+CI does run the full packaging path on every push: `make build` generates the definition and
+implementation assets, `scripts/check_exchange_metadata.py --assets` validates them, and the
+generated files are uploaded as the `exchange-assets-aggregate-risk-gate` workflow artifact so
+a reviewer can inspect exactly what would be published.
 
 ---
 

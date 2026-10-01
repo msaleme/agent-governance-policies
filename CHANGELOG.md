@@ -59,6 +59,20 @@ publication are included.
   read sites treat `None` as empty. Verified reproducible: a second `config-gen` run
   yields no diff, and the full gate (fmt/clippy/lib+integration tests/release wasm)
   is green.
+- **Cross-Session Aggregate-Risk Gate** — Exchange metadata is now publishable and
+  consistent (issue #16). The GCL description was ~2,240 characters. Exchange caps it
+  at 256, so it is now 232, and the full explanation lives in the README. The policy
+  now declares `metadata/capabilities/assetTypes: mcp`, the only target its tests
+  cover. `P4A-SUBMISSION.md` no longer claims A2A or LLM-proxy applicability. The
+  removed description also claimed the policy reuses the gateway's token-usage signal.
+  It never did, and that claim is gone.
+- **CI** — a new `exchange-assets` job runs the full PDK packaging path (`make build`)
+  for both policies from a clean checkout. It fails if `src/generated/config.rs` drifts
+  from `gcl.yaml`, runs `scripts/check_exchange_metadata.py --assets` (which rejects
+  over-length or placeholder metadata, untested asset types, a P4A applicability
+  mismatch, a non-UUID `groupId`, and a wrong `minRuntimeVersion`), and uploads the
+  generated assets as workflow artifacts. It reads the owning org UUID from the
+  `ANYPOINT_GROUP_ID` repository variable; `Cargo.toml` keeps its placeholder.
 
 ### Known limitations
 
