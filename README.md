@@ -87,12 +87,12 @@ fixture.
   authentication data, not a caller-asserted header. P6 single-use is enforced
   atomically via gateway data storage (`local()`, per-replica; see the policy
   README's honesty boundaries for the cross-replica/restart limits).
-- **Stage A ledger.** The aggregate-risk gate ships a real, atomic, in-process
-  reserve-then-authorize ledger, correct under genuine multi-thread contention.
-  It is **not** distributed: each gateway worker holds its own independent ledger,
-  the `window` field is accepted but not time-enforced, `ledgerEndpoint` is a
-  reserved and unimplemented Stage B field, and there is no cryptographic
-  non-repudiation of decisions. See the policy README's honesty boundaries.
+- **Per-worker ledger.** The aggregate-risk gate ships a real, atomic, in-process
+  reserve-then-authorize ledger, correct under genuine multi-thread contention,
+  with a real fixed accounting window. It is **not** shared: each gateway worker
+  holds its own independent ledger with the full budget, a restart resets it, and
+  there is no cryptographic non-repudiation of decisions. A shared, durable ledger
+  is future (v2) work. See the policy README's "Scope of the guarantee".
 - **Bounded JSON-RPC.** Inspection targets admitted JSON-RPC envelopes and their
   bodies, not URL paths, query strings, or arbitrary headers. Header values are
   not trusted provenance.

@@ -21,7 +21,7 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 46 pass | 131 pass |
+| Lib tests | 46 pass | 140 pass |
 | Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26) | In progress — P4A review #14–#18, one PR each |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
@@ -86,8 +86,7 @@ excludes all Flex identity material). No further visibility action is required t
   past a budget no per-call gate ever sees."*
 - **Config surface:** budgetScope(agent|fabric|tenant) / identitySource(authentication|trusted-header) /
   identityField / scopeHeader / maxScopes / reservationTimeoutMs / scopeDisclosure(digest|none|raw) / scopeDigestKey (sensitive) /
-  aggregateBudget / window
-  (rolling-24h|fixed-period, validated) / contribution(estimated-token-weight|spend-amount|fixed-weight) /
+  aggregateBudget / window(fixed-period|worker-lifetime, enforced) / windowMs / contribution(estimated-token-weight|spend-amount|fixed-weight) /
   fixedWeight / spendAmountField / spendCurrency / estimatedTokens / mode(block|monitor) /
   onDeny(rpc-error|empty-403) / resultHeader. All amounts are exact integers in 0–2^53−1 (spend amounts
   in ISO 4217 minor units); `resultHeader` stamps `unit=`. `token-cost` was renamed (P4A review #18).
@@ -95,9 +94,11 @@ excludes all Flex identity material). No further visibility action is required t
   canonicalized and bounded, and the result header shows a digest, not the raw ID (P4A review #14).
 - **Framework refs (supporting-measure):** NIST SP 800-53 Rev5 AC-4/SC-7/AU-2/AU-6/SI-4; OWASP LLM10:2025
   Unbounded Consumption; MITRE ATLAS AML.T0034 Cost Harvesting + Engage; EU AI Act Art 15. Full text in README.
-- **Honesty boundary (must be in the listing):** ships **Stage A** — an in-process, single-worker
-  serialized ledger (real, atomic, race-tested), **not** a distributed multi-region ledger. Stage B
-  (distributed, signed decision records) is unshipped roadmap. Response leg is headers-only.
+- **Honesty boundary (must be in the listing):** an in-process serialized ledger (real, atomic,
+  race-tested) with a real fixed window, **one budget per policy instance per gateway worker**. It is
+  not shared across workers or replicas (N workers admit up to N × the budget) and a restart resets it
+  (P4A review #15). A shared, durable ledger with signed decision records is future v2 work. Response
+  leg is headers-only.
 
 ## Wizard steps (HUMAN)
 1. No visibility blocker — the repo is public (see above). Proceed.

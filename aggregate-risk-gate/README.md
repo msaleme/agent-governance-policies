@@ -107,7 +107,7 @@ envelope's `id`(s) (to echo the caller's own id on a `rpc-error` denial) and, wh
 `identitySource=trusted-header`, the one header named by `scopeHeader`. It never reads any other
 header, the query string, or the request/response path. **On the response, it reads
 nothing but headers** — the status code (to decide commit vs. release) — and never the response
-body; see the `contribution` and Honesty boundaries sections below for why an
+body; see the `contribution` and Scope of the guarantee sections below for why an
 `estimated-token-weight` reservation settles at its own pre-flight estimate rather than a real usage figure.
 
 **Inspection exclusions.** A request body is inspected only if ALL of the following hold, checked
@@ -154,13 +154,13 @@ with one `-32008` error per id, echoing every id in the batch.
 | `scopeDisclosure` | `digest`\|`none`\|`raw` | `digest` | How the scope appears in `resultHeader` and denial messages. `digest` — `<budgetScope>:hmac-<16 hex>` (HMAC-SHA256 under `scopeDigestKey`, first 8 bytes), or `sha256-…` when no key is set. `none` — just `<budgetScope>`. `raw` — the canonical identity itself; only for trusted, internal consumers. |
 | `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest`. Without a key the digest is a plain SHA-256, which anyone holding a candidate identity can recompute. Set a key when identities are guessable. |
 | `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
-| `window` | string | `rolling-24h` | The accounting window `aggregateBudget` nominally applies to. **Accepted but not enforced at Stage A** — see Honesty boundaries below; the ledger accumulates for the life of the gateway worker process, not a real window. |
-| `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Honesty boundaries below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
+| `window` | `fixed-period`\|`worker-lifetime` | `fixed-period` | How long committed exposure counts. `fixed-period` resets every scope's committed total at each `windowMs` boundary, counted from the Unix epoch, so 24-hour windows start at 00:00 UTC. `worker-lifetime` never resets. See Accounting window below. The old value `rolling-24h` never rolled and is now rejected at configure time. |
+| `windowMs` | integer, `60000`–`31622400000` | `86400000` | Window length in ms for `fixed-period` (1 minute to 366 days). Ignored for `worker-lifetime`. |
+| `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Scope of the guarantee below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
 | `fixedWeight` | integer, `0`–`9007199254740991` | `1` | Per-call contribution when `contribution=fixed-weight`. |
 | `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and recorded as zero in `monitor` mode. |
 | `spendCurrency` | string, ISO 4217 | `USD` | Currency of `spend-amount` values: three uppercase letters, with amounts in that currency's ISO 4217 minor unit. Stamped into `resultHeader` as `unit=<code>-minor`. The policy does no currency conversion. |
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
-| `ledgerEndpoint` | string | `""` | **Reserved for Stage B, NOT implemented.** Accepted and validated (a non-empty value is logged as a forward-compatibility notice) but every decision in this build is made by the in-process Stage A ledger regardless of this value. Leave empty. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
 | `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `unpriceable`, or `out-of-range`. Never carries other sessions' call content, and by default never the raw identity. |
@@ -178,13 +178,13 @@ with one `-32008` error per id, echoing every id in the batch.
     scopeDisclosure: digest
     scopeDigestKey: ""        # set from a secret; see scopeDigestKey above
     aggregateBudget: 3000
-    window: rolling-24h
+    window: fixed-period
+    windowMs: 86400000
     contribution: fixed-weight
     fixedWeight: 800
     spendAmountField: params.amount
     spendCurrency: USD
     estimatedTokens: 500
-    ledgerEndpoint: ""
     mode: block
     onDeny: rpc-error
     resultHeader: x-aggregate-risk-gate
@@ -243,7 +243,7 @@ identity contains a space, so these never collide with a real scope.
 and the cap cannot be used to reset someone else's total, because only idle scopes are evicted.
 Idle scopes hold nothing committed or reserved. A stranded reservation stops pinning its scope two
 timeouts after it was made (see Reservation lifecycle). Committed exposure does not expire; that is
-tied to `window`.
+reset by `window`.
 
 **Breaking change.** Earlier builds always keyed on `scopeHeader`. A config that relies on that
 must now set `identitySource: trusted-header` and, to keep raw scopes in the result header,
@@ -287,8 +287,23 @@ and not-active. The line carries no identity.
 
 **Worker restart.** The ledger is in worker memory. When the worker restarts, every committed and
 reserved amount is gone and all scopes start again at zero. This fails open, and it is deterministic:
-a restart is the only thing that resets totals. Settlement is an in-process map update, so it has
+apart from window boundaries, a restart is the only thing that resets totals. Settlement is an in-process map update, so it has
 no transient failure to retry.
+
+## Accounting window
+
+With `window: fixed-period`, time is cut into periods of `windowMs` counted from the Unix epoch,
+on the gateway's own clock. Period `n` covers `[n × windowMs, (n + 1) × windowMs)`. The first time a
+scope is touched in a later period, its committed total resets to zero. Boundaries do not depend
+on when a scope was first seen: two calls 1 ms apart on either side of a boundary land in
+different periods.
+
+A call still in flight at a boundary keeps its reservation, which counts against the new period
+until it settles. When it commits, it is charged to the period it settles in. A clock that steps
+backwards never resets a total, because periods only move forward. A scope whose committed total
+is from an earlier period counts as idle for `maxScopes` eviction.
+
+With `window: worker-lifetime` committed exposure accumulates until the worker restarts.
 
 ## Units
 
@@ -308,51 +323,44 @@ A request amount above the ceiling is refused with `reason=out-of-range`. Ledger
 saturating arithmetic, so a sum that would overflow compares as over budget and never wraps
 around to a small number.
 
-## Honesty boundaries (Stage A vs. Stage B)
+## Scope of the guarantee
 
-This build ships **Stage A**: a real, atomic, in-process reserve-then-authorize ledger, scoped to
-a single gateway worker, backed by a mutex-serialized map keyed by budget scope. It is genuinely
-race-safe — the concurrent-admission unit test proves it holds the budget under contention where
-a naive read-then-write counter breaches — but it is **one serialization point in one worker
-process**, not a distributed, multi-region, or replay-consistent ledger, and it makes no
-cryptographic non-repudiation claim over its decisions. Concretely:
+The ledger is real, atomic, in-process reserve-then-authorize, backed by a mutex-serialized map
+keyed by budget scope. It is genuinely race-safe: the concurrent-admission unit test shows it
+holding the budget under contention where a naive read-then-write counter breaches. Its scope is
+**one policy instance in one gateway worker**. Concretely:
 
-- **No cross-worker/cross-region consistency.** If the gateway runs multiple worker processes or
-  instances fronting the same fabric, each gets its *own* Stage A ledger and its own independent
-  view of a scope's total — the aggregate budget is only truly aggregate within one worker.
-- **`ledgerEndpoint` is a reserved, unimplemented Stage B field.** A distributed ledger service
-  this policy calls out to instead of its in-process map is unshipped roadmap work. Setting this
-  field to a non-empty URL changes nothing about how decisions are made today.
-- **`window` is accepted but not enforced.** Reservations expire (see Reservation lifecycle), but
-  committed exposure does not — a scope's committed total accumulates for the life of the running
-  worker process, not for a rolling or fixed accounting window. Real per-window expiry needs a clock-driven eviction policy against a
-  real distributed store, not a per-request approximation; it is Stage B roadmap work.
+- **The budget is per worker, not per fleet.** Each gateway worker, and each replica's workers,
+  holds its own ledger with the full `aggregateBudget`. With `N` workers in total behind the same
+  API, a scope can be admitted up to `N × aggregateBudget` in a window. To make `aggregateBudget`
+  an upper bound for the whole deployment, divide the intended budget by `N`. That bound is safe
+  but loose: a scope whose traffic lands on one worker gets only `1/N` of the intended budget.
+- **A restart or redeploy resets the ledger.** Every committed and reserved amount is lost and all
+  scopes start again at zero, even mid-window. There is no persistence and no storage dependency,
+  so there are no storage conflicts or storage errors to handle.
+- **No signed decision records.** Every ledger operation happens in-process and is not
+  independently attestable outside this policy's own process. This build makes no claim that its
+  admit/deny decisions are cryptographically non-repudiable.
 - **`estimated-token-weight` contribution is estimate-then-SETTLE, not estimate-then-reconcile,
   and it never measures actual token usage.** The reservation made before authorizing an
-  `estimated-token-weight` call is
-  `estimatedTokens`, a configured upper bound. This build's response leg is strictly headers-only
-  (see Inspection boundary above) — it never buffers or reads the response body, so it never learns
-  a real `usage.total_tokens` figure to true up against. On a successful response the reservation is
-  therefore **committed at the estimate itself**, unchanged (or released outright on failure). This
-  is a more conservative behavior than a real reconcile would be, not a softer one: set the estimate
-  conservatively for the traffic this instance governs, since it is what actually lands in the
-  ledger, not a placeholder for something more accurate arriving later.
-- **A worker restart resets the ledger.** Every committed and reserved amount is lost and every
-  scope starts again at zero (see Reservation lifecycle). There is no persistence.
-- **No signed decision records.** Every ledger operation happens in-process and is not
-  independently attestable outside this policy's own process; this build makes no claim that its
-  admit/deny decisions are cryptographically non-repudiable.
+  `estimated-token-weight` call is `estimatedTokens`, a configured upper bound. This build's
+  response leg is strictly headers-only (see Inspection boundary above). It never buffers or reads
+  the response body, so it never learns a real `usage.total_tokens` figure to true up against. On
+  a successful response the reservation is therefore **committed at the estimate itself**,
+  unchanged (or released outright on failure). Set the estimate conservatively for the traffic
+  this instance governs, since it is what actually lands in the ledger.
 
-A distributed, replay-consistent ledger with signed decision records — matching the full model in
-the `authorized-but-composed` reference work — is Stage B: real, valuable, and **not implemented
-here**. Do not present this build as shipping it.
+A shared, durable ledger, with one budget across workers and replicas that survives restarts and
+has signed decision records (the full model in the `authorized-but-composed` reference work), is
+future work for a v2. It is **not implemented here**. Do not present this build as shipping it.
+The earlier `ledgerEndpoint` placeholder for it has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 131 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 140 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 45 tests): correctness of
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 51 tests): correctness of
   `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
@@ -374,7 +382,11 @@ Docker:
   changes nothing; a settlement more than one timeout after reclaim is dropped and the reservation
   counted abandoned; the counters tell every state apart; and a stranded reservation stops pinning
   a full ledger after two timeouts.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (45 tests,
+  Six cover the accounting window: a fixed window resets committed exposure at the boundary;
+  periods are aligned to the epoch, not first use; an in-flight reservation carries across a
+  boundary and settles in the new period; a clock stepping backwards never resets a total;
+  without a window nothing resets; and a scope from an earlier period can be evicted.
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (47 tests,
   from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
@@ -407,6 +419,9 @@ Docker:
     (`estimated_token_weight_ignores_over_and_malformed_usage_figures`).
   - **Settlement** — a successful response is stamped `settlement=committed` and a failure
     `settlement=released`, and a worker restart (`tester.restart()`) resets every total to zero.
+  - **Window** — with `windowMs: 60000` a spent budget is still denied at 59 s on the gateway
+    clock (`tester.sleep`) and available again at 60 s; with `worker-lifetime` it is still denied
+    400 days later.
   - **Exact integer units** — a spend amount of `12.34`, `1234.0`, `1e3`, `-5`, `"1234"`, or 2^64
     is refused as unpriceable before it reaches upstream. Amounts above 2^53 − 1 are refused as
     out of range, and so are spend-amount and fixed-weight batches whose total overflows. Monitor
@@ -416,8 +431,8 @@ Docker:
   rules in `canonical_identity`; duplicate and mixed-case trusted headers; `client_id`,
   `principal` and `properties.<path>` selection (a non-string property is invalid); and
   `digest` (keyed and unkeyed), `none` and `raw` display.
-- **Direct `Gate::from_config` validation tests** (27): every config-validation rejection path
-  (invalid enum values including `window`, negative or above-2^53 − 1 amounts, a fractional
+- **Direct `Gate::from_config` validation tests** (28): every config-validation rejection path
+  (invalid enum values including `window`, the retired `rolling-24h` rejected with its replacements named, `windowMs` outside `60000`–`31622400000`, negative or above-2^53 − 1 amounts, a fractional
   amount refused by deserialization, the retired `token-cost` name rejected with its replacement
   named, a malformed `spendCurrency`, blank required strings, an unknown `identitySource`,
   `identityField` or `scopeDisclosure`, and `maxScopes` outside `1`–`1000000`, `reservationTimeoutMs` outside `1000`–`86400000`) and the corresponding accepted

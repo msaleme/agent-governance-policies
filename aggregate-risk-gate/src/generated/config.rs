@@ -15,8 +15,6 @@ pub struct Config {
     pub identity_field: String,
     #[serde(alias = "identitySource")]
     pub identity_source: String,
-    #[serde(alias = "ledgerEndpoint")]
-    pub ledger_endpoint: String,
     #[serde(alias = "maxScopes")]
     pub max_scopes: i64,
     #[serde(alias = "mode")]
@@ -39,6 +37,8 @@ pub struct Config {
     pub spend_currency: String,
     #[serde(alias = "window")]
     pub window: String,
+    #[serde(alias = "windowMs")]
+    pub window_ms: i64,
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {

@@ -131,22 +131,25 @@ spec:
         when the policy is configured.
     window:
       type: string
-      default: rolling-24h
+      default: fixed-period
       enum:
-        - rolling-24h
         - fixed-period
+        - worker-lifetime
       description: >-
-        The accounting window the aggregateBudget applies to. This build's
-        Stage A ledger keeps one continuously-accumulating total per scope for
-        the life of the running gateway worker — it does NOT roll off entries
-        older than a fixed period or reset on a calendar boundary. "rolling-24h"
-        and "fixed-period" are both accepted values, but both currently receive
-        the identical continuously-accumulating behavior; per-window expiry is
-        Stage B roadmap work (it needs a real clock-driven eviction policy
-        against the distributed ledger, not a per-request approximation). This
-        field is accepted and stamped into logs/headers today for forward
-        compatibility with that roadmap, not silently ignored, but it does not
-        yet change enforcement.
+        How long committed exposure counts against aggregateBudget.
+        "fixed-period" resets every scope's committed total at each windowMs
+        boundary, counted from the Unix epoch (24h windows start at 00:00
+        UTC). Calls still in flight at a boundary carry into the new period.
+        "worker-lifetime" never resets. In both, the ledger is per gateway
+        worker and a worker restart resets it (see README).
+    windowMs:
+      type: integer
+      default: 86400000
+      minimum: 60000
+      maximum: 31622400000
+      description: >-
+        With window "fixed-period", the window length in milliseconds, from 1
+        minute to 366 days. Ignored with "worker-lifetime".
     contribution:
       type: string
       default: fixed-weight
@@ -209,17 +212,6 @@ spec:
         there is no true-up in either direction. Set it too low and real
         consumption is under-counted; set it too high and successful calls are
         over-charged. It is released in full if the upstream call fails.
-    ledgerEndpoint:
-      type: string
-      default: ""
-      description: >-
-        Reserved for Stage B: the URL of an external, distributed
-        reserve-then-authorize ledger service. NOT implemented in this build —
-        this field is accepted and validated (non-empty values are logged as a
-        forward-compatibility notice) but every decision in this build is made
-        by the in-process Stage A ledger described in this policy's summary,
-        regardless of this value. Leave empty; do not depend on an external
-        ledger being consulted.
     mode:
       type: string
       default: monitor
@@ -285,12 +277,12 @@ spec:
     - scopeDigestKey
     - aggregateBudget
     - window
+    - windowMs
     - contribution
     - fixedWeight
     - spendAmountField
     - spendCurrency
     - estimatedTokens
-    - ledgerEndpoint
     - mode
     - onDeny
     - resultHeader
