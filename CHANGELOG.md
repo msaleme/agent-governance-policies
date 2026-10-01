@@ -74,6 +74,21 @@ publication are included.
   generated assets as workflow artifacts. It reads the owning org UUID from the
   `ANYPOINT_GROUP_ID` repository variable; `Cargo.toml` keeps its placeholder.
 
+- **Cross-Session Aggregate-Risk Gate** — exposure amounts are exact integers (issue #18).
+  The ledger used `f64`, so cumulative decimal amounts drifted. 0.1 + 0.2 > 0.3, so a budget-exact
+  call could be refused, and large values lost precision. The ledger is now `u64`, and saturating
+  arithmetic means an overflowing sum compares as over budget. `aggregateBudget`, `fixedWeight`
+  and `estimatedTokens` are schema `integer`s in `0`–`9007199254740991` (2^53 − 1). Spend amounts
+  must be JSON integer minor units of the new `spendCurrency` (ISO 4217, default `USD`). A
+  fraction, `1234.0`, an exponent, a negative value or a string is denied as unpriceable. A value
+  over the ceiling, or a batch sum or product that overflows it, is denied with
+  `reason=out-of-range`. `resultHeader` stamps integer totals and a `unit=` field. **Breaking:**
+  the `token-cost` contribution is renamed `estimated-token-weight` and the old name is rejected
+  at configure time. It always charged the configured estimate and never measured usage. That is
+  unchanged and now tested against under-, over- and malformed usage responses. The unused
+  `LedgerStore::reconcile` primitive and its two tests are removed. Its only caller passed the
+  estimate back in unchanged, so every mode now settles through `commit`.
+
 ### Known limitations
 
 - Approval-binding P5 attestation is symmetric HMAC in this build (separation-of-

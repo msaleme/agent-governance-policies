@@ -2,15 +2,15 @@ use serde::Deserialize;
 #[derive(Deserialize, Clone, Debug)]
 pub struct Config {
     #[serde(alias = "aggregateBudget")]
-    pub aggregate_budget: f64,
+    pub aggregate_budget: i64,
     #[serde(alias = "budgetScope")]
     pub budget_scope: String,
     #[serde(alias = "contribution")]
     pub contribution: String,
     #[serde(alias = "estimatedTokens")]
-    pub estimated_tokens: f64,
+    pub estimated_tokens: i64,
     #[serde(alias = "fixedWeight")]
-    pub fixed_weight: f64,
+    pub fixed_weight: i64,
     #[serde(alias = "ledgerEndpoint")]
     pub ledger_endpoint: String,
     #[serde(alias = "mode")]
@@ -23,6 +23,8 @@ pub struct Config {
     pub scope_header: String,
     #[serde(alias = "spendAmountField")]
     pub spend_amount_field: String,
+    #[serde(alias = "spendCurrency")]
+    pub spend_currency: String,
     #[serde(alias = "window")]
     pub window: String,
 }

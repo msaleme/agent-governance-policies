@@ -49,8 +49,9 @@ writes. Only **reserve-then-authorize against a serialized ledger** holds the bu
 
 On each governed call the policy:
 
-1. **Computes** the call's exposure contribution — token cost, a spend amount read from the
-   request body, or a fixed per-call weight (`contribution`).
+1. **Computes** the call's exposure contribution as an exact integer — an estimated-token weight,
+   a spend amount in currency minor units read from the request body, or a fixed per-call weight
+   (`contribution`). See Units below.
 2. **Reserves** that contribution against a ledger keyed by budget scope (per agent, per fabric,
    per tenant — `budgetScope`) *before* authorizing the call.
 3. **Authorizes** only if committed-plus-reserved exposure for that scope, including this call's
@@ -98,12 +99,12 @@ checks the files `make build` generates: a real org UUID in `exchange.json`, `mi
 
 **What this policy reads.** On the request, exactly two things, both from the JSON-RPC body: the
 envelope's `id`(s) (to echo the caller's own id on a `rpc-error` denial) and, when
-`contribution=spend-amount`, the numeric value at `spendAmountField`. Alongside those, it reads the
+`contribution=spend-amount`, the integer value at `spendAmountField`. Alongside those, it reads the
 one identity header configured by `scopeHeader` (for `agent`/`tenant` budget scope). It never reads
 any other header, the query string, or the request/response path. **On the response, it reads
 nothing but headers** — the status code (to decide commit vs. release) — and never the response
-body; see the `contribution` and Honesty boundaries sections below for why a `token-cost`
-reservation settles at its own pre-flight estimate rather than a real usage figure.
+body; see the `contribution` and Honesty boundaries sections below for why an
+`estimated-token-weight` reservation settles at its own pre-flight estimate rather than a real usage figure.
 
 **Inspection exclusions.** A request body is inspected only if ALL of the following hold, checked
 at the HEADER phase, before this policy ever buffers the body:
@@ -130,7 +131,7 @@ an explicit, safe fallback, not a risk of missing a hidden secret — and none o
 Flex/Gateway's own framing and buffering limits.
 
 **Batch (array) requests.** A JSON-RPC batch is never priced as if it were a single call: under
-`fixed-weight`/`token-cost` its per-item weight/estimate is multiplied by the number of items in the
+`fixed-weight`/`estimated-token-weight` its per-item weight/estimate is multiplied by the number of items in the
 array; under `spend-amount` every item's amount is read and summed, and the whole batch fails closed
 if any single item is unpriceable. A batch denied for exceeding budget is refused atomically — never
 split so that some items land while others don't — and, in `rpc-error` mode, gets back a JSON array
@@ -142,16 +143,17 @@ with one `-32008` error per id, echoing every id in the batch.
 |---|---|---|---|
 | `budgetScope` | `agent`\|`fabric`\|`tenant` | `agent` | The aggregation dimension. `agent`/`tenant` — one running total per identity value read from `scopeHeader` (a broker session's fleet, or a tenant/org). `fabric` — one running total shared across every request this instance sees, ignoring `scopeHeader`. Ledger key is `"<budgetScope>:<value>"` (`fabric` uses a fixed value). |
 | `scopeHeader` | string | `x-agent-id` | Request header carrying the identity value used to key the ledger when `budgetScope` is `agent` or `tenant`. Ignored for `fabric`. Missing when required: fails closed in `block` mode; recorded under a fixed `(missing)` key in `monitor` mode so the gap is visible rather than silently dropped. |
-| `aggregateBudget` | number | `3000` | The exposure budget for the scope's current window, in `contribution`'s units. A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
+| `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
 | `window` | string | `rolling-24h` | The accounting window `aggregateBudget` nominally applies to. **Accepted but not enforced at Stage A** — see Honesty boundaries below; the ledger accumulates for the life of the gateway worker process, not a real window. |
-| `contribution` | `token-cost`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — numeric field read from the request body at `spendAmountField`. `token-cost` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Honesty boundaries below). A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
-| `fixedWeight` | number | `1` | Per-call contribution when `contribution=fixed-weight`. |
-| `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the numeric spend amount when `contribution=spend-amount`. Missing/unparseable/non-numeric: unpriceable — denied in `block` mode, recorded as zero in `monitor` mode. |
-| `estimatedTokens` | number | `500` | Pre-flight reservation estimate (tokens) when `contribution=token-cost`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
+| `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Honesty boundaries below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
+| `fixedWeight` | integer, `0`–`9007199254740991` | `1` | Per-call contribution when `contribution=fixed-weight`. |
+| `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and recorded as zero in `monitor` mode. |
+| `spendCurrency` | string, ISO 4217 | `USD` | Currency of `spend-amount` values: three uppercase letters, with amounts in that currency's ISO 4217 minor unit. Stamped into `resultHeader` as `unit=<code>-minor`. The policy does no currency conversion. |
+| `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
 | `ledgerEndpoint` | string | `""` | **Reserved for Stage B, NOT implemented.** Accepted and validated (a non-empty value is logged as a forward-compatibility notice) but every decision in this build is made by the in-process Stage A ledger regardless of this value. Leave empty. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
-| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:broker-7;contribution=800.00;total=2400.00/3000.00` or, on denial, `denied;scope=agent:broker-7;would-be-total=3200.00;budget=3000.00`. Never carries other sessions' call content — only the scope key and numeric totals — so it is safe to forward to downstream logging, SIEM, or a Kill Switch without a further redaction pass. |
+| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:broker-7;would-be-total=3200;budget=3000;unit=points`. Unpriceable and out-of-range calls carry `reason=unpriceable` / `reason=out-of-range` instead of totals. Never carries other sessions' call content — only the scope key and numeric totals — so it is safe to forward to downstream logging, SIEM, or a Kill Switch without a further redaction pass. |
 
 ```yaml
 - policyRef:
@@ -164,6 +166,7 @@ with one `-32008` error per id, echoing every id in the batch.
     contribution: fixed-weight
     fixedWeight: 800
     spendAmountField: params.amount
+    spendCurrency: USD
     estimatedTokens: 500
     ledgerEndpoint: ""
     mode: block
@@ -177,9 +180,9 @@ as a JSON-RPC `-32008` error naming a would-be total of 3200/3000; the fifth is 
 way. A different `x-agent-id` gets its own independent 3000-unit budget.
 
 On the fourth (denied) call above, the client-facing response carries, e.g.
-`x-aggregate-risk-gate: denied;scope=agent:broker-7;would-be-total=3200.00;budget=3000.00`. On an
-allowed call it instead carries, e.g.
-`x-aggregate-risk-gate: allowed;scope=agent:broker-7;contribution=800.00;total=2400.00/3000.00`.
+`x-aggregate-risk-gate: denied;scope=agent:broker-7;would-be-total=3200;budget=3000;unit=points`. On
+an allowed call it instead carries, e.g.
+`x-aggregate-risk-gate: allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points`.
 Neither format carries another session's call content — only the scope key and the numeric
 totals — so both are safe to forward downstream to logging, SIEM, or a Kill Switch without a
 further redaction pass. At policy start-up the gateway log separately carries a plain diagnostic
@@ -187,6 +190,24 @@ line naming the armed configuration, e.g.
 `Aggregate Risk Gate armed: budgetScope=agent, aggregateBudget=3000, contribution=fixed-weight, mode=block`
 — a one-time informational line, not a per-call structured event; the `resultHeader` above is the
 per-call decision record.
+
+## Units
+
+Every budget and contribution is an exact non-negative integer, and the ledger keeps them as
+`u64`. Nothing is ever rounded. Each mode has its own unit, which `resultHeader` names:
+
+| `contribution` | Unit | `unit=` stamp |
+|---|---|---|
+| `fixed-weight` | abstract points | `points` |
+| `estimated-token-weight` | estimated tokens (a configured estimate, not measured usage) | `estimated-tokens` |
+| `spend-amount` | ISO 4217 minor units of `spendCurrency` (cents for USD, yen for JPY) | `<CUR>-minor`, e.g. `USD-minor` |
+
+The ceiling for any single amount, and for a batch's total, is `9007199254740991` (2^53 − 1), the
+largest integer every JSON implementation represents exactly. Config values outside
+`0`–`9007199254740991` are rejected at configure time. Fractional config values fail to deserialize.
+A request amount above the ceiling is refused with `reason=out-of-range`. Ledger totals use
+saturating arithmetic, so a sum that would overflow compares as over budget and never wraps
+around to a small number.
 
 ## Honesty boundaries (Stage A vs. Stage B)
 
@@ -207,8 +228,9 @@ cryptographic non-repudiation claim over its decisions. Concretely:
   a scope's exposure accumulates for the life of the running worker process, not for a rolling or
   fixed accounting window. Real per-window expiry needs a clock-driven eviction policy against a
   real distributed store, not a per-request approximation; it is Stage B roadmap work.
-- **`token-cost` contribution is estimate-then-SETTLE, not estimate-then-reconcile, and pre-flight
-  token cost is not exactly known.** The reservation made before authorizing a token-cost call is
+- **`estimated-token-weight` contribution is estimate-then-SETTLE, not estimate-then-reconcile,
+  and it never measures actual token usage.** The reservation made before authorizing an
+  `estimated-token-weight` call is
   `estimatedTokens`, a configured upper bound. This build's response leg is strictly headers-only
   (see Inspection boundary above) — it never buffers or reads the response body, so it never learns
   a real `usage.total_tokens` figure to true up against. On a successful response the reservation is
@@ -226,11 +248,11 @@ here**. Do not present this build as shipping it.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 74 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 88 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 27 tests): correctness of
-  `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`reconcile`/`snapshot`
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 28 tests): correctness of
+  `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
   800-unit calls against a 3000 budget, breaching to 4000) and
@@ -239,8 +261,10 @@ Docker:
   race scenario from `authorized-but-composed`, plus a broader multi-scope stress variant
   (`reserve_then_authorize_never_exceeds_budget_across_many_concurrent_scopes`). These two headline
   tests, and every other test in this file, are never weakened or skipped — they are the correctness
-  proof this whole policy exists to make.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (27 tests,
+  proof this whole policy exists to make. Three more cover exact integer units: small contributions
+  land exactly on the budget, an overflowing sum is denied rather than wrapping, and a forced
+  reservation saturates and still reports the breach.
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (35 tests,
   from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
@@ -260,12 +284,21 @@ Docker:
     does not.
   - **Response leg is headers-only** — a 10x-oversized response body is never buffered and the
     `resultHeader` still lands (`a_large_response_body_is_never_buffered_and_the_header_still_lands`),
-    and a `token-cost` call commits its full pre-flight estimate rather than a smaller real usage
-    figure the response body is never read to find
-    (`token_cost_contribution_commits_the_full_estimate_and_never_reads_the_response_body`).
-- **Direct `Gate::from_config` validation tests** (16): every config-validation rejection path
-  (invalid enum values including `window`, non-finite/negative numeric fields, blank required
-  strings) and the corresponding accepted cases.
+    and an `estimated-token-weight` call commits its full pre-flight estimate rather than a smaller
+    real usage figure the response body is never read to find
+    (`estimated_token_weight_commits_the_full_estimate_and_never_reads_the_response_body`). Usage
+    figures that are higher than the estimate, or malformed, don't change the charge either
+    (`estimated_token_weight_ignores_over_and_malformed_usage_figures`).
+  - **Exact integer units** — a spend amount of `12.34`, `1234.0`, `1e3`, `-5`, `"1234"`, or 2^64
+    is refused as unpriceable before it reaches upstream. Amounts above 2^53 − 1 are refused as
+    out of range, and so are spend-amount and fixed-weight batches whose total overflows. Monitor
+    mode forwards those calls and stamps `reason=out-of-range`. 10 + 20 minor units land exactly
+    on a budget of 30, which a float ledger gets wrong. `spendCurrency` is stamped as the unit.
+- **Direct `Gate::from_config` validation tests** (21): every config-validation rejection path
+  (invalid enum values including `window`, negative or above-2^53 − 1 amounts, a fractional
+  amount refused by deserialization, the retired `token-cost` name rejected with its replacement
+  named, a malformed `spendCurrency`, blank required strings) and the corresponding accepted
+  cases.
 - **`dot_path_value` unit tests** (4): the dotted-path body reader used for `spend-amount`.
 
 `tests/requests.rs` holds two `pdk_test` integration tests that run the same

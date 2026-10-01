@@ -47,13 +47,19 @@ spec:
         fixed "(missing)" key in monitor mode so the gap is visible on
         dashboards rather than silently dropped.
     aggregateBudget:
-      type: number
+      type: integer
       default: 3000
+      minimum: 0
+      maximum: 9007199254740991
       description: >-
-        The exposure budget for the scope's current window, in the same units
-        as contribution (tokens, spend units, or fixed-weight points). A call
-        is authorized only if committed-plus-reserved exposure for its scope,
-        including this call's own contribution, does not exceed this number.
+        The exposure budget for the scope, as an exact non-negative integer in
+        the same unit as contribution: fixed-weight points, estimated tokens,
+        or minor units of spendCurrency (e.g. cents for USD). Range 0 to
+        9007199254740991 (2^53 - 1). A call is authorized only if committed-plus-reserved
+        exposure for its scope, including this call's own contribution, does
+        not exceed this number. All budget arithmetic is exact integer
+        arithmetic; fractional, negative, or out-of-range values are rejected
+        when the policy is configured.
     window:
       type: string
       default: rolling-24h
@@ -76,53 +82,64 @@ spec:
       type: string
       default: fixed-weight
       enum:
-        - token-cost
+        - estimated-token-weight
         - spend-amount
         - fixed-weight
       description: >-
-        How this call's exposure contribution is computed. "fixed-weight" — a
-        static per-call weight from fixedWeight, known before the call is
-        authorized. "spend-amount" — a numeric field read from the request
-        JSON-RPC body at spendAmountField, known before the call is authorized.
-        "token-cost" — pre-flight token cost is not exactly knowable, so the
-        reservation uses estimatedTokens as a stand-in and this build commits
-        that same estimate on a successful response (this build's response
-        handling is headers-only and never reads the response body, so it has
-        no real usage.total_tokens figure to true up against — see
-        estimatedTokens and the Honesty boundaries section in README.md); a
-        future build could settle to a real figure without changing this
-        field's meaning. A JSON-RPC BATCH (array) request's per-item
-        contribution is multiplied/summed across every item in the array, not
-        priced as a single call.
+        How this call's exposure contribution is computed, always as an exact
+        integer. "fixed-weight" — fixedWeight points per call. "spend-amount" —
+        an integer count of spendCurrency minor units read from the request
+        body at spendAmountField. "estimated-token-weight" — a fixed charge of
+        estimatedTokens per call. This is NOT measured token cost: the policy
+        never reads actual token usage, so the estimate is the charge on every
+        successful call, whatever the real usage was. (Renamed from
+        "token-cost", which is now rejected so it cannot be mistaken for
+        actual token accounting.) A JSON-RPC batch (array) is charged per item,
+        never as a single call. A contribution above 9007199254740991 is
+        rejected as out of range.
     fixedWeight:
-      type: number
+      type: integer
       default: 1
+      minimum: 0
+      maximum: 9007199254740991
       description: >-
-        Per-call exposure contribution when contribution=fixed-weight.
+        Per-call exposure contribution, in integer points, when
+        contribution=fixed-weight. Range 0 to 9007199254740991.
     spendAmountField:
       type: string
       default: params.amount
       description: >-
         Dot-separated path into the parsed JSON-RPC request body's top-level
-        object read for the numeric spend amount when contribution=spend-amount
-        (e.g. "params.amount" reads body.params.amount). A request whose body
-        is missing, unparseable as JSON-RPC, or missing/non-numeric at this
-        path is treated as unpriceable: denied in block mode (onDeny applies),
-        recorded as zero contribution in monitor mode so the gap is visible
-        rather than silently inflating or deflating the total.
-    estimatedTokens:
-      type: number
-      default: 500
+        object read for the spend amount when contribution=spend-amount (e.g.
+        "params.amount" reads body.params.amount). The value must be a JSON
+        integer count of spendCurrency minor units, between 0 and
+        9007199254740991: 1234 means 12.34 USD. A fraction (12.34 or 1234.0),
+        an exponent (1e3), a negative value, a string, or anything out of
+        range is rejected, never rounded. A request whose body is missing,
+        unparseable, or has no valid amount at this path is unpriceable:
+        denied in block mode (onDeny applies), recorded as zero contribution
+        in monitor mode so the gap is visible.
+    spendCurrency:
+      type: string
+      default: USD
       description: >-
-        Pre-flight reservation estimate, in tokens, used to reserve exposure
-        before authorizing when contribution=token-cost. Set this to a
-        conservative upper-bound estimate for the traffic this instance
-        governs: on a successful response this build COMMITS the estimate
-        itself (it never reads the response body to learn a real
-        usage.total_tokens figure — see the contribution field and the
-        Honesty boundaries section in README.md), so an estimate set too low
-        under-counts real exposure; the reservation is released outright on an
-        upstream failure.
+        ISO 4217 code (three uppercase letters) of the currency spend amounts
+        are denominated in. Amounts and aggregateBudget are counted in this
+        currency's minor unit as ISO 4217 defines it (cents for USD, yen for
+        JPY, which has no minor unit). Only used when contribution=spend-amount;
+        always validated, and stamped into resultHeader as unit=<code>-minor.
+    estimatedTokens:
+      type: integer
+      default: 500
+      minimum: 0
+      maximum: 9007199254740991
+      description: >-
+        Integer token charge per call when contribution=estimated-token-weight.
+        Range 0 to 9007199254740991. It is reserved before the call and committed
+        unchanged on a successful response; actual usage is never read, so
+        there is no true-up in either direction. Set it too low and real
+        consumption is under-counted; set it too high and successful calls are
+        over-charged. It is released in full if the upstream call fails.
     ledgerEndpoint:
       type: string
       default: ""
@@ -175,11 +192,14 @@ spec:
       description: >-
         Header stamped on the CLIENT-FACING RESPONSE recording the verdict and
         the running total — on an allowed or monitored call, e.g.
-        "allowed;scope=agent:broker-7;contribution=800.00;total=2400.00/3000.00"
+        "allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points"
         or "monitor;scope=...;contribution=...;total=.../..."; on a block-mode
-        denial, e.g. "denied;scope=agent:broker-7;would-be-total=3200.00;
-        budget=3000.00" (or "reason=missing-scope-header" / "reason=unpriceable"
-        for the two non-budget deny reasons). Never carries other sessions'
+        denial, e.g. "denied;scope=agent:broker-7;would-be-total=3200;
+        budget=3000;unit=points" (or "reason=missing-scope-header",
+        "reason=unpriceable", or "reason=out-of-range" for the non-budget deny
+        reasons). All amounts are exact integers; unit is "points"
+        (fixed-weight), "estimated-tokens" (estimated-token-weight), or
+        "<spendCurrency>-minor" such as "USD-minor" (spend-amount). Never carries other sessions'
         call content — only the scope key and the numeric totals — so it is
         safe to forward to downstream logging, SIEM, or a Kill Switch without a
         further redaction pass.
@@ -191,6 +211,7 @@ spec:
     - contribution
     - fixedWeight
     - spendAmountField
+    - spendCurrency
     - estimatedTokens
     - ledgerEndpoint
     - mode
