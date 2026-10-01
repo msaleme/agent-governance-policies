@@ -21,6 +21,9 @@ pdk = { version = "=1.10.0", features = ["enable_stop_iteration"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 anyhow = "1.0"
+# HMAC-SHA256 digest of the scope key for client-visible headers (issue #14).
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
 
 [dev-dependencies]
 pdk-test = { version = "=1.10.0" }

@@ -88,6 +88,20 @@ publication are included.
   unchanged and now tested against under-, over- and malformed usage responses. The unused
   `LedgerStore::reconcile` primitive and its two tests are removed. Its only caller passed the
   estimate back in unchanged, so every mode now settles through `commit`.
+- **Cross-Session Aggregate-Risk Gate** — the budget is keyed on a verified identity (issue #14).
+  The scope used to come from a caller-chosen header, so a client could mint a fresh budget per
+  call by changing it. The identity now comes from the `AuthenticationData` set by an earlier
+  authentication policy (`identitySource: authentication`, `identityField`: `client_id`, `principal`
+  or `properties.<path>`). A header is used only with `identitySource: trusted-header`, which the
+  README says must sit behind a strip-and-inject chain. Identities are trimmed and ASCII-lowercased.
+  An identity over 256 bytes, outside visible ASCII, carrying a stamp delimiter, sent as a
+  duplicate header, or a non-string property is denied with `reason=invalid-identity`. No identity
+  is denied with `reason=missing-identity`. `maxScopes` (default 10000) caps the ledger: only an
+  idle scope is evicted, otherwise a new scope is denied with `reason=scope-capacity`. The result
+  header and denial messages show `scopeDisclosure` (default `digest`, an HMAC-SHA256 under the
+  sensitive `scopeDigestKey`), not the raw identity, and identities are never logged. Adds the
+  `sha2` and `hmac` crates. **Breaking:** a config that keyed on `scopeHeader` must now set
+  `identitySource: trusted-header`, and `scopeDisclosure: raw` to keep raw scopes in the header.
 
 ### Known limitations
 

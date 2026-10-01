@@ -43,16 +43,20 @@ mod generated;
 mod ledger;
 
 use anyhow::{anyhow, Result};
+use hmac::{Hmac, Mac};
+use pdk::authentication::{Authentication, AuthenticationData, AuthenticationHandler};
 use pdk::hl::*;
 use pdk::logger;
 use pdk::policy_violation::PolicyViolations;
+use pdk::script::Value as ScriptValue;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 
 use crate::generated::config::Config;
-use crate::ledger::{Denial, Ledger, LedgerStore, Reservation};
+use crate::ledger::{Denial, Ledger, LedgerStore, Refusal, Reservation};
 
 /// JSON-RPC server-error code used when this policy prevents a call from
 /// reaching its upstream tool. Matches the sibling decoy/binding policies in
@@ -73,6 +77,69 @@ const MAX_INSPECT_BYTES: usize = 64 * 1024;
 /// minor units); anything above this is rejected as out of range rather than
 /// rounded, so ledger arithmetic can never lose precision (P4A review #18).
 const MAX_UNITS: u64 = 9_007_199_254_740_991;
+
+/// The longest canonical identity accepted, in bytes. Together with
+/// `maxScopes` this bounds the ledger's memory (P4A review #14).
+const MAX_IDENTITY_BYTES: usize = 256;
+
+/// Where an agent/tenant identity is read from.
+#[derive(Clone, Debug, PartialEq)]
+enum IdentitySource {
+    /// `budgetScope=fabric`: one shared scope, no identity.
+    Shared,
+    /// Verified PDK authentication data, set by an earlier auth policy.
+    Authentication(IdentityField),
+    /// A header that an earlier policy strips and re-injects. Not verifiable
+    /// by this policy; see the README's trusted-header contract.
+    TrustedHeader(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum IdentityField {
+    ClientId,
+    Principal,
+    /// Dot path into `AuthenticationData::properties`.
+    Property(String),
+}
+
+/// How a scope key is shown to clients.
+#[derive(Clone, Debug, PartialEq)]
+enum Disclosure {
+    /// HMAC-SHA256 with this key, or plain SHA-256 when it is empty.
+    Digest(Vec<u8>),
+    None,
+    Raw,
+}
+
+/// The outcome of resolving a call's identity.
+#[derive(Clone, Debug, PartialEq)]
+enum Identity {
+    /// The ledger key to charge: "<budgetScope>:<canonical>" or "fabric:*".
+    Scope(String),
+    Missing,
+    /// Present but malformed, oversized, or ambiguous.
+    Invalid,
+}
+
+/// Canonicalizes an identity: trims surrounding spaces/tabs, requires 1 to
+/// `MAX_IDENTITY_BYTES` visible ASCII characters excluding the header-stamp
+/// delimiters `,` `;` `=` plus `"` and `\`, then lowercases. Case folding can only merge two
+/// identities into one (stricter) budget, never split one identity into two.
+fn canonical_identity(raw: &str) -> Identity {
+    let trimmed = raw.trim_matches(|c| c == ' ' || c == '\t');
+    if trimmed.is_empty() {
+        return Identity::Missing;
+    }
+    let well_formed = trimmed.len() <= MAX_IDENTITY_BYTES
+        && trimmed
+            .bytes()
+            .all(|b| (0x21..=0x7e).contains(&b) && !b",;=\"\\".contains(&b));
+    if well_formed {
+        Identity::Scope(trimmed.to_ascii_lowercase())
+    } else {
+        Identity::Invalid
+    }
+}
 
 /// The request body available to this policy for pricing/batch-shape
 /// inspection, resolved at the HEADER phase, before any buffering decision.
@@ -320,8 +387,8 @@ fn config_units(name: &str, value: i64) -> Result<u64> {
 /// Stage A ledger described in the module doc comment.
 struct Gate {
     budget_scope: String,
-    needs_scope_header: bool,
-    scope_header: String,
+    identity_source: IdentitySource,
+    disclosure: Disclosure,
     aggregate_budget: u64,
     contribution: Contribution,
     /// The unit every amount is counted in, stamped into `resultHeader` so a
@@ -399,13 +466,58 @@ impl Gate {
             Contribution::SpendAmount => format!("{spend_currency}-minor"),
         };
 
-        let needs_scope_header = budget_scope != "fabric";
-        let scope_header = config.scope_header.trim().to_string();
-        if needs_scope_header && scope_header.is_empty() {
-            return Err(anyhow!(
-                "scopeHeader must not be blank when budgetScope is agent or tenant"
-            ));
-        }
+        let identity_source = if budget_scope == "fabric" {
+            IdentitySource::Shared
+        } else {
+            match config.identity_source.as_str() {
+                "authentication" => {
+                    IdentitySource::Authentication(match config.identity_field.trim() {
+                        "client_id" => IdentityField::ClientId,
+                        "principal" => IdentityField::Principal,
+                        other => match other.strip_prefix("properties.") {
+                            Some(path) if !path.is_empty() && !path.split('.').any(str::is_empty) => {
+                                IdentityField::Property(path.to_string())
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "identityField must be client_id, principal, or properties.<path>, got {other:?}"
+                                ))
+                            }
+                        },
+                    })
+                }
+                "trusted-header" => {
+                    let scope_header = config.scope_header.trim().to_string();
+                    if scope_header.is_empty() {
+                        return Err(anyhow!(
+                            "scopeHeader must not be blank when identitySource is trusted-header"
+                        ));
+                    }
+                    IdentitySource::TrustedHeader(scope_header)
+                }
+                other => {
+                    return Err(anyhow!(
+                        "identitySource must be authentication or trusted-header, got {other:?}"
+                    ))
+                }
+            }
+        };
+
+        let max_scopes = usize::try_from(config.max_scopes)
+            .ok()
+            .filter(|max| (1..=1_000_000).contains(max))
+            .ok_or_else(|| anyhow!("maxScopes must be between 1 and 1000000"))?;
+
+        let disclosure = match config.scope_disclosure.as_str() {
+            "digest" => Disclosure::Digest(config.scope_digest_key.as_bytes().to_vec()),
+            "none" => Disclosure::None,
+            "raw" => Disclosure::Raw,
+            other => {
+                return Err(anyhow!(
+                    "scopeDisclosure must be digest, none, or raw, got {other:?}"
+                ))
+            }
+        };
 
         let spend_amount_field = config.spend_amount_field.trim().to_string();
         if contribution == Contribution::SpendAmount && spend_amount_field.is_empty() {
@@ -440,8 +552,8 @@ impl Gate {
 
         Ok(Self {
             budget_scope,
-            needs_scope_header,
-            scope_header,
+            identity_source,
+            disclosure,
             aggregate_budget,
             contribution,
             unit,
@@ -451,21 +563,82 @@ impl Gate {
             mode,
             on_deny,
             result_header,
-            ledger: Ledger::new(),
+            ledger: Ledger::with_max_scopes(max_scopes),
         })
     }
 
-    /// The concrete ledger key for this call: the aggregation dimension plus an
-    /// identity value (or a fixed value for "fabric", which has none). Returns
-    /// whether the identity header was required-but-missing/blank, so callers
-    /// can apply block/monitor semantics to that case.
-    fn scope_key(&self, header_value: Option<&str>) -> (String, bool) {
-        if !self.needs_scope_header {
-            return (format!("{}:*", self.budget_scope), false);
+    /// Resolves this call's identity into a ledger key. `headers` is the full
+    /// request header list, so a trusted header sent more than once (in any
+    /// letter case) is caught as ambiguous rather than silently picking one.
+    fn identity(
+        &self,
+        auth: Option<&AuthenticationData>,
+        headers: &[(String, String)],
+    ) -> Identity {
+        let raw = match &self.identity_source {
+            IdentitySource::Shared => return Identity::Scope(format!("{}:*", self.budget_scope)),
+            IdentitySource::Authentication(field) => {
+                let Some(data) = auth else {
+                    return Identity::Missing;
+                };
+                let value = match field {
+                    IdentityField::ClientId => data.client_id.clone(),
+                    IdentityField::Principal => data.principal.clone(),
+                    IdentityField::Property(path) => match property_value(&data.properties, path) {
+                        None | Some(ScriptValue::Null) => None,
+                        Some(ScriptValue::String(value)) => Some(value.clone()),
+                        // A number, object, or array is not an identity.
+                        Some(_) => return Identity::Invalid,
+                    },
+                };
+                match value {
+                    Some(value) => value,
+                    None => return Identity::Missing,
+                }
+            }
+            IdentitySource::TrustedHeader(name) => {
+                let mut values = headers
+                    .iter()
+                    .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value);
+                match (values.next(), values.next()) {
+                    (None, _) => return Identity::Missing,
+                    (Some(value), None) => value.clone(),
+                    (Some(_), Some(_)) => return Identity::Invalid,
+                }
+            }
+        };
+        match canonical_identity(&raw) {
+            Identity::Scope(canonical) => {
+                Identity::Scope(format!("{}:{canonical}", self.budget_scope))
+            }
+            other => other,
         }
-        match header_value.map(str::trim) {
-            Some(value) if !value.is_empty() => (format!("{}:{value}", self.budget_scope), false),
-            _ => (format!("{}:(missing)", self.budget_scope), true),
+    }
+
+    /// How a scope key appears in client-visible headers and messages.
+    fn display_scope(&self, key: &str) -> String {
+        // The shared fabric key and the monitor-mode "(missing)"/"(invalid)"
+        // buckets carry no caller identity, so they are shown as-is. A space
+        // never occurs in a canonical identity, so it marks a bucket key.
+        if self.identity_source == IdentitySource::Shared || key.contains(' ') {
+            return key.to_string();
+        }
+        match &self.disclosure {
+            Disclosure::Raw => key.to_string(),
+            Disclosure::None => self.budget_scope.clone(),
+            Disclosure::Digest(secret) => {
+                let (label, digest) = if secret.is_empty() {
+                    ("sha256", Sha256::digest(key.as_bytes()).to_vec())
+                } else {
+                    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+                        .expect("HMAC-SHA256 accepts a key of any length");
+                    mac.update(key.as_bytes());
+                    ("hmac", mac.finalize().into_bytes().to_vec())
+                };
+                let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+                format!("{}:{label}-{hex}", self.budget_scope)
+            }
         }
     }
 }
@@ -474,6 +647,19 @@ impl Gate {
 /// `body.params.amount`. Only descends through JSON objects; any other shape
 /// along the path (array, scalar, missing member) is treated as not found.
 fn dot_path_value<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = root;
+    for segment in path.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Walks a dot path through the authentication properties an upstream
+/// authentication policy attached. Same rules as `dot_path_value`.
+fn property_value<'a>(root: &'a ScriptValue, path: &str) -> Option<&'a ScriptValue> {
     let mut current = root;
     for segment in path.split('.') {
         if segment.is_empty() {
@@ -583,32 +769,50 @@ fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
 /// another session's call content — so both the log line and the resultHeader
 /// stamp are always safe to forward downstream without a further redaction pass.
 enum DenyReason {
-    MissingScopeHeader,
+    MissingIdentity,
+    InvalidIdentity,
+    ScopeCapacity,
     Unpriceable,
     OutOfRange,
     BudgetExceeded(Denial),
 }
 
 impl DenyReason {
+    /// The `reason=` label for the non-budget refusals.
+    fn label(&self) -> &'static str {
+        match self {
+            DenyReason::MissingIdentity => "missing-identity",
+            DenyReason::InvalidIdentity => "invalid-identity",
+            DenyReason::ScopeCapacity => "scope-capacity",
+            DenyReason::Unpriceable => "unpriceable",
+            DenyReason::OutOfRange => "out-of-range",
+            DenyReason::BudgetExceeded(_) => "budget-exceeded",
+        }
+    }
+
+    /// `scope` is the DISPLAY form (see `Gate::display_scope`), never the raw
+    /// ledger key unless `scopeDisclosure=raw`.
     fn stamp(&self, scope: &str, unit: &str) -> String {
         match self {
-            DenyReason::MissingScopeHeader => {
-                format!("denied;scope={scope};reason=missing-scope-header")
-            }
-            DenyReason::Unpriceable => format!("denied;scope={scope};reason=unpriceable"),
-            DenyReason::OutOfRange => format!("denied;scope={scope};reason=out-of-range"),
             DenyReason::BudgetExceeded(denial) => format!(
                 "denied;scope={scope};would-be-total={};budget={};unit={unit}",
                 denial.would_be_total, denial.budget
             ),
+            other => format!("denied;scope={scope};reason={}", other.label()),
         }
     }
 
     fn message(&self, scope: &str, unit: &str) -> String {
         match self {
-            DenyReason::MissingScopeHeader => {
-                format!("aggregate risk gate: missing the required scope-identity header for scope \"{scope}\"")
-            }
+            DenyReason::MissingIdentity => format!(
+                "aggregate risk gate: no verified identity for budget scope \"{scope}\""
+            ),
+            DenyReason::InvalidIdentity => format!(
+                "aggregate risk gate: malformed, oversized, or ambiguous identity for budget scope \"{scope}\""
+            ),
+            DenyReason::ScopeCapacity => format!(
+                "aggregate risk gate: no capacity to track a new scope \"{scope}\""
+            ),
             DenyReason::Unpriceable => {
                 format!("aggregate risk gate: call could not be priced for scope \"{scope}\"")
             }
@@ -621,6 +825,18 @@ impl DenyReason {
             ),
         }
     }
+}
+
+/// Builds the block-mode refusal for `reason`.
+fn refuse(gate: &Gate, reason: DenyReason, scope: &str, echo_bytes: Option<&[u8]>) -> Flow<Ticket> {
+    let stamp = reason.stamp(scope, &gate.unit);
+    Flow::Break(deny_response(
+        gate.on_deny,
+        echo_bytes,
+        &gate.result_header,
+        &stamp,
+        &reason.message(scope, &gate.unit),
+    ))
 }
 
 /// Carries the outcome of the request-phase reservation forward to the
@@ -656,43 +872,50 @@ fn admit(
     echo_bytes: Option<&[u8]>,
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
+    let display = gate.display_scope(scope);
     let reservation = match gate.mode {
         Mode::Block => match gate
             .ledger
             .reserve(scope, contribution, gate.aggregate_budget)
         {
             Ok(reservation) => reservation,
-            Err(denial) => {
-                // This IS the aggregate-risk signal this policy exists to
-                // catch: an individually valid call that composes past the
-                // budget. Mirrors the sibling decoy/binding policies'
-                // PolicyViolations usage so a downstream SIEM/Kill Switch can
-                // key off one signal across the whole gateway.
+            Err(refusal) => {
+                // An over-budget denial IS the aggregate-risk signal this
+                // policy exists to catch: an individually valid call that
+                // composes past the budget. A full scope table is also worth
+                // an operator's attention. Mirrors the sibling decoy/binding
+                // policies' PolicyViolations usage so a downstream SIEM/Kill
+                // Switch can key off one signal across the whole gateway.
                 violations.generate_policy_violation();
-                let reason = DenyReason::BudgetExceeded(denial);
-                let stamp = reason.stamp(scope, &gate.unit);
-                let response = deny_response(
-                    gate.on_deny,
-                    echo_bytes,
-                    &gate.result_header,
-                    &stamp,
-                    &reason.message(scope, &gate.unit),
-                );
-                return Flow::Break(response);
+                let reason = match refusal {
+                    Refusal::OverBudget(denial) => DenyReason::BudgetExceeded(denial),
+                    Refusal::AtCapacity => DenyReason::ScopeCapacity,
+                };
+                return refuse(gate, reason, &display, echo_bytes);
             }
         },
         Mode::Monitor => {
-            let (reservation, breached) =
-                gate.ledger
-                    .force_reserve_checked(scope, contribution, gate.aggregate_budget);
-            if breached {
-                // The call that would have been refused in block mode is
-                // still forwarded (monitor never denies), but the composition
-                // breach is real and must be visible as a policy violation,
-                // not just a log line.
-                violations.generate_policy_violation();
+            match gate
+                .ledger
+                .force_reserve_checked(scope, contribution, gate.aggregate_budget)
+            {
+                Some((reservation, breached)) => {
+                    if breached {
+                        // The call that would have been refused in block mode
+                        // is still forwarded (monitor never denies), but the
+                        // composition breach is real and must be visible as a
+                        // policy violation, not just a log line.
+                        violations.generate_policy_violation();
+                    }
+                    reservation
+                }
+                None => {
+                    violations.generate_policy_violation();
+                    return Flow::Continue(Ticket::None(format!(
+                        "monitor;scope={display};reason=scope-capacity"
+                    )));
+                }
             }
-            reservation
         }
     };
     let total_after = gate.ledger.snapshot(scope).total();
@@ -702,93 +925,88 @@ fn admit(
         "monitor"
     };
     let stamp = format!(
-        "{verb};scope={scope};contribution={contribution};total={total_after}/{};unit={}",
+        "{verb};scope={display};contribution={contribution};total={total_after}/{};unit={}",
         gate.aggregate_budget, gate.unit
     );
     Flow::Continue(Ticket::Reserved(stamp, reservation))
 }
 
 fn decide(
-    handler: &(impl HeadersHandler + ?Sized),
+    identity: Identity,
     gate: &Gate,
     raw_body: RawBody,
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
-    let header_value = if gate.needs_scope_header {
-        handler.header(&gate.scope_header)
-    } else {
-        None
-    };
-    let (scope, missing_header) = gate.scope_key(header_value.as_deref());
     // Captured before `raw_body` is moved into `compute_contribution` below —
     // `as_bytes` only borrows, so this stays valid for every deny path that
     // still needs the original bytes to attempt an in-band id-echo.
     let echo_bytes = raw_body.as_bytes();
 
-    if missing_header && gate.mode == Mode::Block {
-        let reason = DenyReason::MissingScopeHeader;
-        let stamp = reason.stamp(&scope, &gate.unit);
-        let response = deny_response(
-            gate.on_deny,
-            echo_bytes,
-            &gate.result_header,
-            &stamp,
-            &reason.message(&scope, &gate.unit),
-        );
-        return Flow::Break(response);
-    }
+    let scope = match identity {
+        Identity::Scope(key) => key,
+        unidentified => {
+            let (reason, bucket) = if unidentified == Identity::Missing {
+                (DenyReason::MissingIdentity, "missing")
+            } else {
+                (DenyReason::InvalidIdentity, "invalid")
+            };
+            if gate.mode == Mode::Block {
+                return refuse(gate, reason, &gate.budget_scope, echo_bytes);
+            }
+            // Monitor mode still prices the call, under one fixed bucket per
+            // failure kind. The space makes the key impossible for any
+            // canonical identity to collide with.
+            format!("{} ({bucket})", gate.budget_scope)
+        }
+    };
 
-    let (reason, label) = match compute_contribution(gate, raw_body) {
+    let reason = match compute_contribution(gate, raw_body) {
         ContributionOutcome::Known(amount) => {
             return admit(gate, &scope, amount, echo_bytes, violations)
         }
-        ContributionOutcome::Unpriceable => (DenyReason::Unpriceable, "unpriceable"),
-        ContributionOutcome::OutOfRange => (DenyReason::OutOfRange, "out-of-range"),
+        ContributionOutcome::Unpriceable => DenyReason::Unpriceable,
+        ContributionOutcome::OutOfRange => DenyReason::OutOfRange,
     };
+    let display = gate.display_scope(&scope);
     if gate.mode == Mode::Block {
-        let stamp = reason.stamp(&scope, &gate.unit);
-        let response = deny_response(
-            gate.on_deny,
-            echo_bytes,
-            &gate.result_header,
-            &stamp,
-            &reason.message(&scope, &gate.unit),
-        );
-        Flow::Break(response)
+        refuse(gate, reason, &display, echo_bytes)
     } else {
         // Monitor mode: the call still happened, so it is recorded (at a zero
         // contribution — its real exposure is unknown or unrepresentable, not
         // zero, but there is nothing exact to charge) so the scope shows up in
         // the ledger and an operator can see the gap; the gap itself is made
         // visible on the header rather than silently inflating or deflating the
-        // running total.
+        // running total. At the scope cap nothing is recorded.
         gate.ledger.record(&scope, 0);
-        let stamp = format!("monitor;scope={scope};reason={label}");
+        let stamp = format!("monitor;scope={display};reason={}", reason.label());
         Flow::Continue(Ticket::None(stamp))
     }
 }
 
 async fn request_filter(
     request_state: RequestState,
+    auth: Authentication,
     gate: &Gate,
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
     let headers_state = request_state.into_headers_state().await;
+    // Resolved at the header phase, before any body is buffered.
+    let identity = gate.identity(
+        auth.authentication().as_ref(),
+        &headers_state.handler().headers(),
+    );
     if !headers_state.contains_body() {
-        let handler = headers_state.handler();
-        return decide(handler, gate, RawBody::NoBody, violations);
+        return decide(identity, gate, RawBody::NoBody, violations);
     }
     // Header-phase gate, BEFORE ever calling `into_headers_body_state()`:
     // an oversized, non-JSON, or compressed body is never buffered at all —
     // `decide` still runs (as `Uninspectable`) so this call gets the same
     // fail-closed handling as a body this policy read and found unpriceable.
     if !request_is_inspectable(headers_state.handler()) {
-        let handler = headers_state.handler();
-        return decide(handler, gate, RawBody::Uninspectable, violations);
+        return decide(identity, gate, RawBody::Uninspectable, violations);
     }
     let state = headers_state.into_headers_body_state().await;
-    let handler = state.handler();
-    let body = handler.body();
+    let body = state.handler().body();
     // Defense in depth: a Content-Length that undersold the real body size
     // must not smuggle an oversized body past the header-phase gate above.
     let raw_body = if body.len() <= MAX_INSPECT_BYTES {
@@ -796,7 +1014,7 @@ async fn request_filter(
     } else {
         RawBody::Uninspectable
     };
-    decide(handler, gate, raw_body, violations)
+    decide(identity, gate, raw_body, violations)
 }
 
 async fn response_filter(
@@ -867,8 +1085,9 @@ async fn configure(
         }
     );
 
-    let filter = on_request(|rs| request_filter(rs, &gate, &violations))
-        .on_response(|res, data| response_filter(res, data, &gate));
+    let filter =
+        on_request(|rs, auth: Authentication| request_filter(rs, auth, &gate, &violations))
+            .on_response(|res, data| response_filter(res, data, &gate));
     launcher.launch(filter).await?;
     Ok(())
 }
@@ -885,7 +1104,15 @@ mod test {
     fn config(overrides: Value) -> String {
         let mut base = json!({
             "budgetScope": "agent",
+            // The arithmetic tests below drive identity through a header and
+            // read raw scopes off the result header. The identity tests set
+            // the production defaults (authentication + digest) explicitly.
+            "identitySource": "trusted-header",
+            "identityField": "client_id",
             "scopeHeader": "x-agent-id",
+            "maxScopes": 10000,
+            "scopeDisclosure": "raw",
+            "scopeDigestKey": "",
             "aggregateBudget": 3000,
             "window": "rolling-24h",
             "contribution": "fixed-weight",
@@ -1151,6 +1378,10 @@ mod test {
         );
         let response = tester.request(request);
         assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent;reason=missing-identity")
+        );
     }
 
     #[test]
@@ -1167,7 +1398,191 @@ mod test {
         assert!(response
             .header("x-aggregate-risk-gate")
             .unwrap()
-            .contains("(missing)"));
+            .starts_with("monitor;scope=agent (missing);"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity (issue #14) end to end: verified authentication by default, a
+    // trusted header only when opted in, bounded cardinality, no raw IDs.
+    // -----------------------------------------------------------------------
+
+    /// The production identity defaults: verified `client_id`, digest display.
+    fn auth_config(overrides: Value) -> String {
+        let mut merged = json!({
+            "identitySource": "authentication",
+            "identityField": "client_id",
+            "scopeDisclosure": "digest",
+        });
+        for (key, value) in overrides.as_object().unwrap() {
+            merged[key] = value.clone();
+        }
+        config(merged)
+    }
+
+    fn authenticated(request: UnitHttpRequest, client_id: &str) -> UnitHttpRequest {
+        request.with_authentication_data(AuthenticationData {
+            client_id: Some(client_id.to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn rpc_call(id: i64) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {}})
+    }
+
+    #[test]
+    fn a_spoofed_scope_header_is_ignored_under_authentication_identity() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        // One verified client rotates the header value on every call. The
+        // header plays no part, so all four calls share one budget.
+        for i in 0..3 {
+            let spoof = format!("fresh-agent-{i}");
+            let request = authenticated(jsonrpc_request(rpc_call(i), Some(&spoof)), "app-1");
+            assert_eq!(response_error_code(&tester.request(request)), None);
+        }
+        let request = authenticated(jsonrpc_request(rpc_call(4), Some("fresh-agent-4")), "app-1");
+        assert_eq!(
+            response_error_code(&tester.request(request)),
+            Some(MCP_BLOCKED_CODE),
+            "rotating the header must not mint a fresh budget"
+        );
+    }
+
+    #[test]
+    fn missing_authentication_fails_closed_in_block_mode() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        // A scope header is present but is not an identity in this mode.
+        let response = tester.request(jsonrpc_request(rpc_call(1), Some("broker-7")));
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent;reason=missing-identity")
+        );
+    }
+
+    #[test]
+    fn a_malformed_authenticated_identity_is_denied_as_invalid() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let oversized = "a".repeat(MAX_IDENTITY_BYTES + 1);
+        for (i, bad) in [oversized.as_str(), "app;scope=other", "app 1"]
+            .iter()
+            .enumerate()
+        {
+            let request = authenticated(jsonrpc_request(rpc_call(i as i64), None), bad);
+            let response = tester.request(request);
+            assert_eq!(
+                response_error_code(&response),
+                Some(MCP_BLOCKED_CODE),
+                "{:?}",
+                bad
+            );
+            assert_eq!(
+                response.header("x-aggregate-risk-gate"),
+                Some("denied;scope=agent;reason=invalid-identity")
+            );
+        }
+    }
+
+    #[test]
+    fn case_and_whitespace_variants_of_one_identity_share_a_budget() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for (i, variant) in ["App-1", "app-1", " APP-1 "].iter().enumerate() {
+            let request = authenticated(jsonrpc_request(rpc_call(i as i64), None), variant);
+            assert_eq!(response_error_code(&tester.request(request)), None);
+        }
+        let request = authenticated(jsonrpc_request(rpc_call(4), None), "aPp-1");
+        assert_eq!(
+            response_error_code(&tester.request(request)),
+            Some(MCP_BLOCKED_CODE)
+        );
+    }
+
+    #[test]
+    fn a_duplicated_trusted_header_is_denied_as_invalid() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let request =
+            jsonrpc_request(rpc_call(1), Some("broker-7")).with_header("X-Agent-Id", "broker-9");
+        let response = tester.request(request);
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent;reason=invalid-identity")
+        );
+    }
+
+    #[test]
+    fn the_default_result_header_never_echoes_the_raw_identity() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for i in 0..4 {
+            let request = authenticated(jsonrpc_request(rpc_call(i), None), "secret-client-77");
+            let response = tester.request(request);
+            let stamp = response
+                .header("x-aggregate-risk-gate")
+                .unwrap()
+                .to_string();
+            assert!(stamp.contains("scope=agent:sha256-"), "{}", stamp);
+            assert!(!stamp.contains("secret-client-77"), "{}", stamp);
+            assert!(!String::from_utf8_lossy(response.body()).contains("secret-client-77"));
+        }
+    }
+
+    #[test]
+    fn high_cardinality_identities_hit_the_scope_cap_in_block_mode() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({"maxScopes": 2})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for (i, client) in ["app-1", "app-2"].iter().enumerate() {
+            let request = authenticated(jsonrpc_request(rpc_call(i as i64), None), client);
+            assert_eq!(response_error_code(&tester.request(request)), None);
+        }
+        // Both tracked scopes hold committed exposure, so neither is idle and
+        // neither may be evicted to make room: the third identity is refused.
+        let request = authenticated(jsonrpc_request(rpc_call(3), None), "app-3");
+        let response = tester.request(request);
+        assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
+        assert!(response
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .ends_with(";reason=scope-capacity"));
+        // The tracked scopes keep their budgets.
+        let request = authenticated(jsonrpc_request(rpc_call(4), None), "app-1");
+        assert_eq!(response_error_code(&tester.request(request)), None);
+    }
+
+    #[test]
+    fn the_scope_cap_never_denies_in_monitor_mode() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(auth_config(json!({"maxScopes": 1, "mode": "monitor"})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let request = authenticated(jsonrpc_request(rpc_call(1), None), "app-1");
+        assert_eq!(response_error_code(&tester.request(request)), None);
+        let request = authenticated(jsonrpc_request(rpc_call(2), None), "app-2");
+        let response = tester.request(request);
+        assert_eq!(response_error_code(&response), None);
+        assert!(response
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .ends_with(";reason=scope-capacity"));
     }
 
     #[test]
@@ -1802,10 +2217,15 @@ mod test {
             contribution: "fixed-weight".to_string(),
             estimated_tokens: 500,
             fixed_weight: 800,
+            identity_field: "client_id".to_string(),
+            identity_source: "authentication".to_string(),
             ledger_endpoint: String::new(),
+            max_scopes: 10000,
             mode: "block".to_string(),
             on_deny: "rpc-error".to_string(),
             result_header: "x-aggregate-risk-gate".to_string(),
+            scope_digest_key: String::new(),
+            scope_disclosure: "digest".to_string(),
             scope_header: "x-agent-id".to_string(),
             spend_amount_field: "params.amount".to_string(),
             spend_currency: "USD".to_string(),
@@ -1945,18 +2365,218 @@ mod test {
     }
 
     #[test]
-    fn blank_scope_header_is_rejected_when_budget_scope_needs_one() {
+    fn blank_scope_header_is_rejected_for_a_trusted_header_identity() {
         let mut cfg = valid_config_struct();
+        cfg.identity_source = "trusted-header".to_string();
         cfg.scope_header = "   ".to_string();
         assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn blank_scope_header_is_accepted_for_an_authentication_identity() {
+        let mut cfg = valid_config_struct();
+        cfg.scope_header = String::new();
+        assert!(Gate::from_config(&cfg).is_ok());
     }
 
     #[test]
     fn blank_scope_header_is_accepted_when_budget_scope_is_fabric() {
         let mut cfg = valid_config_struct();
         cfg.budget_scope = "fabric".to_string();
+        cfg.identity_source = "trusted-header".to_string();
         cfg.scope_header = String::new();
         assert!(Gate::from_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn invalid_identity_source_is_rejected() {
+        let mut cfg = valid_config_struct();
+        cfg.identity_source = "header".to_string();
+        assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn identity_field_accepts_only_known_fields_and_property_paths() {
+        for good in [
+            "client_id",
+            "principal",
+            "properties.sub",
+            "properties.claims.agent",
+        ] {
+            let mut cfg = valid_config_struct();
+            cfg.identity_field = good.to_string();
+            assert!(Gate::from_config(&cfg).is_ok(), "identityField {:?}", good);
+        }
+        for bad in [
+            "",
+            "client_name",
+            "properties.",
+            "properties..sub",
+            "properties.a.",
+            "sub",
+        ] {
+            let mut cfg = valid_config_struct();
+            cfg.identity_field = bad.to_string();
+            assert!(Gate::from_config(&cfg).is_err(), "identityField {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn max_scopes_must_be_between_one_and_a_million() {
+        for bad in [0, -1, 1_000_001] {
+            let mut cfg = valid_config_struct();
+            cfg.max_scopes = bad;
+            assert!(Gate::from_config(&cfg).is_err(), "maxScopes {}", bad);
+        }
+        for good in [1, 1_000_000] {
+            let mut cfg = valid_config_struct();
+            cfg.max_scopes = good;
+            assert!(Gate::from_config(&cfg).is_ok(), "maxScopes {}", good);
+        }
+    }
+
+    #[test]
+    fn invalid_scope_disclosure_is_rejected() {
+        let mut cfg = valid_config_struct();
+        cfg.scope_disclosure = "hash".to_string();
+        assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity canonicalization and disclosure — direct, no harness.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn canonical_identity_trims_and_lowercases() {
+        assert_eq!(
+            canonical_identity("  Broker-7\t"),
+            Identity::Scope("broker-7".to_string())
+        );
+        assert_eq!(
+            canonical_identity("BROKER-7"),
+            canonical_identity("broker-7")
+        );
+    }
+
+    #[test]
+    fn canonical_identity_treats_blank_as_missing() {
+        assert_eq!(canonical_identity(""), Identity::Missing);
+        assert_eq!(canonical_identity(" \t "), Identity::Missing);
+    }
+
+    #[test]
+    fn canonical_identity_rejects_oversized_values() {
+        let max = "a".repeat(MAX_IDENTITY_BYTES);
+        assert_eq!(canonical_identity(&max), Identity::Scope(max.clone()));
+        let over = "a".repeat(MAX_IDENTITY_BYTES + 1);
+        assert_eq!(canonical_identity(&over), Identity::Invalid);
+    }
+
+    #[test]
+    fn canonical_identity_rejects_stamp_delimiters_and_non_visible_ascii() {
+        for bad in [
+            "a,b", "a;b", "a=b", "a\"b", "a\\b", "a b", "a\u{7f}b", "a\u{0}b", "brökér", "a\nb",
+        ] {
+            assert_eq!(canonical_identity(bad), Identity::Invalid, "{:?}", bad);
+        }
+    }
+
+    fn gate_with(overrides: Value) -> Gate {
+        let cfg: Config = serde_json::from_str(&config(overrides)).unwrap();
+        Gate::from_config(&cfg).unwrap()
+    }
+
+    #[test]
+    fn digest_disclosure_hides_the_raw_identity() {
+        let gate = gate_with(json!({"scopeDisclosure": "digest"}));
+        let shown = gate.display_scope("agent:broker-7");
+        // The README's example stamp; SHA-256("agent:broker-7"), first 8 bytes.
+        assert_eq!(shown, "agent:sha256-b534199b5ab2d7a9");
+        assert!(!shown.contains("broker-7"), "{}", shown);
+        assert_eq!(shown.len(), "agent:sha256-".len() + 16);
+        // Stable: the same identity always maps to the same digest.
+        assert_eq!(shown, gate.display_scope("agent:broker-7"));
+        assert_ne!(shown, gate.display_scope("agent:broker-9"));
+    }
+
+    #[test]
+    fn keyed_digest_disclosure_uses_hmac_and_depends_on_the_key() {
+        let a = gate_with(json!({"scopeDisclosure": "digest", "scopeDigestKey": "key-a"}));
+        let b = gate_with(json!({"scopeDisclosure": "digest", "scopeDigestKey": "key-b"}));
+        let shown_a = a.display_scope("agent:broker-7");
+        assert!(shown_a.starts_with("agent:hmac-"), "{}", shown_a);
+        assert_ne!(shown_a, b.display_scope("agent:broker-7"));
+    }
+
+    #[test]
+    fn none_disclosure_shows_only_the_budget_scope() {
+        let gate = gate_with(json!({"scopeDisclosure": "none"}));
+        assert_eq!(gate.display_scope("agent:broker-7"), "agent");
+    }
+
+    #[test]
+    fn bucket_keys_are_displayed_as_is() {
+        let gate = gate_with(json!({"scopeDisclosure": "digest"}));
+        assert_eq!(gate.display_scope("agent (missing)"), "agent (missing)");
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_trusted_header_sent_twice_in_any_case_is_invalid() {
+        let gate = gate_with(json!({}));
+        let dup = headers(&[("x-agent-id", "broker-7"), ("X-Agent-Id", "broker-9")]);
+        assert_eq!(gate.identity(None, &dup), Identity::Invalid);
+        let once = headers(&[("X-AGENT-ID", "Broker-7")]);
+        assert_eq!(
+            gate.identity(None, &once),
+            Identity::Scope("agent:broker-7".to_string())
+        );
+        assert_eq!(gate.identity(None, &[]), Identity::Missing);
+    }
+
+    #[test]
+    fn authentication_identity_reads_the_configured_field() {
+        let auth = AuthenticationData {
+            client_id: Some("App-1".to_string()),
+            principal: Some("Alice".to_string()),
+            properties: ScriptValue::Object(
+                vec![
+                    (
+                        "sub".to_string(),
+                        ScriptValue::String("Agent-42".to_string()),
+                    ),
+                    ("level".to_string(), ScriptValue::Number(3.0)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        };
+        let base = json!({"identitySource": "authentication"});
+        let by = |field: &str| {
+            let mut overrides = base.clone();
+            overrides["identityField"] = json!(field);
+            gate_with(overrides).identity(Some(&auth), &[])
+        };
+        assert_eq!(by("client_id"), Identity::Scope("agent:app-1".to_string()));
+        assert_eq!(by("principal"), Identity::Scope("agent:alice".to_string()));
+        assert_eq!(
+            by("properties.sub"),
+            Identity::Scope("agent:agent-42".to_string())
+        );
+        assert_eq!(by("properties.level"), Identity::Invalid);
+        assert_eq!(by("properties.absent"), Identity::Missing);
+        assert_eq!(
+            gate_with(base).identity(None, &[]),
+            Identity::Missing,
+            "no authentication data at all"
+        );
     }
 
     #[test]
