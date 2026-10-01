@@ -56,6 +56,7 @@ fn policy_config(scope_header: &str) -> PolicyConfig {
             "identityField": "client_id",
             "scopeHeader": scope_header,
             "maxScopes": 10000,
+            "reservationTimeoutMs": 60000,
             "scopeDisclosure": "raw",
             "scopeDigestKey": "",
             "aggregateBudget": 3000,

@@ -21,7 +21,7 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 46 pass | 116 pass |
+| Lib tests | 46 pass | 131 pass |
 | Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26) | In progress — P4A review #14–#18, one PR each |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
@@ -85,7 +85,7 @@ excludes all Flex identity material). No further visibility action is required t
   *"Reserve-then-authorize aggregate-exposure control: refuses the individually-valid call that composes
   past a budget no per-call gate ever sees."*
 - **Config surface:** budgetScope(agent|fabric|tenant) / identitySource(authentication|trusted-header) /
-  identityField / scopeHeader / maxScopes / scopeDisclosure(digest|none|raw) / scopeDigestKey (sensitive) /
+  identityField / scopeHeader / maxScopes / reservationTimeoutMs / scopeDisclosure(digest|none|raw) / scopeDigestKey (sensitive) /
   aggregateBudget / window
   (rolling-24h|fixed-period, validated) / contribution(estimated-token-weight|spend-amount|fixed-weight) /
   fixedWeight / spendAmountField / spendCurrency / estimatedTokens / mode(block|monitor) /

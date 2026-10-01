@@ -32,44 +32,140 @@
 // above any admissible budget, so a sum that would overflow always compares as
 // over budget instead of wrapping around.
 
+// Time: every operation takes `now`, milliseconds on the gateway's own clock
+// (`lib.rs` reads the PDK `Clock`). Passing it in keeps this module free of any
+// host dependency and makes expiry exactly reproducible in tests.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// One scope's running exposure: `committed` is exposure from calls that already
-/// happened (successfully, or force-recorded in monitor mode); `reserved` is
-/// exposure that has been set aside for an in-flight call whose outcome is not
-/// yet known. Budget checks compare against `committed + reserved`, so a reserved
-/// amount blocks a concurrent composing call exactly as if it had already landed
-/// — that is the whole mechanism.
-#[derive(Default, Clone, Copy, Debug, PartialEq)]
+/// One in-flight reservation's ledger record.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Held {
+    contribution: u64,
+    expires_at: u64,
+}
+
+/// One scope's running exposure. `committed` is exposure from calls that already
+/// happened (successfully, or force-recorded in monitor mode). `active` holds
+/// the reservations set aside for in-flight calls whose outcome is not yet
+/// known, and `reserved` is their sum. Budget checks compare against
+/// `committed + reserved`, so a reserved amount blocks a concurrent composing
+/// call exactly as if it had already landed — that is the whole mechanism.
+///
+/// `reclaimed` keeps a tombstone for each reservation that expired before it
+/// was settled, until `expires_at + ttl`, so a late settlement is recognised
+/// as late rather than as a duplicate (see `LedgerStore::commit`).
+#[derive(Default, Clone, Debug, PartialEq)]
 struct ScopeState {
     committed: u64,
     reserved: u64,
+    active: HashMap<u64, Held>,
+    reclaimed: HashMap<u64, Held>,
 }
 
 impl ScopeState {
-    /// An idle scope has nothing committed and nothing in flight, so it holds
-    /// no enforcement state: dropping it and re-creating it later at zero is
-    /// indistinguishable from keeping it. Only idle scopes are ever evicted.
+    /// An idle scope has nothing committed, nothing in flight and no pending
+    /// tombstone, so it holds no enforcement state: dropping it and re-creating
+    /// it later at zero is indistinguishable from keeping it. Only idle scopes
+    /// are ever evicted.
     fn is_idle(&self) -> bool {
-        self.committed == 0 && self.reserved == 0
+        self.committed == 0 && self.active.is_empty() && self.reclaimed.is_empty()
     }
-}
 
-impl ScopeState {
     fn total(&self) -> u64 {
         self.committed.saturating_add(self.reserved)
+    }
+
+    /// Moves every reservation whose deadline has passed out of `active` (its
+    /// contribution leaves `reserved`; `committed` is untouched) and drops
+    /// tombstones older than one further `ttl`. Returns how many reservations
+    /// expired and how many tombstones were dropped unsettled.
+    fn reclaim(&mut self, now: u64, ttl: u64) -> (u64, u64) {
+        let expired: Vec<u64> = self
+            .active
+            .iter()
+            .filter(|(_, held)| now >= held.expires_at)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            if let Some(held) = self.active.remove(id) {
+                self.reserved = self.reserved.saturating_sub(held.contribution);
+                self.reclaimed.insert(*id, held);
+            }
+        }
+        let before = self.reclaimed.len();
+        self.reclaimed
+            .retain(|_, held| now < held.expires_at.saturating_add(ttl));
+        (expired.len() as u64, (before - self.reclaimed.len()) as u64)
     }
 }
 
 /// A held reservation against a scope, returned by a successful `reserve` or
-/// `force_reserve`. Must be resolved with exactly one of `commit` or `release`
-/// — holding it longer than necessary keeps `reserved` inflated and
-/// makes the scope look more exposed than it is.
+/// `force_reserve`. Settle it with `commit` or `release`. Both are idempotent:
+/// only the first settlement of an `id` changes the ledger. If neither is
+/// called by `expires_at`, the next ledger operation on the scope reclaims it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reservation {
+    /// Unique for the life of the ledger that issued it: a counter that is
+    /// never reused. Stage A IDs never leave the worker process. A shared
+    /// Stage B store would need IDs unique across workers.
+    pub id: u64,
     pub scope: String,
     pub contribution: u64,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// How a `commit` or `release` call was applied.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Settlement {
+    /// The reservation was active: moved into `committed`.
+    Committed,
+    /// The reservation was active: removed without committing.
+    Released,
+    /// The reservation had expired and been reclaimed. A late commit still
+    /// charges its contribution to `committed`, because the call it covered
+    /// did happen and an under-count is the unsafe direction for a risk
+    /// budget. The charge is applied without a budget check, the same way
+    /// monitor mode records exposure it can no longer refuse.
+    LateCommitted,
+    /// The reservation had expired and been reclaimed; nothing to undo.
+    LateReleased,
+    /// Already settled, or unknown to this ledger (for example a settlement
+    /// that arrived more than `2 × ttl` after the reservation was made). A
+    /// no-op, so a duplicate or reordered settlement never double-counts.
+    NotActive,
+}
+
+impl Settlement {
+    pub fn label(self) -> &'static str {
+        match self {
+            Settlement::Committed => "committed",
+            Settlement::Released => "released",
+            Settlement::LateCommitted => "late-committed",
+            Settlement::LateReleased => "late-released",
+            Settlement::NotActive => "not-active",
+        }
+    }
+}
+
+/// Ledger-wide reservation counters for operator telemetry. Each counter only
+/// ever increases except `active`, which is the current number in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LedgerStats {
+    pub active: u64,
+    pub committed: u64,
+    pub released: u64,
+    /// Reservations reclaimed because they passed their deadline unsettled.
+    pub expired: u64,
+    pub late_committed: u64,
+    pub late_released: u64,
+    /// Expired reservations whose tombstone was dropped with no settlement
+    /// ever arriving: the request was cancelled or its response hook never ran.
+    pub abandoned: u64,
+    /// Settlements that matched nothing (duplicate, reordered, or too late).
+    pub not_active: u64,
 }
 
 /// A denied reservation attempt: the call was NOT reserved and NOT mutated into
@@ -127,12 +223,22 @@ impl Snapshot {
 /// distributed backend could later implement the same trait without touching the
 /// filter logic — an explicit seam for the roadmap work called out in the module
 /// doc comment, not a claim that such a backend exists today.
+///
+/// Every method first reclaims the scope's expired reservations, under the
+/// same lock as the operation itself.
 pub trait LedgerStore {
     /// Atomically checks `scope`'s committed-plus-reserved exposure against
-    /// `budget` and, only if `contribution` fits, reserves it. On denial, the
-    /// ledger is left completely unmutated for `scope`. A new scope that does
-    /// not fit under the ledger's scope cap is refused with `AtCapacity`.
-    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Refusal>;
+    /// `budget` and, only if `contribution` fits, reserves it until
+    /// `now + ttl`. On denial, no reservation is made for `scope`. A new scope
+    /// that does not fit under the ledger's scope cap is refused with
+    /// `AtCapacity`.
+    fn reserve(
+        &self,
+        scope: &str,
+        contribution: u64,
+        budget: u64,
+        now: u64,
+    ) -> Result<Reservation, Refusal>;
 
     /// Reserves `contribution` against `scope` unconditionally, ignoring
     /// `budget` — the monitor-mode primitive: composition is still tracked
@@ -150,7 +256,7 @@ pub trait LedgerStore {
     ///
     /// `None` only when `scope` is new and the ledger is at its scope cap.
     #[allow(dead_code)]
-    fn force_reserve(&self, scope: &str, contribution: u64) -> Option<Reservation>;
+    fn force_reserve(&self, scope: &str, contribution: u64, now: u64) -> Option<Reservation>;
 
     /// `force_reserve`, plus a breach signal: reserves `contribution`
     /// against `scope` unconditionally (never denies — monitor mode still
@@ -164,16 +270,19 @@ pub trait LedgerStore {
         scope: &str,
         contribution: u64,
         budget: u64,
+        now: u64,
     ) -> Option<(Reservation, bool)>;
 
-    /// Resolves a reservation as successful: moves its contribution from
-    /// `reserved` into `committed`.
-    fn commit(&self, reservation: Reservation);
+    /// Settles a reservation as successful. An active reservation moves its
+    /// contribution from `reserved` into `committed`. See `Settlement` for
+    /// the expired and already-settled cases.
+    fn commit(&self, reservation: &Reservation, now: u64) -> Settlement;
 
-    /// Resolves a reservation as not-consumed: removes its contribution from
-    /// `reserved` without ever adding it to `committed`. Used when the upstream
-    /// call failed, so a failed call does not count against the budget.
-    fn release(&self, reservation: Reservation);
+    /// Settles a reservation as not consumed: an active reservation's
+    /// contribution leaves `reserved` without ever reaching `committed`. Used
+    /// when the upstream call failed, so a failed call does not count against
+    /// the budget.
+    fn release(&self, reservation: &Reservation, now: u64) -> Settlement;
 
     /// Records `contribution` directly into `committed`, bypassing both the
     /// budget check and the reserve/commit two-step. Used for a call whose
@@ -181,11 +290,20 @@ pub trait LedgerStore {
     /// denied (e.g. monitor mode's unpriceable-at-request-time cases, or a
     /// direct audit correction). Returns `false`, recording nothing, only when
     /// `scope` is new and the ledger is at its scope cap.
-    fn record(&self, scope: &str, contribution: u64) -> bool;
+    fn record(&self, scope: &str, contribution: u64, now: u64) -> bool;
 
     /// A read-only view of one scope's current state, for diagnostics/tests.
-    /// Never creates an entry: an untracked scope reads as zero.
+    /// Never creates an entry or reclaims: an untracked scope reads as zero.
     fn snapshot(&self, scope: &str) -> Snapshot;
+
+    /// The ledger-wide reservation counters.
+    fn stats(&self) -> LedgerStats;
+}
+
+struct Inner {
+    scopes: HashMap<String, ScopeState>,
+    next_id: u64,
+    stats: LedgerStats,
 }
 
 /// The Stage A ledger: an in-process, mutex-serialized `HashMap` of scope states.
@@ -197,77 +315,188 @@ pub trait LedgerStore {
 /// the budget under a race.
 ///
 /// Cardinality is bounded by `max_scopes`. When a NEW scope arrives at the cap,
-/// one idle scope (see `ScopeState::is_idle`) is evicted to make room; if every
-/// tracked scope holds committed or reserved exposure, the new scope is refused
+/// expired reservations are reclaimed across the ledger and then one idle scope
+/// (see `ScopeState::is_idle`) is evicted to make room; if every tracked scope
+/// still holds committed or reserved exposure, the new scope is refused
 /// instead. Live enforcement state is never evicted, so the cap can never be
 /// used to reset another scope's running total.
 pub struct Ledger {
-    scopes: Mutex<HashMap<String, ScopeState>>,
+    inner: Mutex<Inner>,
     max_scopes: usize,
+    ttl: u64,
 }
+
+/// The default reservation lifetime used by tests of the budget arithmetic.
+#[cfg(test)]
+pub const TEST_TTL: u64 = 60_000;
 
 impl Ledger {
     /// An unbounded ledger, for tests of the budget arithmetic itself.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_max_scopes(usize::MAX)
+        Self::with_limits(usize::MAX, TEST_TTL)
     }
 
+    #[cfg(test)]
     pub fn with_max_scopes(max_scopes: usize) -> Self {
+        Self::with_limits(max_scopes, TEST_TTL)
+    }
+
+    /// `ttl` is the reservation lifetime in milliseconds.
+    pub fn with_limits(max_scopes: usize, ttl: u64) -> Self {
         Ledger {
-            scopes: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                scopes: HashMap::new(),
+                next_id: 1,
+                stats: LedgerStats::default(),
+            }),
             max_scopes,
+            ttl,
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ScopeState>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         // A poisoned mutex (a prior panic while the lock was held) still holds
         // valid, if possibly inconsistent, ledger data. Recovering it rather than
         // panicking again keeps this store fail-open at the Rust-panic level
         // while the filter above it stays fail-closed at the policy-decision
         // level (a denial is a normal, safe `Err`, never a panic).
-        self.scopes
+        self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Runs `f` on `scope`'s state, creating it if needed. Returns `None`,
-    /// without running `f`, if `scope` is new and there is no room for it.
-    /// The capacity check, any eviction, and `f` all happen under one lock.
-    fn with_state<R>(&self, scope: &str, f: impl FnOnce(&mut ScopeState) -> R) -> Option<R> {
+    /// Runs `f` on `scope`'s state, creating it if needed, after reclaiming
+    /// its expired reservations. Returns `None`, without running `f`, if
+    /// `scope` is new and there is no room for it. The capacity check, any
+    /// reclamation or eviction, and `f` all happen under one lock.
+    fn with_state<R>(
+        &self,
+        scope: &str,
+        now: u64,
+        f: impl FnOnce(&mut ScopeState, &mut u64, &mut LedgerStats) -> R,
+    ) -> Option<R> {
         let mut guard = self.lock();
-        if !guard.contains_key(scope) && guard.len() >= self.max_scopes {
-            let idle = guard
+        let inner = &mut *guard;
+        if !inner.scopes.contains_key(scope) && inner.scopes.len() >= self.max_scopes {
+            for state in inner.scopes.values_mut() {
+                count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
+            }
+            let idle = inner
+                .scopes
                 .iter()
                 .find(|(_, state)| state.is_idle())
                 .map(|(key, _)| key.clone());
             match idle {
                 Some(key) => {
-                    guard.remove(&key);
+                    inner.scopes.remove(&key);
                 }
                 None => return None,
             }
         }
-        Some(f(guard.entry(scope.to_string()).or_default()))
+        let state = inner.scopes.entry(scope.to_string()).or_default();
+        count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
+        Some(f(state, &mut inner.next_id, &mut inner.stats))
     }
 
-    /// Runs `f` on an EXISTING scope's state; a no-op if it is untracked.
-    fn with_existing(&self, scope: &str, f: impl FnOnce(&mut ScopeState)) {
-        if let Some(state) = self.lock().get_mut(scope) {
-            f(state);
+    /// Adds a new active reservation to `state`.
+    fn hold(
+        &self,
+        state: &mut ScopeState,
+        next_id: &mut u64,
+        stats: &mut LedgerStats,
+        scope: &str,
+        contribution: u64,
+        now: u64,
+    ) -> Reservation {
+        let id = *next_id;
+        *next_id += 1;
+        let expires_at = now.saturating_add(self.ttl);
+        state.reserved = state.reserved.saturating_add(contribution);
+        state.active.insert(
+            id,
+            Held {
+                contribution,
+                expires_at,
+            },
+        );
+        stats.active += 1;
+        Reservation {
+            id,
+            scope: scope.to_string(),
+            contribution,
+            created_at: now,
+            expires_at,
         }
+    }
+
+    /// Settles `reservation` on its EXISTING scope. An untracked scope
+    /// (never created, or evicted while idle) settles as `NotActive`.
+    fn settle(&self, reservation: &Reservation, now: u64, commit: bool) -> Settlement {
+        let mut guard = self.lock();
+        let inner = &mut *guard;
+        let stats = &mut inner.stats;
+        let outcome = match inner.scopes.get_mut(&reservation.scope) {
+            None => Settlement::NotActive,
+            Some(state) => {
+                // Settlement first, reclamation second: a response that lands
+                // before the scope is next touched still settles normally,
+                // even if its deadline has technically passed.
+                let outcome = if let Some(held) = state.active.remove(&reservation.id) {
+                    state.reserved = state.reserved.saturating_sub(held.contribution);
+                    stats.active = stats.active.saturating_sub(1);
+                    if commit {
+                        state.committed = state.committed.saturating_add(held.contribution);
+                        Settlement::Committed
+                    } else {
+                        Settlement::Released
+                    }
+                } else if let Some(held) = state.reclaimed.remove(&reservation.id) {
+                    if commit {
+                        state.committed = state.committed.saturating_add(held.contribution);
+                        Settlement::LateCommitted
+                    } else {
+                        Settlement::LateReleased
+                    }
+                } else {
+                    Settlement::NotActive
+                };
+                count_reclaim(stats, state.reclaim(now, self.ttl));
+                outcome
+            }
+        };
+        match outcome {
+            Settlement::Committed => stats.committed += 1,
+            Settlement::Released => stats.released += 1,
+            Settlement::LateCommitted => stats.late_committed += 1,
+            Settlement::LateReleased => stats.late_released += 1,
+            Settlement::NotActive => stats.not_active += 1,
+        }
+        outcome
     }
 
     /// How many scopes the ledger currently tracks.
     #[cfg(test)]
     pub fn scope_count(&self) -> usize {
-        self.lock().len()
+        self.lock().scopes.len()
     }
 }
 
+fn count_reclaim(stats: &mut LedgerStats, (expired, abandoned): (u64, u64)) {
+    stats.active = stats.active.saturating_sub(expired);
+    stats.expired += expired;
+    stats.abandoned += abandoned;
+}
+
 impl LedgerStore for Ledger {
-    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Refusal> {
-        self.with_state(scope, |state| {
+    fn reserve(
+        &self,
+        scope: &str,
+        contribution: u64,
+        budget: u64,
+        now: u64,
+    ) -> Result<Reservation, Refusal> {
+        self.with_state(scope, now, |state, next_id, stats| {
             let current_total = state.total();
             let would_be_total = current_total.saturating_add(contribution);
             if would_be_total > budget {
@@ -279,22 +508,14 @@ impl LedgerStore for Ledger {
                     budget,
                 }));
             }
-            state.reserved = state.reserved.saturating_add(contribution);
-            Ok(Reservation {
-                scope: scope.to_string(),
-                contribution,
-            })
+            Ok(self.hold(state, next_id, stats, scope, contribution, now))
         })
         .unwrap_or(Err(Refusal::AtCapacity))
     }
 
-    fn force_reserve(&self, scope: &str, contribution: u64) -> Option<Reservation> {
-        self.with_state(scope, |state| {
-            state.reserved = state.reserved.saturating_add(contribution);
-            Reservation {
-                scope: scope.to_string(),
-                contribution,
-            }
+    fn force_reserve(&self, scope: &str, contribution: u64, now: u64) -> Option<Reservation> {
+        self.with_state(scope, now, |state, next_id, stats| {
+            self.hold(state, next_id, stats, scope, contribution, now)
         })
     }
 
@@ -303,38 +524,24 @@ impl LedgerStore for Ledger {
         scope: &str,
         contribution: u64,
         budget: u64,
+        now: u64,
     ) -> Option<(Reservation, bool)> {
-        self.with_state(scope, |state| {
-            state.reserved = state.reserved.saturating_add(contribution);
-            let breached = state.total() > budget;
-            (
-                Reservation {
-                    scope: scope.to_string(),
-                    contribution,
-                },
-                breached,
-            )
+        self.with_state(scope, now, |state, next_id, stats| {
+            let reservation = self.hold(state, next_id, stats, scope, contribution, now);
+            (reservation, state.total() > budget)
         })
     }
 
-    // A reservation's scope always exists: it holds `reserved > 0` (or was
-    // created by the reserve that issued it), so it is never idle and never
-    // evicted while the reservation is outstanding.
-    fn commit(&self, reservation: Reservation) {
-        self.with_existing(&reservation.scope, |state| {
-            state.reserved = state.reserved.saturating_sub(reservation.contribution);
-            state.committed = state.committed.saturating_add(reservation.contribution);
-        });
+    fn commit(&self, reservation: &Reservation, now: u64) -> Settlement {
+        self.settle(reservation, now, true)
     }
 
-    fn release(&self, reservation: Reservation) {
-        self.with_existing(&reservation.scope, |state| {
-            state.reserved = state.reserved.saturating_sub(reservation.contribution);
-        });
+    fn release(&self, reservation: &Reservation, now: u64) -> Settlement {
+        self.settle(reservation, now, false)
     }
 
-    fn record(&self, scope: &str, contribution: u64) -> bool {
-        self.with_state(scope, |state| {
+    fn record(&self, scope: &str, contribution: u64, now: u64) -> bool {
+        self.with_state(scope, now, |state, _, _| {
             state.committed = state.committed.saturating_add(contribution);
         })
         .is_some()
@@ -342,6 +549,7 @@ impl LedgerStore for Ledger {
 
     fn snapshot(&self, scope: &str) -> Snapshot {
         self.lock()
+            .scopes
             .get(scope)
             .map(|state| Snapshot {
                 committed: state.committed,
@@ -351,6 +559,10 @@ impl LedgerStore for Ledger {
                 committed: 0,
                 reserved: 0,
             })
+    }
+
+    fn stats(&self) -> LedgerStats {
+        self.lock().stats
     }
 }
 
@@ -382,16 +594,16 @@ mod test {
         // Sessions 1-3: each individually valid, each admitted, composing to 2400.
         for _ in 0..3 {
             let reservation = ledger
-                .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET)
+                .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET, 0)
                 .expect("first three sessions must be admitted");
-            ledger.commit(reservation);
+            ledger.commit(&reservation, 0);
         }
         assert_eq!(ledger.snapshot(scope).total(), 2400);
 
         // Session 4: locally valid (800 <= a 1000 per-session cap enforced above
         // this ledger), but 2400 + 800 = 3200 > 3000 — refused.
         let denial = ledger
-            .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET)
+            .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET, 0)
             .expect_err("fourth session composes past the aggregate budget")
             .over_budget();
         assert_eq!(denial.current_total, 2400);
@@ -407,12 +619,16 @@ mod test {
         let ledger = Ledger::new();
         let scope = "agent:fleet-a";
         for _ in 0..3 {
-            let reservation = ledger.reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET).unwrap();
-            ledger.commit(reservation);
+            let reservation = ledger
+                .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET, 0)
+                .unwrap();
+            ledger.commit(&reservation, 0);
         }
         // Two more attempts at 800 each: both refused, neither changes the total.
         for _ in 0..2 {
-            assert!(ledger.reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET).is_err());
+            assert!(ledger
+                .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET, 0)
+                .is_err());
         }
         assert_eq!(ledger.snapshot(scope).total(), 2400);
     }
@@ -518,9 +734,9 @@ mod test {
                     let ledger = Arc::clone(&ledger);
                     thread::spawn(move || {
                         ledger
-                            .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET)
+                            .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET, 0)
                             .map(|reservation| {
-                                ledger.commit(reservation);
+                                ledger.commit(&reservation, 0);
                             })
                     })
                 })
@@ -558,9 +774,11 @@ mod test {
             for _ in 0..10 {
                 let ledger = Arc::clone(&ledger);
                 handles.push(thread::spawn(move || {
-                    ledger.reserve(scope, per_call, budget).map(|reservation| {
-                        ledger.commit(reservation);
-                    })
+                    ledger
+                        .reserve(scope, per_call, budget, 0)
+                        .map(|reservation| {
+                            ledger.commit(&reservation, 0);
+                        })
                 }));
             }
         }
@@ -588,7 +806,7 @@ mod test {
     #[test]
     fn commit_moves_contribution_from_reserved_to_committed() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 100, 1000).unwrap();
+        let reservation = ledger.reserve("s", 100, 1000, 0).unwrap();
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
@@ -596,7 +814,7 @@ mod test {
                 reserved: 100
             }
         );
-        ledger.commit(reservation);
+        ledger.commit(&reservation, 0);
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
@@ -609,8 +827,8 @@ mod test {
     #[test]
     fn release_removes_reservation_without_committing() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 100, 1000).unwrap();
-        ledger.release(reservation);
+        let reservation = ledger.reserve("s", 100, 1000, 0).unwrap();
+        ledger.release(&reservation, 0);
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
@@ -623,14 +841,14 @@ mod test {
     #[test]
     fn a_released_reservation_frees_budget_for_a_later_call() {
         let ledger = Ledger::new();
-        let first = ledger.reserve("s", 900, 1000).unwrap();
+        let first = ledger.reserve("s", 900, 1000, 0).unwrap();
         assert!(
-            ledger.reserve("s", 200, 1000).is_err(),
+            ledger.reserve("s", 200, 1000, 0).is_err(),
             "900 reserved leaves no room for 200"
         );
-        ledger.release(first);
+        ledger.release(&first, 0);
         assert!(
-            ledger.reserve("s", 200, 1000).is_ok(),
+            ledger.reserve("s", 200, 1000, 0).is_ok(),
             "releasing the first reservation must free its budget"
         );
     }
@@ -639,26 +857,26 @@ mod test {
     fn record_bypasses_the_budget_check_entirely() {
         let ledger = Ledger::new();
         // record() has no budget parameter: it cannot be denied by construction.
-        ledger.record("s", 10_000);
+        ledger.record("s", 10_000, 0);
         assert_eq!(ledger.snapshot("s").committed, 10_000);
     }
 
     #[test]
     fn force_reserve_always_succeeds_even_over_a_notional_budget() {
         let ledger = Ledger::new();
-        let reservation = ledger.force_reserve("s", 10_000).unwrap();
+        let reservation = ledger.force_reserve("s", 10_000, 0).unwrap();
         assert_eq!(ledger.snapshot("s").reserved, 10_000);
-        ledger.commit(reservation);
+        ledger.commit(&reservation, 0);
         assert_eq!(ledger.snapshot("s").committed, 10_000);
     }
 
     #[test]
     fn force_reserve_checked_reports_no_breach_when_within_budget() {
         let ledger = Ledger::new();
-        let (reservation, breached) = ledger.force_reserve_checked("s", 500, 1000).unwrap();
+        let (reservation, breached) = ledger.force_reserve_checked("s", 500, 1000, 0).unwrap();
         assert!(!breached);
         assert_eq!(ledger.snapshot("s").reserved, 500);
-        ledger.commit(reservation);
+        ledger.commit(&reservation, 0);
     }
 
     #[test]
@@ -666,28 +884,28 @@ mod test {
         let ledger = Ledger::new();
         // Never denies (monitor-mode primitive), but must still truthfully
         // report that this reservation pushed the scope over budget.
-        let (reservation, breached) = ledger.force_reserve_checked("s", 1500, 1000).unwrap();
+        let (reservation, breached) = ledger.force_reserve_checked("s", 1500, 1000, 0).unwrap();
         assert!(breached);
         assert_eq!(
             ledger.snapshot("s").reserved,
             1500,
             "force_reserve_checked must still reserve the full amount despite the breach"
         );
-        ledger.commit(reservation);
+        ledger.commit(&reservation, 0);
         assert_eq!(ledger.snapshot("s").committed, 1500);
     }
 
     #[test]
     fn force_reserve_checked_breach_reflects_prior_committed_exposure_too() {
         let ledger = Ledger::new();
-        let first = ledger.force_reserve_checked("s", 800, 1000).unwrap();
+        let first = ledger.force_reserve_checked("s", 800, 1000, 0).unwrap();
         assert!(!first.1);
-        ledger.commit(first.0);
+        ledger.commit(&first.0, 0);
         // 800 committed + 300 more reserved = 1100 > 1000: a breach, even
         // though this second call's OWN amount is well within budget alone.
-        let (reservation, breached) = ledger.force_reserve_checked("s", 300, 1000).unwrap();
+        let (reservation, breached) = ledger.force_reserve_checked("s", 300, 1000, 0).unwrap();
         assert!(breached);
-        ledger.commit(reservation);
+        ledger.commit(&reservation, 0);
     }
 
     #[test]
@@ -696,8 +914,8 @@ mod test {
         // actually landed upstream should not count against the running total,
         // even though force_reserve never denies up front.
         let ledger = Ledger::new();
-        let reservation = ledger.force_reserve("s", 500).unwrap();
-        ledger.release(reservation);
+        let reservation = ledger.force_reserve("s", 500, 0).unwrap();
+        ledger.release(&reservation, 0);
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
@@ -714,10 +932,10 @@ mod test {
     #[test]
     fn different_scopes_have_independent_totals() {
         let ledger = Ledger::new();
-        let a = ledger.reserve("agent:a", 900, 1000).unwrap();
-        ledger.commit(a);
+        let a = ledger.reserve("agent:a", 900, 1000, 0).unwrap();
+        ledger.commit(&a, 0);
         // A different scope key starts fresh even though it shares a budget.
-        assert!(ledger.reserve("agent:b", 900, 1000).is_ok());
+        assert!(ledger.reserve("agent:b", 900, 1000, 0).is_ok());
         assert_eq!(ledger.snapshot("agent:a").total(), 900);
         assert_eq!(ledger.snapshot("agent:b").total(), 900);
     }
@@ -729,10 +947,10 @@ mod test {
         // the key. This test documents that contract at the ledger layer (the
         // filter is what actually builds these keys; see lib.rs).
         let ledger = Ledger::new();
-        let agent_res = ledger.reserve("agent:x", 900, 1000).unwrap();
-        ledger.commit(agent_res);
+        let agent_res = ledger.reserve("agent:x", 900, 1000, 0).unwrap();
+        ledger.commit(&agent_res, 0);
         assert!(
-            ledger.reserve("tenant:x", 900, 1000).is_ok(),
+            ledger.reserve("tenant:x", 900, 1000, 0).is_ok(),
             "a different scope dimension for the same identity value must not share budget"
         );
     }
@@ -745,7 +963,7 @@ mod test {
     fn a_call_landing_exactly_on_budget_is_admitted() {
         let ledger = Ledger::new();
         assert!(
-            ledger.reserve("s", 1000, 1000).is_ok(),
+            ledger.reserve("s", 1000, 1000, 0).is_ok(),
             "exactly-at-budget must be admitted"
         );
     }
@@ -753,31 +971,34 @@ mod test {
     #[test]
     fn a_call_one_unit_over_budget_is_denied() {
         let ledger = Ledger::new();
-        let denial = ledger.reserve("s", 1001, 1000).unwrap_err().over_budget();
+        let denial = ledger
+            .reserve("s", 1001, 1000, 0)
+            .unwrap_err()
+            .over_budget();
         assert_eq!(denial.would_be_total, 1001);
     }
 
     #[test]
     fn a_zero_contribution_call_is_always_admitted_even_at_zero_budget() {
         let ledger = Ledger::new();
-        assert!(ledger.reserve("s", 0, 0).is_ok());
+        assert!(ledger.reserve("s", 0, 0, 0).is_ok());
     }
 
     #[test]
     fn a_zero_budget_denies_any_positive_contribution() {
         let ledger = Ledger::new();
-        assert!(ledger.reserve("s", 1, 0).is_err());
+        assert!(ledger.reserve("s", 1, 0, 0).is_err());
     }
 
     #[test]
     fn committed_exposure_from_a_prior_call_counts_against_a_new_reservation() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("s", 1000, 1000).unwrap();
-        ledger.commit(reservation);
+        let reservation = ledger.reserve("s", 1000, 1000, 0).unwrap();
+        ledger.commit(&reservation, 0);
         // The scope is now fully committed; even a zero-sized new call is fine,
         // but anything positive must be denied.
-        assert!(ledger.reserve("s", 0, 1000).is_ok());
-        assert!(ledger.reserve("s", 1, 1000).is_err());
+        assert!(ledger.reserve("s", 0, 1000, 0).is_ok());
+        assert!(ledger.reserve("s", 1, 1000, 0).is_err());
     }
 
     #[test]
@@ -785,13 +1006,13 @@ mod test {
         // The core of reserve-then-authorize: a RESERVED (not yet committed)
         // amount must block a composing call exactly as if it had landed.
         let ledger = Ledger::new();
-        let first = ledger.reserve("s", 600, 1000).unwrap();
+        let first = ledger.reserve("s", 600, 1000, 0).unwrap();
         assert!(
-            ledger.reserve("s", 500, 1000).is_err(),
+            ledger.reserve("s", 500, 1000, 0).is_err(),
             "an in-flight reservation must count against the budget check"
         );
-        ledger.release(first);
-        assert!(ledger.reserve("s", 500, 1000).is_ok());
+        ledger.release(&first, 0);
+        assert!(ledger.reserve("s", 500, 1000, 0).is_ok());
     }
 
     #[test]
@@ -800,10 +1021,10 @@ mod test {
         // is actually held must not underflow the tracked state into a negative
         // "reserved" that would let future calls smuggle extra budget through.
         let ledger = Ledger::new();
-        ledger.release(Reservation {
-            scope: "s".to_string(),
-            contribution: 500,
-        });
+        assert_eq!(
+            ledger.release(&forged("s", 1, 500), 0),
+            Settlement::NotActive
+        );
         assert_eq!(
             ledger.snapshot("s"),
             Snapshot {
@@ -816,10 +1037,10 @@ mod test {
     #[test]
     fn denial_report_carries_the_scope_and_amounts_for_diagnostics() {
         let ledger = Ledger::new();
-        let reservation = ledger.reserve("agent:z", 700, 1000).unwrap();
-        ledger.commit(reservation);
+        let reservation = ledger.reserve("agent:z", 700, 1000, 0).unwrap();
+        ledger.commit(&reservation, 0);
         let denial = ledger
-            .reserve("agent:z", 400, 1000)
+            .reserve("agent:z", 400, 1000, 0)
             .unwrap_err()
             .over_budget();
         assert_eq!(denial.scope, "agent:z");
@@ -841,24 +1062,24 @@ mod test {
         // eleventh is denied.
         let ledger = Ledger::new();
         for _ in 0..10 {
-            let reservation = ledger.reserve("s", 1, 10).expect("within budget");
-            ledger.commit(reservation);
+            let reservation = ledger.reserve("s", 1, 10, 0).expect("within budget");
+            ledger.commit(&reservation, 0);
         }
         assert_eq!(ledger.snapshot("s").total(), 10);
-        assert!(ledger.reserve("s", 1, 10).is_err());
+        assert!(ledger.reserve("s", 1, 10, 0).is_err());
 
         let ledger = Ledger::new();
-        ledger.commit(ledger.reserve("s", 10, 30).unwrap());
-        ledger.commit(ledger.reserve("s", 20, 30).unwrap());
+        ledger.commit(&ledger.reserve("s", 10, 30, 0).unwrap(), 0);
+        ledger.commit(&ledger.reserve("s", 20, 30, 0).unwrap(), 0);
         assert_eq!(ledger.snapshot("s").total(), 30, "10 + 20 is exactly 30");
     }
 
     #[test]
     fn an_overflowing_sum_is_denied_rather_than_wrapping() {
         let ledger = Ledger::new();
-        ledger.record("s", u64::MAX - 1);
+        ledger.record("s", u64::MAX - 1, 0);
         let denial = ledger
-            .reserve("s", 10, u64::MAX - 1)
+            .reserve("s", 10, u64::MAX - 1, 0)
             .unwrap_err()
             .over_budget();
         assert_eq!(
@@ -872,11 +1093,11 @@ mod test {
     #[test]
     fn force_reserve_checked_saturates_and_reports_the_breach() {
         let ledger = Ledger::new();
-        ledger.record("s", u64::MAX);
-        let (reservation, breached) = ledger.force_reserve_checked("s", 5, 1000).unwrap();
+        ledger.record("s", u64::MAX, 0);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 5, 1000, 0).unwrap();
         assert!(breached);
         assert_eq!(ledger.snapshot("s").total(), u64::MAX);
-        ledger.release(reservation);
+        ledger.release(&reservation, 0);
         assert_eq!(ledger.snapshot("s").reserved, 0);
     }
 
@@ -902,15 +1123,15 @@ mod test {
     #[test]
     fn a_full_ledger_refuses_a_new_scope_when_no_scope_is_idle() {
         let ledger = Ledger::with_max_scopes(2);
-        let a = ledger.reserve("a", 10, 100).unwrap();
-        ledger.commit(a);
-        let _in_flight = ledger.reserve("b", 10, 100).unwrap();
+        let a = ledger.reserve("a", 10, 100, 0).unwrap();
+        ledger.commit(&a, 0);
+        let _in_flight = ledger.reserve("b", 10, 100, 0).unwrap();
         assert!(matches!(
-            ledger.reserve("c", 10, 100),
+            ledger.reserve("c", 10, 100, 0),
             Err(Refusal::AtCapacity)
         ));
-        assert!(ledger.force_reserve_checked("c", 10, 100).is_none());
-        assert!(!ledger.record("c", 10));
+        assert!(ledger.force_reserve_checked("c", 10, 100, 0).is_none());
+        assert!(!ledger.record("c", 10, 0));
         assert_eq!(ledger.scope_count(), 2);
         // Neither live scope lost its state to make room.
         assert_eq!(ledger.snapshot("a").committed, 10);
@@ -920,12 +1141,12 @@ mod test {
     #[test]
     fn a_full_ledger_evicts_only_an_idle_scope() {
         let ledger = Ledger::with_max_scopes(2);
-        let a = ledger.reserve("a", 10, 100).unwrap();
-        ledger.commit(a);
+        let a = ledger.reserve("a", 10, 100, 0).unwrap();
+        ledger.commit(&a, 0);
         // "b" reserved then released: zero committed, zero reserved — idle.
-        let b = ledger.reserve("b", 10, 100).unwrap();
-        ledger.release(b);
-        assert!(ledger.reserve("c", 10, 100).is_ok());
+        let b = ledger.reserve("b", 10, 100, 0).unwrap();
+        ledger.release(&b, 0);
+        assert!(ledger.reserve("c", 10, 100, 0).is_ok());
         assert_eq!(ledger.scope_count(), 2);
         assert_eq!(ledger.snapshot("a").committed, 10, "live scope kept");
         assert_eq!(ledger.snapshot("b").total(), 0);
@@ -934,22 +1155,192 @@ mod test {
     #[test]
     fn an_already_tracked_scope_is_never_refused_for_capacity() {
         let ledger = Ledger::with_max_scopes(1);
-        let first = ledger.reserve("a", 10, 100).unwrap();
-        ledger.commit(first);
-        assert!(ledger.reserve("a", 10, 100).is_ok());
+        let first = ledger.reserve("a", 10, 100, 0).unwrap();
+        ledger.commit(&first, 0);
+        assert!(ledger.reserve("a", 10, 100, 0).is_ok());
     }
 
     #[test]
     fn commit_and_release_on_an_untracked_scope_do_not_create_it() {
         let ledger = Ledger::with_max_scopes(1);
-        ledger.commit(Reservation {
-            scope: "ghost".to_string(),
-            contribution: 5,
-        });
-        ledger.release(Reservation {
-            scope: "ghost".to_string(),
-            contribution: 5,
-        });
+        ledger.commit(&forged("ghost", 1, 5), 0);
+        ledger.release(&forged("ghost", 1, 5), 0);
         assert_eq!(ledger.scope_count(), 0);
+    }
+
+    /// A reservation this ledger never issued.
+    fn forged(scope: &str, id: u64, contribution: u64) -> Reservation {
+        Reservation {
+            id,
+            scope: scope.to_string(),
+            contribution,
+            created_at: 0,
+            expires_at: TEST_TTL,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Reservation lifecycle (issue #17): IDs, TTL, idempotent settlement.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn every_reservation_has_a_unique_id_and_a_bounded_lifetime() {
+        let ledger = Ledger::new();
+        let mut ids = std::collections::HashSet::new();
+        for i in 0..1000u64 {
+            let scope = format!("s{}", i % 7);
+            let r = ledger.force_reserve(&scope, 1, i).unwrap();
+            assert!(ids.insert(r.id), "id {} reused", r.id);
+            assert_eq!(r.created_at, i);
+            assert_eq!(r.expires_at, i + TEST_TTL);
+        }
+    }
+
+    #[test]
+    fn a_duplicate_commit_does_not_double_count() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        assert_eq!(ledger.commit(&r, 1), Settlement::Committed);
+        assert_eq!(ledger.commit(&r, 2), Settlement::NotActive);
+        assert_eq!(ledger.snapshot("s").committed, 800);
+        assert_eq!(ledger.snapshot("s").reserved, 0);
+    }
+
+    #[test]
+    fn a_duplicate_release_does_not_under_count() {
+        let ledger = Ledger::new();
+        let held = ledger.reserve("s", 500, 3000, 0).unwrap();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        assert_eq!(ledger.release(&r, 1), Settlement::Released);
+        assert_eq!(ledger.release(&r, 2), Settlement::NotActive);
+        // The other in-flight reservation still counts in full.
+        assert_eq!(ledger.snapshot("s").reserved, 500);
+        ledger.commit(&held, 3);
+    }
+
+    #[test]
+    fn commit_after_release_does_not_commit() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        ledger.release(&r, 1);
+        assert_eq!(ledger.commit(&r, 2), Settlement::NotActive);
+        assert_eq!(ledger.snapshot("s").total(), 0);
+    }
+
+    #[test]
+    fn release_after_commit_does_not_uncommit() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        ledger.commit(&r, 1);
+        assert_eq!(ledger.release(&r, 2), Settlement::NotActive);
+        assert_eq!(ledger.snapshot("s").committed, 800);
+    }
+
+    #[test]
+    fn an_abandoned_reservation_is_reclaimed_after_its_ttl_without_touching_committed() {
+        let ledger = Ledger::new();
+        let done = ledger.reserve("s", 1000, 3000, 0).unwrap();
+        ledger.commit(&done, 0);
+        // The response hook for this one never runs.
+        let _stranded = ledger.reserve("s", 2000, 3000, 0).unwrap();
+        assert!(
+            ledger.reserve("s", 1, 3000, TEST_TTL - 1).is_err(),
+            "still held one millisecond before its deadline"
+        );
+        assert!(ledger.reserve("s", 2000, 3000, TEST_TTL).is_ok());
+        assert_eq!(ledger.snapshot("s").committed, 1000, "committed kept");
+        assert_eq!(ledger.stats().expired, 1);
+    }
+
+    #[test]
+    fn a_late_commit_after_reclaim_charges_the_exposure_exactly_once() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        // Another call at the deadline reclaims it.
+        assert_eq!(ledger.snapshot("s").reserved, 800);
+        ledger.record("s", 0, TEST_TTL);
+        assert_eq!(ledger.snapshot("s").reserved, 0);
+        // Then the slow upstream succeeds: the call happened, so it is charged.
+        assert_eq!(ledger.commit(&r, TEST_TTL + 1), Settlement::LateCommitted);
+        assert_eq!(ledger.snapshot("s").committed, 800);
+        assert_eq!(ledger.commit(&r, TEST_TTL + 2), Settlement::NotActive);
+        assert_eq!(ledger.snapshot("s").committed, 800);
+    }
+
+    #[test]
+    fn a_late_release_after_reclaim_changes_nothing() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        ledger.record("s", 0, TEST_TTL);
+        assert_eq!(ledger.release(&r, TEST_TTL + 1), Settlement::LateReleased);
+        assert_eq!(ledger.snapshot("s").total(), 0);
+    }
+
+    #[test]
+    fn a_settlement_before_the_scope_is_touched_again_is_on_time() {
+        // Reclamation is lazy: past the deadline but not yet reclaimed, the
+        // reservation is still active and settles normally.
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        assert_eq!(ledger.commit(&r, TEST_TTL + 5), Settlement::Committed);
+        assert_eq!(ledger.snapshot("s").committed, 800);
+    }
+
+    #[test]
+    fn a_cancelled_request_is_counted_abandoned_and_a_very_late_settlement_is_dropped() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 800, 3000, 0).unwrap();
+        ledger.record("s", 0, TEST_TTL);
+        assert_eq!(ledger.stats().abandoned, 0, "tombstone still held");
+        ledger.record("s", 0, 2 * TEST_TTL);
+        assert_eq!(ledger.stats().abandoned, 1);
+        // Past 2 × ttl the ledger no longer knows the reservation.
+        assert_eq!(ledger.commit(&r, 2 * TEST_TTL + 1), Settlement::NotActive);
+        assert_eq!(ledger.snapshot("s").committed, 0);
+    }
+
+    #[test]
+    fn stats_distinguish_every_reservation_state() {
+        let ledger = Ledger::new();
+        let committed = ledger.reserve("s", 1, 100, 0).unwrap();
+        let released = ledger.reserve("s", 1, 100, 0).unwrap();
+        let late = ledger.reserve("s", 1, 100, 0).unwrap();
+        let _abandoned = ledger.reserve("s", 1, 100, 0).unwrap();
+        let _active = ledger.reserve("t", 1, 100, 0).unwrap();
+        ledger.commit(&committed, 1);
+        ledger.release(&released, 1);
+        ledger.commit(&committed, 2);
+        ledger.record("s", 0, TEST_TTL);
+        ledger.commit(&late, TEST_TTL + 1);
+        ledger.record("s", 0, 2 * TEST_TTL);
+        assert_eq!(
+            ledger.stats(),
+            LedgerStats {
+                active: 1,
+                committed: 1,
+                released: 1,
+                expired: 2,
+                late_committed: 1,
+                late_released: 0,
+                abandoned: 1,
+                not_active: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_stranded_reservation_stops_pinning_its_scope_after_two_ttls() {
+        let ledger = Ledger::with_max_scopes(1);
+        let _stranded = ledger.reserve("a", 10, 100, 0).unwrap();
+        assert!(matches!(
+            ledger.reserve("b", 10, 100, TEST_TTL - 1),
+            Err(Refusal::AtCapacity)
+        ));
+        // Expired, but its tombstone still waits for a late settlement.
+        assert!(matches!(
+            ledger.reserve("b", 10, 100, TEST_TTL),
+            Err(Refusal::AtCapacity)
+        ));
+        assert!(ledger.reserve("b", 10, 100, 2 * TEST_TTL).is_ok());
     }
 }

@@ -102,6 +102,19 @@ publication are included.
   sensitive `scopeDigestKey`), not the raw identity, and identities are never logged. Adds the
   `sha2` and `hmac` crates. **Breaking:** a config that keyed on `scopeHeader` must now set
   `identitySource: trusted-header`, and `scopeDisclosure: raw` to keep raw scopes in the header.
+- **Cross-Session Aggregate-Risk Gate** — reservations have a lifecycle (issue #17). A request whose
+  response never reached the policy (client disconnect, cancellation, upstream timeout) used to hold
+  its reservation for the life of the worker. Each reservation now has a worker-unique id, a creation
+  time and an expiry from the new `reservationTimeoutMs` (default 60000, range 1000–86400000), read
+  from the gateway clock. An expired reservation is reclaimed under the ledger lock, freeing its
+  budget, and committed exposure is untouched. Settlement is by id and happens at most once, so a
+  duplicate, reordered or crossed commit/release changes nothing. A response within one more timeout
+  after reclaim settles late: a success is charged without a budget check, a failure changes nothing.
+  After that the reservation is counted abandoned. `resultHeader` on an allowed or monitored call now
+  ends with `settlement=committed|released|late-committed|late-released|not-active`, and any
+  settlement that isn't on time logs the ledger counters, with no identities. A worker restart still
+  resets the in-memory ledger. That is now documented and tested. **Breaking:** the allowed/monitor
+  `resultHeader` format gains the trailing `settlement=` field.
 
 ### Known limitations
 
