@@ -48,6 +48,15 @@ struct ScopeState {
 }
 
 impl ScopeState {
+    /// An idle scope has nothing committed and nothing in flight, so it holds
+    /// no enforcement state: dropping it and re-creating it later at zero is
+    /// indistinguishable from keeping it. Only idle scopes are ever evicted.
+    fn is_idle(&self) -> bool {
+        self.committed == 0 && self.reserved == 0
+    }
+}
+
+impl ScopeState {
     fn total(&self) -> u64 {
         self.committed.saturating_add(self.reserved)
     }
@@ -86,6 +95,27 @@ pub struct Snapshot {
     pub reserved: u64,
 }
 
+/// Why `reserve` refused a call.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Refusal {
+    /// Admitting the contribution would push the scope over its budget.
+    OverBudget(Denial),
+    /// `scope` is new and the ledger already tracks `max_scopes` scopes, none
+    /// of them idle. The call is refused rather than evicting live state.
+    AtCapacity,
+}
+
+#[cfg(test)]
+impl Refusal {
+    /// The budget denial inside an `OverBudget` refusal; panics otherwise.
+    pub fn over_budget(self) -> Denial {
+        match self {
+            Refusal::OverBudget(denial) => denial,
+            Refusal::AtCapacity => panic!("expected OverBudget, got AtCapacity"),
+        }
+    }
+}
+
 impl Snapshot {
     pub fn total(&self) -> u64 {
         self.committed.saturating_add(self.reserved)
@@ -100,8 +130,9 @@ impl Snapshot {
 pub trait LedgerStore {
     /// Atomically checks `scope`'s committed-plus-reserved exposure against
     /// `budget` and, only if `contribution` fits, reserves it. On denial, the
-    /// ledger is left completely unmutated for `scope`.
-    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Denial>;
+    /// ledger is left completely unmutated for `scope`. A new scope that does
+    /// not fit under the ledger's scope cap is refused with `AtCapacity`.
+    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Refusal>;
 
     /// Reserves `contribution` against `scope` unconditionally, ignoring
     /// `budget` — the monitor-mode primitive: composition is still tracked
@@ -116,21 +147,24 @@ pub trait LedgerStore {
     /// read, which would reopen the exact read-then-write race window this
     /// module's whole correctness story is about) — hence `#[allow(dead_code)]`
     /// rather than deleting a real, tested API.
+    ///
+    /// `None` only when `scope` is new and the ledger is at its scope cap.
     #[allow(dead_code)]
-    fn force_reserve(&self, scope: &str, contribution: u64) -> Reservation;
+    fn force_reserve(&self, scope: &str, contribution: u64) -> Option<Reservation>;
 
     /// `force_reserve`, plus a breach signal: reserves `contribution`
     /// against `scope` unconditionally (never denies — monitor mode still
     /// forwards every call), but also reports whether doing so pushed
     /// committed-plus-reserved exposure over `budget`. This is what lets
     /// monitor mode raise the same policy-violation signal a block-mode
-    /// denial would, without actually denying the call.
+    /// denial would, without actually denying the call. `None` only when
+    /// `scope` is new and the ledger is at its scope cap.
     fn force_reserve_checked(
         &self,
         scope: &str,
         contribution: u64,
         budget: u64,
-    ) -> (Reservation, bool);
+    ) -> Option<(Reservation, bool)>;
 
     /// Resolves a reservation as successful: moves its contribution from
     /// `reserved` into `committed`.
@@ -145,10 +179,12 @@ pub trait LedgerStore {
     /// budget check and the reserve/commit two-step. Used for a call whose
     /// exposure is known only after it already happened and so can no longer be
     /// denied (e.g. monitor mode's unpriceable-at-request-time cases, or a
-    /// direct audit correction).
-    fn record(&self, scope: &str, contribution: u64);
+    /// direct audit correction). Returns `false`, recording nothing, only when
+    /// `scope` is new and the ledger is at its scope cap.
+    fn record(&self, scope: &str, contribution: u64) -> bool;
 
     /// A read-only view of one scope's current state, for diagnostics/tests.
+    /// Never creates an entry: an untracked scope reads as zero.
     fn snapshot(&self, scope: &str) -> Snapshot;
 }
 
@@ -159,44 +195,89 @@ pub trait LedgerStore {
 /// simulated/interleaved async calls, which is the strongest evidence available
 /// short of a real distributed backend that reserve-then-authorize actually holds
 /// the budget under a race.
-#[derive(Default)]
+///
+/// Cardinality is bounded by `max_scopes`. When a NEW scope arrives at the cap,
+/// one idle scope (see `ScopeState::is_idle`) is evicted to make room; if every
+/// tracked scope holds committed or reserved exposure, the new scope is refused
+/// instead. Live enforcement state is never evicted, so the cap can never be
+/// used to reset another scope's running total.
 pub struct Ledger {
     scopes: Mutex<HashMap<String, ScopeState>>,
+    max_scopes: usize,
 }
 
 impl Ledger {
+    /// An unbounded ledger, for tests of the budget arithmetic itself.
+    #[cfg(test)]
     pub fn new() -> Self {
-        Self::default()
+        Self::with_max_scopes(usize::MAX)
     }
 
-    fn with_state<R>(&self, scope: &str, f: impl FnOnce(&mut ScopeState) -> R) -> R {
+    pub fn with_max_scopes(max_scopes: usize) -> Self {
+        Ledger {
+            scopes: Mutex::new(HashMap::new()),
+            max_scopes,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ScopeState>> {
         // A poisoned mutex (a prior panic while the lock was held) still holds
         // valid, if possibly inconsistent, ledger data. Recovering it rather than
         // panicking again keeps this store fail-open at the Rust-panic level
         // while the filter above it stays fail-closed at the policy-decision
         // level (a denial is a normal, safe `Err`, never a panic).
-        let mut guard = self
-            .scopes
+        self.scopes
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let state = guard.entry(scope.to_string()).or_default();
-        f(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Runs `f` on `scope`'s state, creating it if needed. Returns `None`,
+    /// without running `f`, if `scope` is new and there is no room for it.
+    /// The capacity check, any eviction, and `f` all happen under one lock.
+    fn with_state<R>(&self, scope: &str, f: impl FnOnce(&mut ScopeState) -> R) -> Option<R> {
+        let mut guard = self.lock();
+        if !guard.contains_key(scope) && guard.len() >= self.max_scopes {
+            let idle = guard
+                .iter()
+                .find(|(_, state)| state.is_idle())
+                .map(|(key, _)| key.clone());
+            match idle {
+                Some(key) => {
+                    guard.remove(&key);
+                }
+                None => return None,
+            }
+        }
+        Some(f(guard.entry(scope.to_string()).or_default()))
+    }
+
+    /// Runs `f` on an EXISTING scope's state; a no-op if it is untracked.
+    fn with_existing(&self, scope: &str, f: impl FnOnce(&mut ScopeState)) {
+        if let Some(state) = self.lock().get_mut(scope) {
+            f(state);
+        }
+    }
+
+    /// How many scopes the ledger currently tracks.
+    #[cfg(test)]
+    pub fn scope_count(&self) -> usize {
+        self.lock().len()
     }
 }
 
 impl LedgerStore for Ledger {
-    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Denial> {
+    fn reserve(&self, scope: &str, contribution: u64, budget: u64) -> Result<Reservation, Refusal> {
         self.with_state(scope, |state| {
             let current_total = state.total();
             let would_be_total = current_total.saturating_add(contribution);
             if would_be_total > budget {
-                return Err(Denial {
+                return Err(Refusal::OverBudget(Denial {
                     scope: scope.to_string(),
                     contribution,
                     current_total,
                     would_be_total,
                     budget,
-                });
+                }));
             }
             state.reserved = state.reserved.saturating_add(contribution);
             Ok(Reservation {
@@ -204,16 +285,17 @@ impl LedgerStore for Ledger {
                 contribution,
             })
         })
+        .unwrap_or(Err(Refusal::AtCapacity))
     }
 
-    fn force_reserve(&self, scope: &str, contribution: u64) -> Reservation {
+    fn force_reserve(&self, scope: &str, contribution: u64) -> Option<Reservation> {
         self.with_state(scope, |state| {
             state.reserved = state.reserved.saturating_add(contribution);
-        });
-        Reservation {
-            scope: scope.to_string(),
-            contribution,
-        }
+            Reservation {
+                scope: scope.to_string(),
+                contribution,
+            }
+        })
     }
 
     fn force_reserve_checked(
@@ -221,7 +303,7 @@ impl LedgerStore for Ledger {
         scope: &str,
         contribution: u64,
         budget: u64,
-    ) -> (Reservation, bool) {
+    ) -> Option<(Reservation, bool)> {
         self.with_state(scope, |state| {
             state.reserved = state.reserved.saturating_add(contribution);
             let breached = state.total() > budget;
@@ -235,30 +317,40 @@ impl LedgerStore for Ledger {
         })
     }
 
+    // A reservation's scope always exists: it holds `reserved > 0` (or was
+    // created by the reserve that issued it), so it is never idle and never
+    // evicted while the reservation is outstanding.
     fn commit(&self, reservation: Reservation) {
-        self.with_state(&reservation.scope, |state| {
+        self.with_existing(&reservation.scope, |state| {
             state.reserved = state.reserved.saturating_sub(reservation.contribution);
             state.committed = state.committed.saturating_add(reservation.contribution);
         });
     }
 
     fn release(&self, reservation: Reservation) {
-        self.with_state(&reservation.scope, |state| {
+        self.with_existing(&reservation.scope, |state| {
             state.reserved = state.reserved.saturating_sub(reservation.contribution);
         });
     }
 
-    fn record(&self, scope: &str, contribution: u64) {
+    fn record(&self, scope: &str, contribution: u64) -> bool {
         self.with_state(scope, |state| {
             state.committed = state.committed.saturating_add(contribution);
-        });
+        })
+        .is_some()
     }
 
     fn snapshot(&self, scope: &str) -> Snapshot {
-        self.with_state(scope, |state| Snapshot {
-            committed: state.committed,
-            reserved: state.reserved,
-        })
+        self.lock()
+            .get(scope)
+            .map(|state| Snapshot {
+                committed: state.committed,
+                reserved: state.reserved,
+            })
+            .unwrap_or(Snapshot {
+                committed: 0,
+                reserved: 0,
+            })
     }
 }
 
@@ -300,7 +392,8 @@ mod test {
         // this ledger), but 2400 + 800 = 3200 > 3000 — refused.
         let denial = ledger
             .reserve(scope, CAP_CONTRIBUTION, CAP_BUDGET)
-            .expect_err("fourth session composes past the aggregate budget");
+            .expect_err("fourth session composes past the aggregate budget")
+            .over_budget();
         assert_eq!(denial.current_total, 2400);
         assert_eq!(denial.would_be_total, 3200);
         assert_eq!(denial.budget, CAP_BUDGET);
@@ -553,7 +646,7 @@ mod test {
     #[test]
     fn force_reserve_always_succeeds_even_over_a_notional_budget() {
         let ledger = Ledger::new();
-        let reservation = ledger.force_reserve("s", 10_000);
+        let reservation = ledger.force_reserve("s", 10_000).unwrap();
         assert_eq!(ledger.snapshot("s").reserved, 10_000);
         ledger.commit(reservation);
         assert_eq!(ledger.snapshot("s").committed, 10_000);
@@ -562,7 +655,7 @@ mod test {
     #[test]
     fn force_reserve_checked_reports_no_breach_when_within_budget() {
         let ledger = Ledger::new();
-        let (reservation, breached) = ledger.force_reserve_checked("s", 500, 1000);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 500, 1000).unwrap();
         assert!(!breached);
         assert_eq!(ledger.snapshot("s").reserved, 500);
         ledger.commit(reservation);
@@ -573,7 +666,7 @@ mod test {
         let ledger = Ledger::new();
         // Never denies (monitor-mode primitive), but must still truthfully
         // report that this reservation pushed the scope over budget.
-        let (reservation, breached) = ledger.force_reserve_checked("s", 1500, 1000);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 1500, 1000).unwrap();
         assert!(breached);
         assert_eq!(
             ledger.snapshot("s").reserved,
@@ -587,12 +680,12 @@ mod test {
     #[test]
     fn force_reserve_checked_breach_reflects_prior_committed_exposure_too() {
         let ledger = Ledger::new();
-        let first = ledger.force_reserve_checked("s", 800, 1000);
+        let first = ledger.force_reserve_checked("s", 800, 1000).unwrap();
         assert!(!first.1);
         ledger.commit(first.0);
         // 800 committed + 300 more reserved = 1100 > 1000: a breach, even
         // though this second call's OWN amount is well within budget alone.
-        let (reservation, breached) = ledger.force_reserve_checked("s", 300, 1000);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 300, 1000).unwrap();
         assert!(breached);
         ledger.commit(reservation);
     }
@@ -603,7 +696,7 @@ mod test {
         // actually landed upstream should not count against the running total,
         // even though force_reserve never denies up front.
         let ledger = Ledger::new();
-        let reservation = ledger.force_reserve("s", 500);
+        let reservation = ledger.force_reserve("s", 500).unwrap();
         ledger.release(reservation);
         assert_eq!(
             ledger.snapshot("s"),
@@ -660,7 +753,7 @@ mod test {
     #[test]
     fn a_call_one_unit_over_budget_is_denied() {
         let ledger = Ledger::new();
-        let denial = ledger.reserve("s", 1001, 1000).unwrap_err();
+        let denial = ledger.reserve("s", 1001, 1000).unwrap_err().over_budget();
         assert_eq!(denial.would_be_total, 1001);
     }
 
@@ -725,7 +818,10 @@ mod test {
         let ledger = Ledger::new();
         let reservation = ledger.reserve("agent:z", 700, 1000).unwrap();
         ledger.commit(reservation);
-        let denial = ledger.reserve("agent:z", 400, 1000).unwrap_err();
+        let denial = ledger
+            .reserve("agent:z", 400, 1000)
+            .unwrap_err()
+            .over_budget();
         assert_eq!(denial.scope, "agent:z");
         assert_eq!(denial.contribution, 400);
         assert_eq!(denial.current_total, 700);
@@ -761,7 +857,10 @@ mod test {
     fn an_overflowing_sum_is_denied_rather_than_wrapping() {
         let ledger = Ledger::new();
         ledger.record("s", u64::MAX - 1);
-        let denial = ledger.reserve("s", 10, u64::MAX - 1).unwrap_err();
+        let denial = ledger
+            .reserve("s", 10, u64::MAX - 1)
+            .unwrap_err()
+            .over_budget();
         assert_eq!(
             denial.would_be_total,
             u64::MAX,
@@ -774,7 +873,7 @@ mod test {
     fn force_reserve_checked_saturates_and_reports_the_breach() {
         let ledger = Ledger::new();
         ledger.record("s", u64::MAX);
-        let (reservation, breached) = ledger.force_reserve_checked("s", 5, 1000);
+        let (reservation, breached) = ledger.force_reserve_checked("s", 5, 1000).unwrap();
         assert!(breached);
         assert_eq!(ledger.snapshot("s").total(), u64::MAX);
         ledger.release(reservation);
@@ -791,5 +890,66 @@ mod test {
                 reserved: 0
             }
         );
+    }
+
+    #[test]
+    fn snapshot_of_an_unknown_scope_does_not_start_tracking_it() {
+        let ledger = Ledger::with_max_scopes(1);
+        ledger.snapshot("probe");
+        assert_eq!(ledger.scope_count(), 0);
+    }
+
+    #[test]
+    fn a_full_ledger_refuses_a_new_scope_when_no_scope_is_idle() {
+        let ledger = Ledger::with_max_scopes(2);
+        let a = ledger.reserve("a", 10, 100).unwrap();
+        ledger.commit(a);
+        let _in_flight = ledger.reserve("b", 10, 100).unwrap();
+        assert!(matches!(
+            ledger.reserve("c", 10, 100),
+            Err(Refusal::AtCapacity)
+        ));
+        assert!(ledger.force_reserve_checked("c", 10, 100).is_none());
+        assert!(!ledger.record("c", 10));
+        assert_eq!(ledger.scope_count(), 2);
+        // Neither live scope lost its state to make room.
+        assert_eq!(ledger.snapshot("a").committed, 10);
+        assert_eq!(ledger.snapshot("b").reserved, 10);
+    }
+
+    #[test]
+    fn a_full_ledger_evicts_only_an_idle_scope() {
+        let ledger = Ledger::with_max_scopes(2);
+        let a = ledger.reserve("a", 10, 100).unwrap();
+        ledger.commit(a);
+        // "b" reserved then released: zero committed, zero reserved — idle.
+        let b = ledger.reserve("b", 10, 100).unwrap();
+        ledger.release(b);
+        assert!(ledger.reserve("c", 10, 100).is_ok());
+        assert_eq!(ledger.scope_count(), 2);
+        assert_eq!(ledger.snapshot("a").committed, 10, "live scope kept");
+        assert_eq!(ledger.snapshot("b").total(), 0);
+    }
+
+    #[test]
+    fn an_already_tracked_scope_is_never_refused_for_capacity() {
+        let ledger = Ledger::with_max_scopes(1);
+        let first = ledger.reserve("a", 10, 100).unwrap();
+        ledger.commit(first);
+        assert!(ledger.reserve("a", 10, 100).is_ok());
+    }
+
+    #[test]
+    fn commit_and_release_on_an_untracked_scope_do_not_create_it() {
+        let ledger = Ledger::with_max_scopes(1);
+        ledger.commit(Reservation {
+            scope: "ghost".to_string(),
+            contribution: 5,
+        });
+        ledger.release(Reservation {
+            scope: "ghost".to_string(),
+            contribution: 5,
+        });
+        assert_eq!(ledger.scope_count(), 0);
     }
 }

@@ -99,9 +99,11 @@ checks the files `make build` generates: a real org UUID in `exchange.json`, `mi
 
 **What this policy reads.** On the request, exactly two things, both from the JSON-RPC body: the
 envelope's `id`(s) (to echo the caller's own id on a `rpc-error` denial) and, when
-`contribution=spend-amount`, the integer value at `spendAmountField`. Alongside those, it reads the
-one identity header configured by `scopeHeader` (for `agent`/`tenant` budget scope). It never reads
-any other header, the query string, or the request/response path. **On the response, it reads
+`contribution=spend-amount`, the integer value at `spendAmountField`. Alongside those, for
+`agent`/`tenant` budget scope, it reads the call's identity: by default the verified
+`AuthenticationData` an upstream authentication policy attached (see Identity below), or, only when
+`identitySource=trusted-header`, the one header named by `scopeHeader`. It never reads any other
+header, the query string, or the request/response path. **On the response, it reads
 nothing but headers** — the status code (to decide commit vs. release) — and never the response
 body; see the `contribution` and Honesty boundaries sections below for why an
 `estimated-token-weight` reservation settles at its own pre-flight estimate rather than a real usage figure.
@@ -141,8 +143,13 @@ with one `-32008` error per id, echoing every id in the batch.
 
 | Field | Type | Default | Purpose |
 |---|---|---|---|
-| `budgetScope` | `agent`\|`fabric`\|`tenant` | `agent` | The aggregation dimension. `agent`/`tenant` — one running total per identity value read from `scopeHeader` (a broker session's fleet, or a tenant/org). `fabric` — one running total shared across every request this instance sees, ignoring `scopeHeader`. Ledger key is `"<budgetScope>:<value>"` (`fabric` uses a fixed value). |
-| `scopeHeader` | string | `x-agent-id` | Request header carrying the identity value used to key the ledger when `budgetScope` is `agent` or `tenant`. Ignored for `fabric`. Missing when required: fails closed in `block` mode; recorded under a fixed `(missing)` key in `monitor` mode so the gap is visible rather than silently dropped. |
+| `budgetScope` | `agent`\|`fabric`\|`tenant` | `agent` | The aggregation dimension. `agent`/`tenant` — one running total per canonical identity (see Identity below). `fabric` — one running total shared across every request this instance sees, ignoring identity. Ledger key is `"<budgetScope>:<canonical identity>"` (`fabric` uses a fixed value). |
+| `identitySource` | `authentication`\|`trusted-header` | `authentication` | Where the identity comes from. `authentication` — the verified `AuthenticationData` set by an authentication policy (Client ID Enforcement, JWT Validation, OAuth introspection) that runs **before** this one. `trusted-header` — the `scopeHeader` value, which this policy cannot verify; use it only behind a chain that strips and re-injects that header (see Identity below). Ignored for `fabric`. |
+| `identityField` | `client_id`\|`principal`\|`properties.<path>` | `client_id` | Which `AuthenticationData` field identifies the caller when `identitySource=authentication`. `properties.<path>` reads a dot path into the authentication properties (for example a JWT claim); the value must be a string. |
+| `scopeHeader` | string | `x-agent-id` | Header carrying the identity when `identitySource=trusted-header`; must be non-blank in that mode, ignored otherwise. Matched case-insensitively. A header sent more than once is invalid. |
+| `maxScopes` | integer, `1`–`1000000` | `10000` | Most scopes the ledger tracks at once. At the cap a new scope may evict one idle scope (nothing committed or reserved). If none is idle the call is denied in `block` mode with `reason=scope-capacity`, or forwarded in `monitor` mode with that reason stamped. Live totals are never evicted. |
+| `scopeDisclosure` | `digest`\|`none`\|`raw` | `digest` | How the scope appears in `resultHeader` and denial messages. `digest` — `<budgetScope>:hmac-<16 hex>` (HMAC-SHA256 under `scopeDigestKey`, first 8 bytes), or `sha256-…` when no key is set. `none` — just `<budgetScope>`. `raw` — the canonical identity itself; only for trusted, internal consumers. |
+| `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest`. Without a key the digest is a plain SHA-256, which anyone holding a candidate identity can recompute. Set a key when identities are guessable. |
 | `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
 | `window` | string | `rolling-24h` | The accounting window `aggregateBudget` nominally applies to. **Accepted but not enforced at Stage A** — see Honesty boundaries below; the ledger accumulates for the life of the gateway worker process, not a real window. |
 | `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Honesty boundaries below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
@@ -153,14 +160,19 @@ with one `-32008` error per id, echoing every id in the batch.
 | `ledgerEndpoint` | string | `""` | **Reserved for Stage B, NOT implemented.** Accepted and validated (a non-empty value is logged as a forward-compatibility notice) but every decision in this build is made by the in-process Stage A ledger regardless of this value. Leave empty. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
-| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:broker-7;would-be-total=3200;budget=3000;unit=points`. Unpriceable and out-of-range calls carry `reason=unpriceable` / `reason=out-of-range` instead of totals. Never carries other sessions' call content — only the scope key and numeric totals — so it is safe to forward to downstream logging, SIEM, or a Kill Switch without a further redaction pass. |
+| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `unpriceable`, or `out-of-range`. Never carries other sessions' call content, and by default never the raw identity. |
 
 ```yaml
 - policyRef:
     name: aggregate-risk-gate-v1-0-impl
   config:
     budgetScope: agent
+    identitySource: authentication
+    identityField: client_id
     scopeHeader: x-agent-id
+    maxScopes: 10000
+    scopeDisclosure: digest
+    scopeDigestKey: ""        # set from a secret; see scopeDigestKey above
     aggregateBudget: 3000
     window: rolling-24h
     contribution: fixed-weight
@@ -175,21 +187,61 @@ with one `-32008` error per id, echoing every id in the batch.
 ```
 
 Reproducing the reference scenario against this config: five 800-unit calls from the same
-`x-agent-id` — the first three commit (running total 2400/3000); the fourth is refused in-band
-as a JSON-RPC `-32008` error naming a would-be total of 3200/3000; the fifth is refused the same
-way. A different `x-agent-id` gets its own independent 3000-unit budget.
+authenticated client (`client_id` `broker-7` in the stamps below; with `scopeDigestKey` empty the
+digest is the first 8 bytes of SHA-256 over `agent:broker-7`) — the first three commit (running total 2400/3000); the fourth is refused
+in-band as a JSON-RPC `-32008` error naming a would-be total of 3200/3000; the fifth is refused the
+same way. A different client gets its own independent 3000-unit budget. Changing a request header
+does not: the header is not an identity in this mode.
 
 On the fourth (denied) call above, the client-facing response carries, e.g.
-`x-aggregate-risk-gate: denied;scope=agent:broker-7;would-be-total=3200;budget=3000;unit=points`. On
+`x-aggregate-risk-gate: denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points`. On
 an allowed call it instead carries, e.g.
-`x-aggregate-risk-gate: allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points`.
-Neither format carries another session's call content — only the scope key and the numeric
-totals — so both are safe to forward downstream to logging, SIEM, or a Kill Switch without a
-further redaction pass. At policy start-up the gateway log separately carries a plain diagnostic
+`x-aggregate-risk-gate: allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points`.
+Neither format carries another session's call content or the raw identity — only a stable
+digest and the numeric totals — so both are safe to forward downstream to logging, SIEM, or a
+Kill Switch. The gateway log never carries an identity. At policy start-up the gateway log separately carries a plain diagnostic
 line naming the armed configuration, e.g.
 `Aggregate Risk Gate armed: budgetScope=agent, aggregateBudget=3000, contribution=fixed-weight, mode=block`
 — a one-time informational line, not a per-call structured event; the `resultHeader` above is the
 per-call decision record.
+
+## Identity
+
+The budget is only as strong as the identity it is keyed on. If a caller can pick its own
+identity, it can mint a fresh budget per call. So by default (`identitySource=authentication`) the
+identity is the verified `AuthenticationData` that an authentication policy earlier in the chain
+attached. Client ID Enforcement sets `client_id`; JWT Validation and OAuth introspection set
+`principal` and `properties`. **Order the authentication policy before this one.** With no
+authentication data the call is `missing-identity`: denied in `block` mode.
+
+`identitySource=trusted-header` keys on `scopeHeader` instead. This policy cannot verify a header,
+so this mode is safe only when the chain in front of it guarantees the value:
+
+1. a header-removal policy strips any client-sent `scopeHeader`, then
+2. a policy that has verified the caller (for example a DataWeave headers transformation reading
+   the authentication data) injects it, then
+3. this policy runs.
+
+Without that chain any client can set the header, and the budget is advisory.
+
+Every identity is canonicalized before it keys the ledger: leading and trailing spaces and tabs
+are trimmed and ASCII letters are lowercased, so `Broker-7`, `broker-7` and ` BROKER-7 ` share one
+budget. Case folding can only merge budgets, never split one. An identity is `invalid-identity`
+when it is longer than 256 bytes, contains anything outside visible ASCII, or contains a stamp
+delimiter (`,` `;` `=` `"` `\`). A trusted header sent more than once, in any letter case, is also
+invalid. An authentication property that is not a string is invalid. In `block` mode both
+`missing-identity` and `invalid-identity` deny. In `monitor` mode the call is priced under one
+fixed bucket per failure, `<budgetScope> (missing)` or `<budgetScope> (invalid)`; no canonical
+identity contains a space, so these never collide with a real scope.
+
+`maxScopes` bounds the ledger's memory. A flood of distinct identities cannot grow it past the cap,
+and the cap cannot be used to reset someone else's total, because only idle scopes are evicted.
+Idle scopes hold nothing committed or reserved. Time-based expiry of committed exposure is tied to
+`window` and is out of scope here.
+
+**Breaking change.** Earlier builds always keyed on `scopeHeader`. A config that relies on that
+must now set `identitySource: trusted-header` and, to keep raw scopes in the result header,
+`scopeDisclosure: raw`.
 
 ## Units
 
@@ -248,10 +300,10 @@ here**. Do not present this build as shipping it.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 88 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 116 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 28 tests): correctness of
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 33 tests): correctness of
   `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
@@ -263,14 +315,22 @@ Docker:
   tests, and every other test in this file, are never weakened or skipped — they are the correctness
   proof this whole policy exists to make. Three more cover exact integer units: small contributions
   land exactly on the budget, an overflowing sum is denied rather than wrapping, and a forced
-  reservation saturates and still reports the breach.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (35 tests,
+  reservation saturates and still reports the breach. Five cover the scope cap: a full ledger refuses a
+  new scope when none is idle and keeps live totals, evicts only an idle scope, never refuses an
+  already-tracked scope, and neither `snapshot` nor a stray `commit`/`release` creates a scope.
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (43 tests,
   from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
   unpriceable and estimate-then-settle edge cases, independent per-scope budgets, the missing-
-  scope-header path in both modes, and that the `resultHeader` stamp lands on the client-facing
+  identity path in both modes, and that the `resultHeader` stamp lands on the client-facing
   response (not the upstream request) in both the allow and deny paths. Also:
+  - **Identity** — a spoofed, rotating scope header does not mint a fresh budget under
+    `authentication`; missing authentication fails closed; oversized, delimiter-bearing and
+    space-bearing identities are denied as invalid; case and whitespace variants share one budget;
+    a duplicated trusted header is invalid; the default stamp never echoes the raw identity; and
+    the scope cap denies a new identity in `block` mode (keeping existing budgets) and stamps it in
+    `monitor` mode.
   - **Batch (array) accounting** — an over-budget batch is denied atomically with one `-32008`
     error per id (`an_over_budget_batch_is_denied_atomically_with_one_error_per_id`), a
     within-budget batch commits the FULL per-item contribution
@@ -294,10 +354,15 @@ Docker:
     out of range, and so are spend-amount and fixed-weight batches whose total overflows. Monitor
     mode forwards those calls and stamps `reason=out-of-range`. 10 + 20 minor units land exactly
     on a budget of 30, which a float ledger gets wrong. `spendCurrency` is stamped as the unit.
-- **Direct `Gate::from_config` validation tests** (21): every config-validation rejection path
+- **Direct identity tests** (10): trimming, case folding, the 256-byte limit and the character
+  rules in `canonical_identity`; duplicate and mixed-case trusted headers; `client_id`,
+  `principal` and `properties.<path>` selection (a non-string property is invalid); and
+  `digest` (keyed and unkeyed), `none` and `raw` display.
+- **Direct `Gate::from_config` validation tests** (26): every config-validation rejection path
   (invalid enum values including `window`, negative or above-2^53 − 1 amounts, a fractional
   amount refused by deserialization, the retired `token-cost` name rejected with its replacement
-  named, a malformed `spendCurrency`, blank required strings) and the corresponding accepted
+  named, a malformed `spendCurrency`, blank required strings, an unknown `identitySource`,
+  `identityField` or `scopeDisclosure`, and `maxScopes` outside `1`–`1000000`) and the corresponding accepted
   cases.
 - **`dot_path_value` unit tests** (4): the dotted-path body reader used for `spend-amount`.
 

@@ -27,25 +27,81 @@ spec:
         - tenant
       description: >-
         The aggregation dimension the ledger keys on. "agent" — one running
-        total per identity value read from scopeHeader (e.g. one broker
-        session's fleet). "fabric" — one running total shared across every
-        request this policy instance sees, ignoring scopeHeader (the whole
-        fronted fabric shares one budget). "tenant" — one running total per
-        value read from scopeHeader, intended for a tenant/org identifier
-        rather than a per-agent one; the mechanics are identical to "agent",
-        only the intended header semantics differ. The concrete ledger key is
-        "<budgetScope>:<value>" ("fabric" uses a fixed value since it has no
-        per-identity header).
+        total per verified agent identity (see identitySource). "tenant" — the
+        same mechanics, intended for a tenant/org identity rather than a
+        per-agent one. "fabric" — one running total shared by every request
+        this policy instance sees; no identity is read. The ledger key is
+        "<budgetScope>:<canonical identity>", or "fabric:*".
+    identitySource:
+      type: string
+      default: authentication
+      enum:
+        - authentication
+        - trusted-header
+      description: >-
+        Where the agent/tenant identity comes from. "authentication" (default)
+        reads verified PDK authentication data set by an authentication policy
+        that runs BEFORE this one (Client ID Enforcement, JWT Validation,
+        OAuth 2.0 introspection), so a caller cannot choose or rotate its own
+        budget. A request with no verified identity fails closed in block
+        mode. "trusted-header" reads scopeHeader instead. Use it only when an
+        earlier policy in the chain removes any caller-supplied copy of that
+        header and injects the trusted identity (see the policy README). This
+        policy cannot verify that the chain is in place. A request carrying the
+        header more than once is refused as ambiguous.
+    identityField:
+      type: string
+      default: client_id
+      description: >-
+        With identitySource "authentication", which verified field names the
+        identity. "client_id", "principal", or "properties.<dot.path>" for a
+        string claim the authentication policy exposes (e.g.
+        "properties.claims.tenant_id"). Ignored otherwise.
     scopeHeader:
       type: string
       default: x-agent-id
       description: >-
-        Request header carrying the identity value used to key the ledger when
-        budgetScope is "agent" or "tenant". Ignored when budgetScope is
-        "fabric". A request missing this header when it is required fails
-        closed in block mode (denied, onDeny applies) and is recorded under a
-        fixed "(missing)" key in monitor mode so the gap is visible on
-        dashboards rather than silently dropped.
+        With identitySource "trusted-header", the request header carrying the
+        trusted identity for "agent" or "tenant" budgetScope. Ignored
+        otherwise.
+    maxScopes:
+      type: integer
+      default: 10000
+      minimum: 1
+      maximum: 1000000
+      description: >-
+        The most scopes the ledger tracks at once. Identities are canonicalized
+        first (surrounding spaces/tabs trimmed, ASCII lowercased) and must be 1
+        to 256 visible ASCII characters with no comma, semicolon, equals sign,
+        quote, or backslash. Anything else fails closed in block mode with
+        reason=invalid-identity. At the cap, a new scope evicts an idle scope
+        (nothing committed or reserved). If every tracked scope holds exposure,
+        the new scope is refused with reason=scope-capacity. Live enforcement
+        state is never evicted.
+    scopeDisclosure:
+      type: string
+      default: digest
+      enum:
+        - digest
+        - none
+        - raw
+      description: >-
+        How the scope appears in resultHeader and denial messages. "digest"
+        (default) shows "<budgetScope>:hmac-<16 hex>" (or "sha256-" when
+        scopeDigestKey is empty), a stable pseudonym. "none" shows only the
+        budgetScope. "raw" shows the canonical identity itself; use it only
+        when identities are not sensitive. The policy never logs identities.
+    scopeDigestKey:
+      type: string
+      default: ""
+      "@context":
+        "@characteristics":
+          - "security:sensitive"
+      description: >-
+        Secret key for the "digest" scopeDisclosure (HMAC-SHA256). With a key,
+        a client cannot confirm a guessed identity from its digest. When empty,
+        an unkeyed SHA-256 is used, which hides the value but lets anyone who
+        can guess an identity confirm it.
     aggregateBudget:
       type: integer
       default: 3000
@@ -195,9 +251,11 @@ spec:
         "allowed;scope=agent:broker-7;contribution=800;total=2400/3000;unit=points"
         or "monitor;scope=...;contribution=...;total=.../..."; on a block-mode
         denial, e.g. "denied;scope=agent:broker-7;would-be-total=3200;
-        budget=3000;unit=points" (or "reason=missing-scope-header",
+        budget=3000;unit=points" (or "reason=missing-identity",
+        "reason=invalid-identity", "reason=scope-capacity",
         "reason=unpriceable", or "reason=out-of-range" for the non-budget deny
-        reasons). All amounts are exact integers; unit is "points"
+        reasons). The scope is shown per scopeDisclosure; the examples use
+        "raw". All amounts are exact integers; unit is "points"
         (fixed-weight), "estimated-tokens" (estimated-token-weight), or
         "<spendCurrency>-minor" such as "USD-minor" (spend-amount). Never carries other sessions'
         call content — only the scope key and the numeric totals — so it is
@@ -205,7 +263,12 @@ spec:
         further redaction pass.
   required:
     - budgetScope
+    - identitySource
+    - identityField
     - scopeHeader
+    - maxScopes
+    - scopeDisclosure
+    - scopeDigestKey
     - aggregateBudget
     - window
     - contribution

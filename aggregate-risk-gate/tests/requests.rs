@@ -49,7 +49,15 @@ fn policy_config(scope_header: &str) -> PolicyConfig {
         .name(POLICY_NAME)
         .configuration(serde_json::json!({
             "budgetScope": "agent",
+            // This test API has no authentication policy in front of the gate,
+            // so it opts into a trusted header. A production chain must strip
+            // and re-inject that header (see the README's identity section).
+            "identitySource": "trusted-header",
+            "identityField": "client_id",
             "scopeHeader": scope_header,
+            "maxScopes": 10000,
+            "scopeDisclosure": "raw",
+            "scopeDigestKey": "",
             "aggregateBudget": 3000,
             "window": "rolling-24h",
             "contribution": "fixed-weight",

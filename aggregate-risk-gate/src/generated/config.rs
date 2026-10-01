@@ -11,14 +11,24 @@ pub struct Config {
     pub estimated_tokens: i64,
     #[serde(alias = "fixedWeight")]
     pub fixed_weight: i64,
+    #[serde(alias = "identityField")]
+    pub identity_field: String,
+    #[serde(alias = "identitySource")]
+    pub identity_source: String,
     #[serde(alias = "ledgerEndpoint")]
     pub ledger_endpoint: String,
+    #[serde(alias = "maxScopes")]
+    pub max_scopes: i64,
     #[serde(alias = "mode")]
     pub mode: String,
     #[serde(alias = "onDeny")]
     pub on_deny: String,
     #[serde(alias = "resultHeader")]
     pub result_header: String,
+    #[serde(alias = "scopeDigestKey")]
+    pub scope_digest_key: String,
+    #[serde(alias = "scopeDisclosure")]
+    pub scope_disclosure: String,
     #[serde(alias = "scopeHeader")]
     pub scope_header: String,
     #[serde(alias = "spendAmountField")]

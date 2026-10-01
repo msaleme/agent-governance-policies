@@ -58,6 +58,7 @@ name = "aggregate_risk_gate"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "hmac",
  "httpmock",
  "pdk",
  "pdk-test",
@@ -65,6 +66,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
