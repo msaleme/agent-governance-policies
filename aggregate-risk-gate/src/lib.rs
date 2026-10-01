@@ -47,10 +47,7 @@ fn deny_response(result_header: &str, stamp: &str) -> Response {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Mode {
-    Block,
-    Monitor,
-}
+enum Contribution { TokenCost, SpendAmount, FixedWeight }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Contribution {
