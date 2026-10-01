@@ -77,8 +77,11 @@ excludes all Flex identity material). No further visibility action is required t
 
 ### 2. Cross-Session Aggregate-Risk Gate
 - **Project path:** `/aggregate-risk-gate` (point the wizard at `/tree/main/aggregate-risk-gate`)
-- **Category / injection point / scope:** Security / inbound / `api,resource` → applicability **MCP + A2A + LLM-proxy**
-- **Catalog copy:** use `definition/gcl.yaml` `metadata.labels.description` verbatim. One-line hook:
+- **Category / injection point / scope:** Security / inbound / `api,resource`; `metadata/capabilities/assetTypes: mcp` → applicability **MCP only**.
+- **Dropped targets:** an earlier draft also listed agent-to-agent and model-proxy instances; neither has
+  test coverage, so neither is declared (P4A review #16).
+- **Catalog copy:** use `definition/gcl.yaml` `metadata.labels.description` verbatim (≤256 chars; the full
+  explanation lives in the policy README). One-line hook:
   *"Reserve-then-authorize aggregate-exposure control: refuses the individually-valid call that composes
   past a budget no per-call gate ever sees."*
 - **Config surface:** budgetScope(agent|fabric|tenant) / scopeHeader / aggregateBudget / window
@@ -97,7 +100,7 @@ excludes all Flex identity material). No further visibility action is required t
    supported, but **submit and validate each project explicitly** — one root URL does not guarantee
    auto-discovery of both.
 3. Set catalog copy from each policy's `gcl.yaml` description + the one-line hook above.
-4. Set applicability (MCP/A2A/API-LLM as noted per policy).
+4. Set applicability to **MCP** for both policies (each declares `assetTypes: mcp`).
 5. Submit; reviewer **Tommaso Bolis** runs the same review loop the three decoy policies went through.
    His findings #1–#7 on approval-execution-binding are **resolved and merged to `main`** (PR #19, plus
    publish/build fixes #23 and #26; per-finding resolution table above), and the policy has been

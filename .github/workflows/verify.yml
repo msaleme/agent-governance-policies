@@ -39,3 +39,59 @@ jobs:
           done
       # Runtime suites require separately authorized disposable Flex registrations.
       # No registration or platform credentials are supplied to this workflow.
+
+  # Full PDK packaging path from a clean checkout: generate the definition and
+  # implementation assets exactly as `make build` / `make release` would, prove
+  # src/generated/config.rs is in sync with gcl.yaml, reject placeholder or
+  # invalid Exchange metadata, and keep the generated files as an artifact.
+  # ANYPOINT_GROUP_ID is a repository *variable* (an org UUID, not a secret);
+  # Cargo.toml keeps its placeholder and is only rewritten inside this job.
+  exchange-assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        policy: [approval-execution-binding, aggregate-risk-gate]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install pinned PDK tooling
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal \
+            --component rustfmt --component clippy --target wasm32-wasip1
+          npm install -g anypoint-cli-v4-public@1.6.27
+          anypoint-cli-v4 plugins:install anypoint-pdk-plugin@1.9.0
+          cargo +1.89.0 install --locked cargo-anypoint@1.10.0
+          python3 -c "import yaml"
+      - name: Generate assets
+        shell: bash
+        env:
+          ANYPOINT_GROUP_ID: ${{ vars.ANYPOINT_GROUP_ID }}
+        working-directory: ${{ matrix.policy }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${ANYPOINT_GROUP_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::Repository variable ANYPOINT_GROUP_ID must be the owning Anypoint org UUID"
+            exit 1
+          fi
+          sed -i "s/REPLACE_WITH_YOUR_ANYPOINT_ORG_ID/${ANYPOINT_GROUP_ID}/" Cargo.toml
+          make build
+          git checkout -- Cargo.toml
+          git diff --exit-code -- src/generated/config.rs
+      - name: Validate Exchange metadata
+        run: python3 scripts/check_exchange_metadata.py ${{ matrix.policy }} --assets
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exchange-assets-${{ matrix.policy }}
+          if-no-files-found: error
+          path: |
+            ${{ matrix.policy }}/target/implementation/
+            ${{ matrix.policy }}/target/implementation-dev/
+            ${{ matrix.policy }}/target/wasm32-wasip1/release/*.wasm
+            ${{ matrix.policy }}/target/wasm32-wasip1/release/*_definition.yaml
+            ${{ matrix.policy }}/target/wasm32-wasip1/release/*_implementation.yaml
