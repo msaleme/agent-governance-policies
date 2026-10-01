@@ -115,6 +115,17 @@ publication are included.
   settlement that isn't on time logs the ledger counters, with no identities. A worker restart still
   resets the in-memory ledger. That is now documented and tested. **Breaking:** the allowed/monitor
   `resultHeader` format gains the trailing `settlement=` field.
+- **Cross-Session Aggregate-Risk Gate** — `window` is enforced, and the claims match a per-worker
+  ledger (issue #15). `window: fixed-period` now resets every scope's committed total at each
+  `windowMs` boundary (new field, default 86400000, range 60000–31622400000), counted from the Unix
+  epoch on the gateway clock. In-flight reservations carry across a boundary and settle in the new
+  period, and a clock stepping backwards never resets a total. The new `window: worker-lifetime`
+  never resets. The unimplemented `ledgerEndpoint` field is removed. The README, GCL and P4A text now
+  say the budget is per policy instance per gateway worker: `N` workers admit up to
+  `N × aggregateBudget`, and a restart resets the ledger. A shared, durable ledger is future (v2)
+  work. **Breaking:** `window: rolling-24h` (the old default) never rolled and is now rejected with
+  its replacements named, the default is now `fixed-period` with a 24-hour window, and a config that
+  sets `ledgerEndpoint` must drop it.
 
 ### Known limitations
 
@@ -134,9 +145,9 @@ publication are included.
   to the policy, so that branch is exercised only with a shared/remote store. A
   shared/remote store is the single change that would close both: it makes single-use
   global across replicas and makes the storage-unavailable branch reachable.
-- The aggregate-risk gate ships the Stage A in-process ledger only: per-worker
-  (not distributed) state, `window` accepted but not time-enforced, `ledgerEndpoint`
-  reserved and unimplemented, and no cryptographic non-repudiation of decisions.
+- The aggregate-risk gate's ledger is in-process: one budget per policy instance per
+  gateway worker (not shared across workers or replicas), reset by a restart, and with
+  no cryptographic non-repudiation of decisions.
   Reference concurrency scenarios are synthetic, not production telemetry.
 - Inspection targets admitted JSON-RPC envelopes and bodies, not paths, query
   strings, or arbitrary headers. Local tests do not establish general MCP

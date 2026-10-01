@@ -28,14 +28,12 @@
 // counter authorizes all five under concurrency, while reserve-then-authorize
 // admits exactly three (2,400) and refuses the other two.
 //
-// Honesty boundary (Stage A / Stage B — see also the gcl.yaml field docs and
-// README): this build ships Stage A, a real, correct, exhaustively tested
-// in-process reserve-then-authorize engine — but it is scoped to a single
-// gateway worker's in-memory ledger, not a distributed, multi-region, or
-// replay-consistent store, and it makes no cryptographic non-repudiation claim
-// about its decisions. A distributed Stage B ledger with signed decision records
-// is unshipped roadmap work; the `ledgerEndpoint` config field is reserved for it
-// and does nothing in this build.
+// Scope of the guarantee (see also the gcl.yaml field docs and README): a real,
+// correct, exhaustively tested in-process reserve-then-authorize engine, with
+// one ledger per policy instance per gateway worker. It is not shared across
+// workers or replicas, a restart resets it, and it makes no cryptographic
+// non-repudiation claim about its decisions. A shared, durable ledger with
+// signed decision records is future work (v2).
 //
 // NIST SP 800-53 Rev 5: AC-6 (Least Privilege / aggregate exposure), SI-4
 // (Monitoring), AU-6 (Audit Review — the running-total resultHeader).
@@ -386,7 +384,7 @@ fn config_units(name: &str, value: i64) -> Result<u64> {
 
 /// Compiled, validated policy state, built once at configuration time and
 /// shared (by reference) across every exchange this instance governs. Owns the
-/// Stage A ledger described in the module doc comment.
+/// per-worker ledger described in the module doc comment.
 struct Gate {
     budget_scope: String,
     identity_source: IdentitySource,
@@ -445,11 +443,23 @@ impl Gate {
                 ))
             }
         };
-        match config.window.as_str() {
-            "rolling-24h" | "fixed-period" => {}
+        let window = match config.window.as_str() {
+            "fixed-period" => Some(
+                u64::try_from(config.window_ms)
+                    .ok()
+                    .filter(|ms| (60_000..=31_622_400_000).contains(ms))
+                    .ok_or_else(|| anyhow!("windowMs must be between 60000 and 31622400000"))?,
+            ),
+            "worker-lifetime" => None,
+            "rolling-24h" => {
+                return Err(anyhow!(
+                    "window \"rolling-24h\" was removed: it never rolled. Use \"fixed-period\" \
+                     with windowMs 86400000 for a daily budget, or \"worker-lifetime\""
+                ))
+            }
             other => {
                 return Err(anyhow!(
-                    "window must be rolling-24h or fixed-period, got {other:?}"
+                    "window must be fixed-period or worker-lifetime, got {other:?}"
                 ))
             }
         };
@@ -537,25 +547,6 @@ impl Gate {
             return Err(anyhow!("resultHeader must not be blank"));
         }
 
-        if !config.ledger_endpoint.trim().is_empty() {
-            logger::info!(
-                "aggregate-risk-gate: ledgerEndpoint is set but Stage A does not consult an \
-                 external ledger; every decision is made by the in-process store. Ignoring {:?}.",
-                config.ledger_endpoint
-            );
-        }
-
-        // `window` (e.g. "rolling-24h") is accepted-but-not-enforced at Stage A:
-        // reservations expire after reservationTimeoutMs, but committed exposure
-        // never does, so every scope's committed total accumulates for the life of
-        // the gateway worker process, not the configured window. Logged once at
-        // startup so this is visible without reading the gcl.yaml field docs.
-        logger::info!(
-            "aggregate-risk-gate: window={:?} is accepted but not enforced by this Stage A build \
-             (committed exposure never expires; it accumulates for the worker process lifetime).",
-            config.window
-        );
-
         Ok(Self {
             budget_scope,
             identity_source,
@@ -569,7 +560,7 @@ impl Gate {
             mode,
             on_deny,
             result_header,
-            ledger: Ledger::with_limits(max_scopes, reservation_timeout_ms),
+            ledger: Ledger::with_limits(max_scopes, reservation_timeout_ms, window),
         })
     }
 
@@ -1164,13 +1155,13 @@ mod test {
             "scopeDisclosure": "raw",
             "scopeDigestKey": "",
             "aggregateBudget": 3000,
-            "window": "rolling-24h",
+            "window": "fixed-period",
+            "windowMs": 86400000,
             "contribution": "fixed-weight",
             "fixedWeight": 800,
             "spendAmountField": "params.amount",
             "spendCurrency": "USD",
             "estimatedTokens": 500,
-            "ledgerEndpoint": "",
             "mode": "block",
             "onDeny": "rpc-error",
             "resultHeader": "x-aggregate-risk-gate",
@@ -2270,7 +2261,6 @@ mod test {
             fixed_weight: 800,
             identity_field: "client_id".to_string(),
             identity_source: "authentication".to_string(),
-            ledger_endpoint: String::new(),
             max_scopes: 10000,
             reservation_timeout_ms: 60000,
             mode: "block".to_string(),
@@ -2281,7 +2271,8 @@ mod test {
             scope_header: "x-agent-id".to_string(),
             spend_amount_field: "params.amount".to_string(),
             spend_currency: "USD".to_string(),
-            window: "rolling-24h".to_string(),
+            window: "fixed-period".to_string(),
+            window_ms: 86_400_000,
         }
     }
 
@@ -2326,9 +2317,39 @@ mod test {
     }
 
     #[test]
-    fn fixed_period_window_is_accepted() {
+    fn both_window_kinds_are_accepted() {
+        for window in ["fixed-period", "worker-lifetime"] {
+            let mut cfg = valid_config_struct();
+            cfg.window = window.to_string();
+            assert!(Gate::from_config(&cfg).is_ok(), "{}", window);
+        }
+    }
+
+    #[test]
+    fn the_old_rolling_window_name_is_rejected_with_its_replacements() {
         let mut cfg = valid_config_struct();
-        cfg.window = "fixed-period".to_string();
+        cfg.window = "rolling-24h".to_string();
+        let err = Gate::from_config(&cfg).err().unwrap().to_string();
+        assert!(err.contains("fixed-period"), "{}", err);
+        assert!(err.contains("worker-lifetime"), "{}", err);
+    }
+
+    #[test]
+    fn window_ms_must_be_between_one_minute_and_366_days() {
+        for bad in [0, 59_999, -1, 31_622_400_001] {
+            let mut cfg = valid_config_struct();
+            cfg.window_ms = bad;
+            assert!(Gate::from_config(&cfg).is_err(), "windowMs {}", bad);
+        }
+        for good in [60_000, 86_400_000, 31_622_400_000] {
+            let mut cfg = valid_config_struct();
+            cfg.window_ms = good;
+            assert!(Gate::from_config(&cfg).is_ok(), "windowMs {}", good);
+        }
+        // Ignored, so not validated, without a fixed window.
+        let mut cfg = valid_config_struct();
+        cfg.window = "worker-lifetime".to_string();
+        cfg.window_ms = 0;
         assert!(Gate::from_config(&cfg).is_ok());
     }
 
@@ -2506,7 +2527,7 @@ mod test {
 
     #[test]
     fn a_worker_restart_resets_the_in_process_ledger() {
-        // Documented Stage A behavior: the ledger lives in worker memory, so a
+        // Documented behavior: the ledger lives in worker memory, so a
         // restart forgets every committed and reserved amount (fail-open).
         let mut tester = UnitTestBuilder::default()
             .with_config(config(
@@ -2531,6 +2552,62 @@ mod test {
             .header("x-aggregate-risk-gate")
             .unwrap()
             .contains("total=1000/2000"));
+    }
+
+    #[test]
+    fn a_fixed_window_resets_the_budget_on_the_gateway_clock() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({
+                "aggregateBudget": 2000,
+                "fixedWeight": 1000,
+                "windowMs": 60000,
+            })))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for id in 1..=2 {
+            assert_eq!(
+                response_error_code(&tester.request(rpc_request(id, "broker-7"))),
+                None
+            );
+        }
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(3, "broker-7"))),
+            Some(MCP_BLOCKED_CODE)
+        );
+        tester.sleep(std::time::Duration::from_millis(59_000));
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(4, "broker-7"))),
+            Some(MCP_BLOCKED_CODE),
+            "still inside the first window"
+        );
+        tester.sleep(std::time::Duration::from_millis(1_000));
+        let next = tester.request(rpc_request(5, "broker-7"));
+        assert_eq!(response_error_code(&next), None);
+        assert!(next
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .contains("total=1000/2000"));
+    }
+
+    #[test]
+    fn a_worker_lifetime_window_never_resets() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({
+                "aggregateBudget": 1000,
+                "fixedWeight": 1000,
+                "window": "worker-lifetime",
+            })))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(1, "broker-7"))),
+            None
+        );
+        tester.sleep(std::time::Duration::from_millis(400 * 86_400_000));
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(2, "broker-7"))),
+            Some(MCP_BLOCKED_CODE)
+        );
     }
 
     #[test]
@@ -2718,16 +2795,6 @@ mod test {
         let mut cfg = valid_config_struct();
         cfg.result_header = String::new();
         assert!(Gate::from_config(&cfg).is_err());
-    }
-
-    #[test]
-    fn a_non_empty_ledger_endpoint_is_accepted_but_does_not_change_this_builds_behavior() {
-        // Reserved for Stage B; accepted (not an error) but must not be
-        // required, and this build's decisions come only from the in-process
-        // ledger regardless of its value.
-        let mut cfg = valid_config_struct();
-        cfg.ledger_endpoint = "https://example.invalid/ledger".to_string();
-        assert!(Gate::from_config(&cfg).is_ok());
     }
 
     // -----------------------------------------------------------------------

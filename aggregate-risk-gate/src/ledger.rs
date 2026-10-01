@@ -15,13 +15,13 @@
 // of `reserved` happen while holding one lock, so no other caller can observe an
 // intermediate state.
 //
-// Stage A / Stage B honesty boundary: this is the Stage A ledger — a single,
-// in-process, mutex-serialized store. It is a real, correct reserve-then-authorize
-// engine (proven below, including under genuine multi-thread contention), not a
-// simulation of one. It is NOT a distributed, multi-region, or replay-consistent
-// ledger, and it carries no cryptographic attestation of its decisions — that is
-// Stage B, unshipped roadmap work. Every scope here lives only as long as the
-// process that holds it; nothing here should be read as a claim of durability,
+// Scope of the guarantee: this is a single, in-process, mutex-serialized store.
+// It is a real, correct reserve-then-authorize engine (proven below, including
+// under genuine multi-thread contention), not a simulation of one. One `Ledger`
+// exists per policy instance per gateway worker: it is NOT shared across
+// workers or replicas, it does not survive a restart, and it carries no
+// cryptographic attestation of its decisions. A shared, durable ledger is
+// future work (v2); nothing here should be read as a claim of durability,
 // multi-worker sharing, or non-repudiation.
 
 // Units: every amount here is an exact, non-negative integer (`u64`) in the
@@ -35,6 +35,12 @@
 // Time: every operation takes `now`, milliseconds on the gateway's own clock
 // (`lib.rs` reads the PDK `Clock`). Passing it in keeps this module free of any
 // host dependency and makes expiry exactly reproducible in tests.
+//
+// Windows: with a fixed window of `w` ms, period `n` is `[n*w, (n+1)*w)` since
+// the Unix epoch. The first time a scope is touched in a later period, its
+// committed exposure resets to zero. In-flight reservations are not reset: they
+// carry into the new period, and settle there. Periods only move forward, so a
+// clock that steps backwards never resets a total.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -58,6 +64,8 @@ struct Held {
 /// as late rather than as a duplicate (see `LedgerStore::commit`).
 #[derive(Default, Clone, Debug, PartialEq)]
 struct ScopeState {
+    /// The window period `committed` belongs to (always 0 without a window).
+    period: u64,
     committed: u64,
     reserved: u64,
     active: HashMap<u64, Held>,
@@ -75,6 +83,15 @@ impl ScopeState {
 
     fn total(&self) -> u64 {
         self.committed.saturating_add(self.reserved)
+    }
+
+    /// Starts a new window period: committed exposure from an earlier period
+    /// no longer counts. Reservations are untouched.
+    fn roll(&mut self, period: u64) {
+        if period > self.period {
+            self.period = period;
+            self.committed = 0;
+        }
     }
 
     /// Moves every reservation whose deadline has passed out of `active` (its
@@ -219,9 +236,9 @@ impl Snapshot {
 }
 
 /// The behavior every backend must provide. `lib.rs` (the PDK-aware filter)
-/// depends only on this trait, never on `Ledger` directly, so a Stage B
-/// distributed backend could later implement the same trait without touching the
-/// filter logic — an explicit seam for the roadmap work called out in the module
+/// calls the ledger only through this trait (it constructs a `Ledger` once), so
+/// a shared (v2) backend could later implement the same trait without touching
+/// the filter's decision logic — an explicit seam for the roadmap work called out in the module
 /// doc comment, not a claim that such a backend exists today.
 ///
 /// Every method first reclaims the scope's expired reservations, under the
@@ -293,7 +310,8 @@ pub trait LedgerStore {
     fn record(&self, scope: &str, contribution: u64, now: u64) -> bool;
 
     /// A read-only view of one scope's current state, for diagnostics/tests.
-    /// Never creates an entry or reclaims: an untracked scope reads as zero.
+    /// Never creates an entry, reclaims, or starts a new window period: it
+    /// shows the scope as of its last touch. An untracked scope reads as zero.
     fn snapshot(&self, scope: &str) -> Snapshot;
 
     /// The ledger-wide reservation counters.
@@ -306,7 +324,7 @@ struct Inner {
     stats: LedgerStats,
 }
 
-/// The Stage A ledger: an in-process, mutex-serialized `HashMap` of scope states.
+/// The per-worker ledger: an in-process, mutex-serialized `HashMap` of scope states.
 /// `std::sync::Mutex` (rather than `RefCell`) is a deliberate choice beyond what
 /// the PDK's single-threaded async runtime strictly requires — it lets the unit
 /// tests below exercise `reserve` under genuine OS-thread contention, not just
@@ -324,6 +342,8 @@ pub struct Ledger {
     inner: Mutex<Inner>,
     max_scopes: usize,
     ttl: u64,
+    /// Fixed window length in ms; `None` accumulates for the worker's life.
+    window: Option<u64>,
 }
 
 /// The default reservation lifetime used by tests of the budget arithmetic.
@@ -334,16 +354,21 @@ impl Ledger {
     /// An unbounded ledger, for tests of the budget arithmetic itself.
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_limits(usize::MAX, TEST_TTL)
+        Self::with_limits(usize::MAX, TEST_TTL, None)
     }
 
     #[cfg(test)]
     pub fn with_max_scopes(max_scopes: usize) -> Self {
-        Self::with_limits(max_scopes, TEST_TTL)
+        Self::with_limits(max_scopes, TEST_TTL, None)
+    }
+
+    #[cfg(test)]
+    pub fn with_window(window: u64) -> Self {
+        Self::with_limits(usize::MAX, TEST_TTL, Some(window))
     }
 
     /// `ttl` is the reservation lifetime in milliseconds.
-    pub fn with_limits(max_scopes: usize, ttl: u64) -> Self {
+    pub fn with_limits(max_scopes: usize, ttl: u64, window: Option<u64>) -> Self {
         Ledger {
             inner: Mutex::new(Inner {
                 scopes: HashMap::new(),
@@ -352,7 +377,12 @@ impl Ledger {
             }),
             max_scopes,
             ttl,
+            window,
         }
+    }
+
+    fn period(&self, now: u64) -> u64 {
+        self.window.map_or(0, |window| now / window)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -378,8 +408,10 @@ impl Ledger {
     ) -> Option<R> {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        let period = self.period(now);
         if !inner.scopes.contains_key(scope) && inner.scopes.len() >= self.max_scopes {
             for state in inner.scopes.values_mut() {
+                state.roll(period);
                 count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
             }
             let idle = inner
@@ -395,6 +427,7 @@ impl Ledger {
             }
         }
         let state = inner.scopes.entry(scope.to_string()).or_default();
+        state.roll(period);
         count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
         Some(f(state, &mut inner.next_id, &mut inner.stats))
     }
@@ -439,6 +472,8 @@ impl Ledger {
         let outcome = match inner.scopes.get_mut(&reservation.scope) {
             None => Settlement::NotActive,
             Some(state) => {
+                // A commit lands in the current window period.
+                state.roll(self.period(now));
                 // Settlement first, reclamation second: a response that lands
                 // before the scope is next touched still settles normally,
                 // even if its deadline has technically passed.
@@ -1342,5 +1377,80 @@ mod test {
             Err(Refusal::AtCapacity)
         ));
         assert!(ledger.reserve("b", 10, 100, 2 * TEST_TTL).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Accounting windows (issue #15).
+    // -----------------------------------------------------------------------
+
+    const DAY: u64 = 86_400_000;
+
+    #[test]
+    fn a_fixed_window_resets_committed_exposure_at_the_boundary() {
+        let ledger = Ledger::with_window(DAY);
+        let r = ledger.reserve("s", 3000, 3000, 0).unwrap();
+        ledger.commit(&r, 0);
+        assert!(
+            ledger.reserve("s", 1, 3000, DAY - 1).is_err(),
+            "same period"
+        );
+        let next = ledger.reserve("s", 3000, 3000, DAY).unwrap();
+        ledger.commit(&next, DAY);
+        assert_eq!(ledger.snapshot("s").committed, 3000);
+    }
+
+    #[test]
+    fn fixed_window_periods_are_aligned_to_the_epoch_not_to_first_use() {
+        // Two calls one millisecond apart straddle a boundary: the second one
+        // starts a fresh period even though the scope was first seen 1 ms ago.
+        let ledger = Ledger::with_window(DAY);
+        let r = ledger.reserve("s", 3000, 3000, 5 * DAY - 1).unwrap();
+        ledger.commit(&r, 5 * DAY - 1);
+        assert!(ledger.reserve("s", 3000, 3000, 5 * DAY).is_ok());
+    }
+
+    #[test]
+    fn an_in_flight_reservation_carries_across_the_boundary_and_settles_in_the_new_period() {
+        let ledger = Ledger::with_window(DAY);
+        let committed = ledger.reserve("s", 1000, 3000, DAY - 10).unwrap();
+        ledger.commit(&committed, DAY - 10);
+        let in_flight = ledger.reserve("s", 2000, 3000, DAY - 5).unwrap();
+        // The new period drops the 1000 committed, but the 2000 still in flight
+        // keeps counting against it.
+        assert!(ledger.reserve("s", 1001, 3000, DAY).is_err());
+        assert_eq!(ledger.commit(&in_flight, DAY + 1), Settlement::Committed);
+        assert_eq!(ledger.snapshot("s").committed, 2000);
+        assert_eq!(ledger.snapshot("s").reserved, 0);
+    }
+
+    #[test]
+    fn a_clock_stepping_backwards_never_resets_a_total() {
+        let ledger = Ledger::with_window(DAY);
+        let r = ledger.reserve("s", 3000, 3000, 3 * DAY).unwrap();
+        ledger.commit(&r, 3 * DAY);
+        assert!(ledger.reserve("s", 1, 3000, 2 * DAY).is_err());
+        assert_eq!(ledger.snapshot("s").committed, 3000);
+    }
+
+    #[test]
+    fn without_a_window_committed_exposure_never_resets() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 3000, 3000, 0).unwrap();
+        ledger.commit(&r, 0);
+        assert!(ledger.reserve("s", 1, 3000, 1000 * DAY).is_err());
+        assert_eq!(ledger.snapshot("s").committed, 3000);
+    }
+
+    #[test]
+    fn a_scope_from_an_earlier_period_is_idle_and_can_be_evicted() {
+        let ledger = Ledger::with_limits(1, TEST_TTL, Some(DAY));
+        let r = ledger.reserve("a", 10, 100, 0).unwrap();
+        ledger.commit(&r, 0);
+        assert!(matches!(
+            ledger.reserve("b", 10, 100, DAY - 1),
+            Err(Refusal::AtCapacity)
+        ));
+        assert!(ledger.reserve("b", 10, 100, DAY).is_ok());
+        assert_eq!(ledger.scope_count(), 1);
     }
 }
