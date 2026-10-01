@@ -78,6 +78,19 @@ spec:
         (nothing committed or reserved). If every tracked scope holds exposure,
         the new scope is refused with reason=scope-capacity. Live enforcement
         state is never evicted.
+    reservationTimeoutMs:
+      type: integer
+      default: 60000
+      minimum: 1000
+      maximum: 86400000
+      description: >-
+        How long, in milliseconds, a reservation may stay unsettled. A request
+        whose response never reaches this policy (client disconnect,
+        cancellation, upstream timeout without a response) leaves its
+        reservation held; after this timeout the reservation is reclaimed and
+        its budget freed. Set it above the longest upstream timeout. A response
+        that arrives within one further timeout still settles: a success is
+        charged, a failure changes nothing. Later responses are ignored.
     scopeDisclosure:
       type: string
       default: digest
@@ -267,6 +280,7 @@ spec:
     - identityField
     - scopeHeader
     - maxScopes
+    - reservationTimeoutMs
     - scopeDisclosure
     - scopeDigestKey
     - aggregateBudget

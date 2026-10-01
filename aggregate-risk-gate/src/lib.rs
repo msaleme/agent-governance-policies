@@ -45,6 +45,7 @@ mod ledger;
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
 use pdk::authentication::{Authentication, AuthenticationData, AuthenticationHandler};
+use pdk::hl::timer::Clock;
 use pdk::hl::*;
 use pdk::logger;
 use pdk::policy_violation::PolicyViolations;
@@ -54,9 +55,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::generated::config::Config;
-use crate::ledger::{Denial, Ledger, LedgerStore, Refusal, Reservation};
+use crate::ledger::{Denial, Ledger, LedgerStats, LedgerStore, Refusal, Reservation, Settlement};
 
 /// JSON-RPC server-error code used when this policy prevents a call from
 /// reaching its upstream tool. Matches the sibling decoy/binding policies in
@@ -507,6 +509,10 @@ impl Gate {
             .ok()
             .filter(|max| (1..=1_000_000).contains(max))
             .ok_or_else(|| anyhow!("maxScopes must be between 1 and 1000000"))?;
+        let reservation_timeout_ms = u64::try_from(config.reservation_timeout_ms)
+            .ok()
+            .filter(|ms| (1_000..=86_400_000).contains(ms))
+            .ok_or_else(|| anyhow!("reservationTimeoutMs must be between 1000 and 86400000"))?;
 
         let disclosure = match config.scope_disclosure.as_str() {
             "digest" => Disclosure::Digest(config.scope_digest_key.as_bytes().to_vec()),
@@ -539,14 +545,14 @@ impl Gate {
             );
         }
 
-        // `window` (e.g. "rolling-24h") is accepted-but-not-enforced at Stage A: this
-        // in-process ledger has no notion of time or expiry, so every scope's
-        // exposure accumulates for the life of the gateway worker process, not the
-        // configured window. Logged once at startup so this is visible without
-        // reading the gcl.yaml field docs.
+        // `window` (e.g. "rolling-24h") is accepted-but-not-enforced at Stage A:
+        // reservations expire after reservationTimeoutMs, but committed exposure
+        // never does, so every scope's committed total accumulates for the life of
+        // the gateway worker process, not the configured window. Logged once at
+        // startup so this is visible without reading the gcl.yaml field docs.
         logger::info!(
             "aggregate-risk-gate: window={:?} is accepted but not enforced by this Stage A build \
-             (no time-boxing or expiry; exposure accumulates for the worker process lifetime).",
+             (committed exposure never expires; it accumulates for the worker process lifetime).",
             config.window
         );
 
@@ -563,7 +569,7 @@ impl Gate {
             mode,
             on_deny,
             result_header,
-            ledger: Ledger::with_max_scopes(max_scopes),
+            ledger: Ledger::with_limits(max_scopes, reservation_timeout_ms),
         })
     }
 
@@ -869,6 +875,7 @@ fn admit(
     gate: &Gate,
     scope: &str,
     contribution: u64,
+    now: u64,
     echo_bytes: Option<&[u8]>,
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
@@ -876,7 +883,7 @@ fn admit(
     let reservation = match gate.mode {
         Mode::Block => match gate
             .ledger
-            .reserve(scope, contribution, gate.aggregate_budget)
+            .reserve(scope, contribution, gate.aggregate_budget, now)
         {
             Ok(reservation) => reservation,
             Err(refusal) => {
@@ -897,7 +904,7 @@ fn admit(
         Mode::Monitor => {
             match gate
                 .ledger
-                .force_reserve_checked(scope, contribution, gate.aggregate_budget)
+                .force_reserve_checked(scope, contribution, gate.aggregate_budget, now)
             {
                 Some((reservation, breached)) => {
                     if breached {
@@ -933,6 +940,7 @@ fn admit(
 
 fn decide(
     identity: Identity,
+    now: u64,
     gate: &Gate,
     raw_body: RawBody,
     violations: &PolicyViolations,
@@ -962,7 +970,7 @@ fn decide(
 
     let reason = match compute_contribution(gate, raw_body) {
         ContributionOutcome::Known(amount) => {
-            return admit(gate, &scope, amount, echo_bytes, violations)
+            return admit(gate, &scope, amount, now, echo_bytes, violations)
         }
         ContributionOutcome::Unpriceable => DenyReason::Unpriceable,
         ContributionOutcome::OutOfRange => DenyReason::OutOfRange,
@@ -977,7 +985,7 @@ fn decide(
         // the ledger and an operator can see the gap; the gap itself is made
         // visible on the header rather than silently inflating or deflating the
         // running total. At the scope cap nothing is recorded.
-        gate.ledger.record(&scope, 0);
+        gate.ledger.record(&scope, 0, now);
         let stamp = format!("monitor;scope={display};reason={}", reason.label());
         Flow::Continue(Ticket::None(stamp))
     }
@@ -986,24 +994,27 @@ fn decide(
 async fn request_filter(
     request_state: RequestState,
     auth: Authentication,
+    clock: &Clock,
     gate: &Gate,
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
     let headers_state = request_state.into_headers_state().await;
+    // The admission instant: a reservation's timeout runs from here.
+    let now = epoch_ms(clock.now());
     // Resolved at the header phase, before any body is buffered.
     let identity = gate.identity(
         auth.authentication().as_ref(),
         &headers_state.handler().headers(),
     );
     if !headers_state.contains_body() {
-        return decide(identity, gate, RawBody::NoBody, violations);
+        return decide(identity, now, gate, RawBody::NoBody, violations);
     }
     // Header-phase gate, BEFORE ever calling `into_headers_body_state()`:
     // an oversized, non-JSON, or compressed body is never buffered at all —
     // `decide` still runs (as `Uninspectable`) so this call gets the same
     // fail-closed handling as a body this policy read and found unpriceable.
     if !request_is_inspectable(headers_state.handler()) {
-        return decide(identity, gate, RawBody::Uninspectable, violations);
+        return decide(identity, now, gate, RawBody::Uninspectable, violations);
     }
     let state = headers_state.into_headers_body_state().await;
     let body = state.handler().body();
@@ -1014,12 +1025,38 @@ async fn request_filter(
     } else {
         RawBody::Uninspectable
     };
-    decide(identity, gate, raw_body, violations)
+    decide(identity, now, gate, raw_body, violations)
+}
+
+/// Milliseconds since the Unix epoch. A clock before the epoch reads as 0.
+fn epoch_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Logs ledger counters (never identities) when a settlement was not the
+/// normal on-time kind, so stranded and late reservations are visible.
+fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
+    logger::info!(
+        "aggregate-risk-gate: settlement={} active={} committed={} released={} expired={} \
+         late-committed={} late-released={} abandoned={} not-active={}",
+        settlement.label(),
+        stats.active,
+        stats.committed,
+        stats.released,
+        stats.expired,
+        stats.late_committed,
+        stats.late_released,
+        stats.abandoned,
+        stats.not_active
+    );
 }
 
 async fn response_filter(
     response_state: ResponseState,
     request_data: RequestData<Ticket>,
+    clock: &Clock,
     gate: &Gate,
 ) {
     let ticket = match request_data {
@@ -1035,11 +1072,10 @@ async fn response_filter(
         Ticket::None(stamp) => (stamp, None),
         Ticket::Reserved(stamp, reservation) => (stamp, Some(reservation)),
     };
-    headers_state
-        .handler()
-        .set_header(&gate.result_header, &stamp);
-
     let Some(reservation) = reservation else {
+        headers_state
+            .handler()
+            .set_header(&gate.result_header, &stamp);
         return;
     };
 
@@ -1050,10 +1086,22 @@ async fn response_filter(
     // here would risk a 504 for no gain worth that risk), so there is no real
     // `usage.total_tokens` to read. See the Honesty boundaries section in
     // README.md and the `contribution` field doc in gcl.yaml.
-    if is_success(headers_state.status_code()) {
-        gate.ledger.commit(reservation);
+    //
+    // Settlement is by reservation id, so a duplicate or reordered response
+    // cannot settle twice, and a reservation already reclaimed by timeout is
+    // settled late (see `Settlement`). The header reports which happened.
+    let now = epoch_ms(clock.now());
+    let settlement = if is_success(headers_state.status_code()) {
+        gate.ledger.commit(&reservation, now)
     } else {
-        gate.ledger.release(reservation);
+        gate.ledger.release(&reservation, now)
+    };
+    headers_state.handler().set_header(
+        &gate.result_header,
+        &format!("{stamp};settlement={}", settlement.label()),
+    );
+    if !matches!(settlement, Settlement::Committed | Settlement::Released) {
+        log_unusual_settlement(settlement, gate.ledger.stats());
     }
 }
 
@@ -1062,6 +1110,7 @@ async fn configure(
     launcher: Launcher,
     Configuration(bytes): Configuration,
     violations: PolicyViolations,
+    clock: Clock,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -1086,8 +1135,8 @@ async fn configure(
     );
 
     let filter =
-        on_request(|rs, auth: Authentication| request_filter(rs, auth, &gate, &violations))
-            .on_response(|res, data| response_filter(res, data, &gate));
+        on_request(|rs, auth: Authentication| request_filter(rs, auth, &clock, &gate, &violations))
+            .on_response(|res, data| response_filter(res, data, &clock, &gate));
     launcher.launch(filter).await?;
     Ok(())
 }
@@ -1111,6 +1160,7 @@ mod test {
             "identityField": "client_id",
             "scopeHeader": "x-agent-id",
             "maxScopes": 10000,
+            "reservationTimeoutMs": 60000,
             "scopeDisclosure": "raw",
             "scopeDigestKey": "",
             "aggregateBudget": 3000,
@@ -1681,7 +1731,7 @@ mod test {
         assert_eq!(response_error_code(&first), None);
         let header = first.header("x-aggregate-risk-gate").unwrap();
         assert!(header.contains("contribution=600;"));
-        assert!(header.ends_with(";unit=estimated-tokens"));
+        assert!(header.ends_with(";unit=estimated-tokens;settlement=committed"));
         // A 2nd 600-token estimate only denies (600 + 600 = 1200 > 1000) if
         // the 1st call's estimate was committed IN FULL — a true-up to the
         // real 50-token usage would leave 50 + 600 = 650, still under budget.
@@ -2141,7 +2191,7 @@ mod test {
         let header = response.header("x-aggregate-risk-gate").unwrap();
         assert_eq!(
             header,
-            "allowed;scope=agent:broker-7;contribution=20;total=30/30;unit=USD-minor"
+            "allowed;scope=agent:broker-7;contribution=20;total=30/30;unit=USD-minor;settlement=committed"
         );
         let response = tester.request(rpc_request_with_amount(3, "broker-7", 1));
         assert_eq!(response_error_code(&response), Some(MCP_BLOCKED_CODE));
@@ -2158,7 +2208,8 @@ mod test {
         let response = tester.request(rpc_request_with_amount(1, "broker-7", 1234));
         let header = response.header("x-aggregate-risk-gate").unwrap();
         assert!(
-            header.ends_with("contribution=1234;total=1234/3000;unit=EUR-minor"),
+            header
+                .ends_with("contribution=1234;total=1234/3000;unit=EUR-minor;settlement=committed"),
             "{}",
             header
         );
@@ -2221,6 +2272,7 @@ mod test {
             identity_source: "authentication".to_string(),
             ledger_endpoint: String::new(),
             max_scopes: 10000,
+            reservation_timeout_ms: 60000,
             mode: "block".to_string(),
             on_deny: "rpc-error".to_string(),
             result_header: "x-aggregate-risk-gate".to_string(),
@@ -2418,6 +2470,80 @@ mod test {
             let mut cfg = valid_config_struct();
             cfg.identity_field = bad.to_string();
             assert!(Gate::from_config(&cfg).is_err(), "identityField {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn a_successful_response_is_stamped_committed_and_a_failure_released() {
+        let mut ok = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let header = ok.request(rpc_request(1, "broker-7"));
+        assert!(
+            header
+                .header("x-aggregate-risk-gate")
+                .unwrap()
+                .ends_with(";settlement=committed"),
+            "{:?}",
+            header.header("x-aggregate-risk-gate")
+        );
+
+        let mut failing = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(failing_backend)
+            .with_entrypoint(super::configure);
+        let response = failing.request(rpc_request(1, "broker-7"));
+        assert!(
+            response
+                .header("x-aggregate-risk-gate")
+                .unwrap()
+                .ends_with(";settlement=released"),
+            "{:?}",
+            response.header("x-aggregate-risk-gate")
+        );
+    }
+
+    #[test]
+    fn a_worker_restart_resets_the_in_process_ledger() {
+        // Documented Stage A behavior: the ledger lives in worker memory, so a
+        // restart forgets every committed and reserved amount (fail-open).
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"aggregateBudget": 2000, "fixedWeight": 1000}),
+            ))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for id in 1..=2 {
+            assert_eq!(
+                response_error_code(&tester.request(rpc_request(id, "broker-7"))),
+                None
+            );
+        }
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(3, "broker-7"))),
+            Some(MCP_BLOCKED_CODE)
+        );
+        tester.restart();
+        let after = tester.request(rpc_request(4, "broker-7"));
+        assert_eq!(response_error_code(&after), None);
+        assert!(after
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .contains("total=1000/2000"));
+    }
+
+    #[test]
+    fn reservation_timeout_must_be_between_one_second_and_one_day() {
+        for bad in [0, 999, -1, 86_400_001] {
+            let mut cfg = valid_config_struct();
+            cfg.reservation_timeout_ms = bad;
+            assert!(Gate::from_config(&cfg).is_err(), "timeout {}", bad);
+        }
+        for good in [1_000, 60_000, 86_400_000] {
+            let mut cfg = valid_config_struct();
+            cfg.reservation_timeout_ms = good;
+            assert!(Gate::from_config(&cfg).is_ok(), "timeout {}", good);
         }
     }
 

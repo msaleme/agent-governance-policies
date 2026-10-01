@@ -23,6 +23,8 @@ pub struct Config {
     pub mode: String,
     #[serde(alias = "onDeny")]
     pub on_deny: String,
+    #[serde(alias = "reservationTimeoutMs")]
+    pub reservation_timeout_ms: i64,
     #[serde(alias = "resultHeader")]
     pub result_header: String,
     #[serde(alias = "scopeDigestKey")]

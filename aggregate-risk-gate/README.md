@@ -60,7 +60,9 @@ On each governed call the policy:
    so composition can be characterized with zero enforcement risk (`mode: monitor`).
 4. **Commits** the reservation into the ledger's running total on a successful upstream response;
    **releases** it on an upstream failure, so a call that never completed does not consume
-   exposure it never spent.
+   exposure it never spent. Settlement is by reservation id and happens at most once. A
+   reservation whose response never arrives is reclaimed after `reservationTimeoutMs` (see
+   Reservation lifecycle below).
 
 The reserve-then-authorize *order* is the whole point, and it is why this policy exists rather
 than a cheaper read-then-write counter: under concurrency, a read-then-write counter lets every
@@ -148,6 +150,7 @@ with one `-32008` error per id, echoing every id in the batch.
 | `identityField` | `client_id`\|`principal`\|`properties.<path>` | `client_id` | Which `AuthenticationData` field identifies the caller when `identitySource=authentication`. `properties.<path>` reads a dot path into the authentication properties (for example a JWT claim); the value must be a string. |
 | `scopeHeader` | string | `x-agent-id` | Header carrying the identity when `identitySource=trusted-header`; must be non-blank in that mode, ignored otherwise. Matched case-insensitively. A header sent more than once is invalid. |
 | `maxScopes` | integer, `1`–`1000000` | `10000` | Most scopes the ledger tracks at once. At the cap a new scope may evict one idle scope (nothing committed or reserved). If none is idle the call is denied in `block` mode with `reason=scope-capacity`, or forwarded in `monitor` mode with that reason stamped. Live totals are never evicted. |
+| `reservationTimeoutMs` | integer, `1000`–`86400000` | `60000` | How long a reservation may stay unsettled before it is reclaimed and its budget freed. Set it above the longest upstream timeout. See Reservation lifecycle below. |
 | `scopeDisclosure` | `digest`\|`none`\|`raw` | `digest` | How the scope appears in `resultHeader` and denial messages. `digest` — `<budgetScope>:hmac-<16 hex>` (HMAC-SHA256 under `scopeDigestKey`, first 8 bytes), or `sha256-…` when no key is set. `none` — just `<budgetScope>`. `raw` — the canonical identity itself; only for trusted, internal consumers. |
 | `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest`. Without a key the digest is a plain SHA-256, which anyone holding a candidate identity can recompute. Set a key when identities are guessable. |
 | `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
@@ -171,6 +174,7 @@ with one `-32008` error per id, echoing every id in the batch.
     identityField: client_id
     scopeHeader: x-agent-id
     maxScopes: 10000
+    reservationTimeoutMs: 60000
     scopeDisclosure: digest
     scopeDigestKey: ""        # set from a secret; see scopeDigestKey above
     aggregateBudget: 3000
@@ -196,7 +200,8 @@ does not: the header is not an identity in this mode.
 On the fourth (denied) call above, the client-facing response carries, e.g.
 `x-aggregate-risk-gate: denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points`. On
 an allowed call it instead carries, e.g.
-`x-aggregate-risk-gate: allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points`.
+`x-aggregate-risk-gate: allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points;settlement=committed`.
+The `settlement=` field says what the response did to the reservation (see Reservation lifecycle).
 Neither format carries another session's call content or the raw identity — only a stable
 digest and the numeric totals — so both are safe to forward downstream to logging, SIEM, or a
 Kill Switch. The gateway log never carries an identity. At policy start-up the gateway log separately carries a plain diagnostic
@@ -236,12 +241,54 @@ identity contains a space, so these never collide with a real scope.
 
 `maxScopes` bounds the ledger's memory. A flood of distinct identities cannot grow it past the cap,
 and the cap cannot be used to reset someone else's total, because only idle scopes are evicted.
-Idle scopes hold nothing committed or reserved. Time-based expiry of committed exposure is tied to
-`window` and is out of scope here.
+Idle scopes hold nothing committed or reserved. A stranded reservation stops pinning its scope two
+timeouts after it was made (see Reservation lifecycle). Committed exposure does not expire; that is
+tied to `window`.
 
 **Breaking change.** Earlier builds always keyed on `scopeHeader`. A config that relies on that
 must now set `identitySource: trusted-header` and, to keep raw scopes in the result header,
 `scopeDisclosure: raw`.
+
+## Reservation lifecycle
+
+Every reservation gets an id that is unique within the worker, a creation time and an expiry time
+of creation + `reservationTimeoutMs`. Time is the gateway's own clock, read when the request
+headers arrive and again when the response headers arrive. A reservation ends in exactly one of
+these states, and the response stamps which one as `settlement=`:
+
+| `settlement=` | When | Effect on the ledger |
+|---|---|---|
+| `committed` | Success response before the reservation was reclaimed | Reserved amount moves to committed |
+| `released` | Failure response before the reservation was reclaimed | Reserved amount is freed |
+| `late-committed` | Success response after reclaim, within one more timeout | Amount is added to committed, with no budget check: the call did happen, and under-counting it is the unsafe direction |
+| `late-released` | Failure response after reclaim, within one more timeout | Nothing; the amount was already freed |
+| `not-active` | The reservation was already settled, or was reclaimed more than one timeout ago | Nothing |
+
+Reclaim is lazy. It runs, under the same lock as admission, whenever a call touches the scope, and
+across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is reclaimed once `now` reaches
+its expiry. Its id is then kept for one more timeout so a slow response can still settle late, and
+after that it is counted as abandoned. This covers a client that disconnects, a cancelled request,
+and an upstream that times out without a response reaching this policy: their reservations free up
+after the timeout instead of pinning the budget for the life of the worker.
+
+Settling by id means a duplicate or reordered response cannot commit or release twice, a commit
+after a release changes nothing, and a release after a commit cannot take back committed exposure.
+
+**Choosing the timeout.** Set `reservationTimeoutMs` above the longest time a governed call can
+legitimately take, including upstream and gateway timeouts. Too short, and a slow call's
+reservation is reclaimed while the call is still running. That frees budget another call can take
+before the slow call commits late, so the scope can briefly overshoot its budget by the late amount.
+Too long, and a stranded reservation holds budget longer than needed. Overshoot only happens past
+the timeout. Within it the budget holds exactly.
+
+A response that is not one of the normal kinds (`committed`, `released`) writes one log line with
+the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned
+and not-active. The line carries no identity.
+
+**Worker restart.** The ledger is in worker memory. When the worker restarts, every committed and
+reserved amount is gone and all scopes start again at zero. This fails open, and it is deterministic:
+a restart is the only thing that resets totals. Settlement is an in-process map update, so it has
+no transient failure to retry.
 
 ## Units
 
@@ -276,9 +323,9 @@ cryptographic non-repudiation claim over its decisions. Concretely:
 - **`ledgerEndpoint` is a reserved, unimplemented Stage B field.** A distributed ledger service
   this policy calls out to instead of its in-process map is unshipped roadmap work. Setting this
   field to a non-empty URL changes nothing about how decisions are made today.
-- **`window` is accepted but not enforced.** The Stage A ledger has no notion of time or expiry —
-  a scope's exposure accumulates for the life of the running worker process, not for a rolling or
-  fixed accounting window. Real per-window expiry needs a clock-driven eviction policy against a
+- **`window` is accepted but not enforced.** Reservations expire (see Reservation lifecycle), but
+  committed exposure does not — a scope's committed total accumulates for the life of the running
+  worker process, not for a rolling or fixed accounting window. Real per-window expiry needs a clock-driven eviction policy against a
   real distributed store, not a per-request approximation; it is Stage B roadmap work.
 - **`estimated-token-weight` contribution is estimate-then-SETTLE, not estimate-then-reconcile,
   and it never measures actual token usage.** The reservation made before authorizing an
@@ -290,6 +337,8 @@ cryptographic non-repudiation claim over its decisions. Concretely:
   is a more conservative behavior than a real reconcile would be, not a softer one: set the estimate
   conservatively for the traffic this instance governs, since it is what actually lands in the
   ledger, not a placeholder for something more accurate arriving later.
+- **A worker restart resets the ledger.** Every committed and reserved amount is lost and every
+  scope starts again at zero (see Reservation lifecycle). There is no persistence.
 - **No signed decision records.** Every ledger operation happens in-process and is not
   independently attestable outside this policy's own process; this build makes no claim that its
   admit/deny decisions are cryptographically non-repudiable.
@@ -300,10 +349,10 @@ here**. Do not present this build as shipping it.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 116 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 131 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 33 tests): correctness of
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 45 tests): correctness of
   `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
@@ -318,7 +367,14 @@ Docker:
   reservation saturates and still reports the breach. Five cover the scope cap: a full ledger refuses a
   new scope when none is idle and keeps live totals, evicts only an idle scope, never refuses an
   already-tracked scope, and neither `snapshot` nor a stray `commit`/`release` creates a scope.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (43 tests,
+  Twelve cover the reservation lifecycle with an injected clock: ids are unique and every
+  reservation has a bounded expiry; a duplicate commit or release, a commit after a release and a
+  release after a commit change nothing; an abandoned reservation is reclaimed at its timeout
+  without touching committed exposure; a late commit is charged exactly once and a late release
+  changes nothing; a settlement more than one timeout after reclaim is dropped and the reservation
+  counted abandoned; the counters tell every state apart; and a stranded reservation stops pinning
+  a full ledger after two timeouts.
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (45 tests,
   from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
@@ -349,6 +405,8 @@ Docker:
     (`estimated_token_weight_commits_the_full_estimate_and_never_reads_the_response_body`). Usage
     figures that are higher than the estimate, or malformed, don't change the charge either
     (`estimated_token_weight_ignores_over_and_malformed_usage_figures`).
+  - **Settlement** — a successful response is stamped `settlement=committed` and a failure
+    `settlement=released`, and a worker restart (`tester.restart()`) resets every total to zero.
   - **Exact integer units** — a spend amount of `12.34`, `1234.0`, `1e3`, `-5`, `"1234"`, or 2^64
     is refused as unpriceable before it reaches upstream. Amounts above 2^53 − 1 are refused as
     out of range, and so are spend-amount and fixed-weight batches whose total overflows. Monitor
@@ -358,11 +416,11 @@ Docker:
   rules in `canonical_identity`; duplicate and mixed-case trusted headers; `client_id`,
   `principal` and `properties.<path>` selection (a non-string property is invalid); and
   `digest` (keyed and unkeyed), `none` and `raw` display.
-- **Direct `Gate::from_config` validation tests** (26): every config-validation rejection path
+- **Direct `Gate::from_config` validation tests** (27): every config-validation rejection path
   (invalid enum values including `window`, negative or above-2^53 − 1 amounts, a fractional
   amount refused by deserialization, the retired `token-cost` name rejected with its replacement
   named, a malformed `spendCurrency`, blank required strings, an unknown `identitySource`,
-  `identityField` or `scopeDisclosure`, and `maxScopes` outside `1`–`1000000`) and the corresponding accepted
+  `identityField` or `scopeDisclosure`, and `maxScopes` outside `1`–`1000000`, `reservationTimeoutMs` outside `1000`–`86400000`) and the corresponding accepted
   cases.
 - **`dot_path_value` unit tests** (4): the dotted-path body reader used for `spend-amount`.
 
