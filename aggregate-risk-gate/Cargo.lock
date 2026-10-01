@@ -58,13 +58,17 @@ name = "aggregate_risk_gate"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "futures-lite",
  "httpmock",
  "pdk",
+ "pdk-data-storage-lib",
  "pdk-test",
  "pdk-unit",
  "reqwest",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
