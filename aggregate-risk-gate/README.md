@@ -341,6 +341,12 @@ holding the budget under contention where a naive read-then-write counter breach
   API, a scope can be admitted up to `N × aggregateBudget` in a window. To make `aggregateBudget`
   an upper bound for the whole deployment, divide the intended budget by `N`. That bound is safe
   but loose: a scope whose traffic lands on one worker gets only `1/N` of the intended budget.
+- **Single-worker configuration gives one budget per replica.** Setting
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1` gives each policy instance one worker ledger per replica,
+  at the cost of worker parallelism. In the [real Flex 1.14.0 run, case 8](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#8-per-worker-scope-observed-15),
+  12 of 200 calls were admitted with four workers and 3 of 200 with one worker, using
+  `aggregateBudget: 3000` and `fixedWeight: 800`. These are observations from that run;
+  replicas still have independent budgets, and restart still resets the ledger.
 - **A restart or redeploy resets the ledger.** Every committed and reserved amount is lost and all
   scopes start again at zero, even mid-window. There is no persistence and no storage dependency,
   so there are no storage conflicts or storage errors to handle.
