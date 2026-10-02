@@ -260,14 +260,20 @@ these states, and the response stamps which one as `settlement=`:
 |---|---|---|
 | `committed` | Success response before the reservation was reclaimed | Reserved amount moves to committed |
 | `released` | Failure response before the reservation was reclaimed | Reserved amount is freed |
-| `late-committed` | Success response after reclaim, within one more timeout | Amount is added to committed, with no budget check: the call did happen, and under-counting it is the unsafe direction |
-| `late-released` | Failure response after reclaim, within one more timeout | Nothing; the amount was already freed |
-| `not-active` | The reservation was already settled, or was reclaimed more than one timeout ago | Nothing |
+| `late-committed` | Success response after reclaim, while the reservation's tombstone is still held (see below) | Amount is added to committed, with no budget check: the call did happen, and under-counting it is the unsafe direction |
+| `late-released` | Failure response after reclaim, while the tombstone is still held | Nothing; the amount was already freed |
+| `not-active` | The reservation was already settled, or its tombstone was dropped | Nothing |
 
 Reclaim is lazy. It runs, under the same lock as admission, whenever a call touches the scope, and
-across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is reclaimed once `now` reaches
-its expiry. Its id is then kept for one more timeout so a slow response can still settle late, and
-after that it is counted as abandoned. This covers a client that disconnects, a cancelled request,
+across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is
+reclaimed by the first such pass at or after its expiry, which frees its budget and leaves a
+tombstone so a slow response can still settle late. The tombstone is kept for at least one more
+timeout and dropped by the first pass at or after `expiry + reservationTimeoutMs`. From then on the
+reservation is counted as abandoned. A response settles before that pass runs, so the
+"one more timeout" is a minimum, not a deadline. If nothing touches the scope, a response arriving
+long after two timeouts still settles `late-committed` and is charged. That errs toward
+over-counting, the safe direction, and was observed on a real gateway
+(`docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`, case 5b). This covers a client that disconnects, a cancelled request,
 and an upstream that times out without a response reaching this policy: their reservations free up
 after the timeout instead of pinning the budget for the life of the worker.
 
@@ -379,8 +385,8 @@ Docker:
   reservation has a bounded expiry; a duplicate commit or release, a commit after a release and a
   release after a commit change nothing; an abandoned reservation is reclaimed at its timeout
   without touching committed exposure; a late commit is charged exactly once and a late release
-  changes nothing; a settlement more than one timeout after reclaim is dropped and the reservation
-  counted abandoned; the counters tell every state apart; and a stranded reservation stops pinning
+  changes nothing; once a call touches the scope more than one timeout after reclaim, the tombstone
+  is dropped, the reservation is counted abandoned and a later settlement is `not-active`; the counters tell every state apart; and a stranded reservation stops pinning
   a full ledger after two timeouts.
   Six cover the accounting window: a fixed window resets committed exposure at the boundary;
   periods are aligned to the epoch, not first use; an in-flight reservation carries across a

@@ -108,9 +108,12 @@ publication are included.
   time and an expiry from the new `reservationTimeoutMs` (default 60000, range 1000–86400000), read
   from the gateway clock. An expired reservation is reclaimed under the ledger lock, freeing its
   budget, and committed exposure is untouched. Settlement is by id and happens at most once, so a
-  duplicate, reordered or crossed commit/release changes nothing. A response within one more timeout
-  after reclaim settles late: a success is charged without a budget check, a failure changes nothing.
-  After that the reservation is counted abandoned. `resultHeader` on an allowed or monitored call now
+  duplicate, reordered or crossed commit/release changes nothing. A response after reclaim settles
+  late while the reservation's tombstone is held: a success is charged without a budget check, a
+  failure changes nothing. Reclaim is lazy. The tombstone is held for at least one more timeout and
+  dropped when the scope is next touched after that. From then on the reservation is counted
+  abandoned. An untouched scope can therefore settle late after more than two timeouts. That
+  over-counts, the safe direction, and was confirmed on a real gateway on 2026-10-01. `resultHeader` on an allowed or monitored call now
   ends with `settlement=committed|released|late-committed|late-released|not-active`, and any
   settlement that isn't on time logs the ledger counters, with no identities. A worker restart still
   resets the in-memory ledger. That is now documented and tested. **Breaking:** the allowed/monitor

@@ -117,7 +117,12 @@ as abandoned") says a response more than one timeout after reclaim settles `not-
 - Once something touches the scope (5c), the documented `not-active` holds.
 
 The deviation over-counts, which is the safe direction. It is a mismatch between the docs and
-the behaviour, not a budget breach. No issue has been filed yet.
+the behaviour, not a budget breach.
+
+**Resolved by a docs fix in this change.** The behaviour is the safe one, so the policy code is
+unchanged. The README settlement table and reclaim paragraph, its unit-test summary and the
+CHANGELOG `#17` entry now say that the tombstone is held for *at least* one more timeout and is
+dropped when the scope is next touched after that.
 
 ### 6: fixed window reset (PASS, #15)
 

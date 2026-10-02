@@ -409,19 +409,19 @@
       "id": "F1",
       "case": "5b",
       "summary": "An untouched tombstone still settles late-committed after 2 x TTL (slow call 2.65 s, TTL 1 s); README says late settlement applies only 'within one more timeout' and not-active after. Tombstones drop lazily on the next call that touches the scope. Over-counts (safe direction); docs/behaviour mismatch.",
-      "issue_filed": false
+      "resolution": "docs fix: README settlement table, reclaim paragraph and unit-test summary, plus CHANGELOG #17 entry, now state the tombstone is held for at least one more timeout and dropped on the next touch after that; policy code unchanged"
     },
     {
       "id": "F2",
       "case": "8",
       "summary": "Observed 12/200 admitted at envoy concurrency 4 (= 4 x 3) and 3/200 at concurrency 1, matching README's N x aggregateBudget. FLEX_SERVICE_ENVOY_CONCURRENCY=1 gives one budget per replica; README could say so.",
-      "issue_filed": false
+      "resolution": "open"
     },
     {
       "id": "F3",
       "case": "2",
       "summary": "Client ID Enforcement could not be exercised in local mode (needs control-plane contracts); http-basic-authentication-flex used as the upstream authentication policy. Ordering and spoof-resistance proven; Client-ID-specific run still pending on a connected gateway.",
-      "issue_filed": false
+      "resolution": "open"
     }
   ],
   "resource_deletion": {

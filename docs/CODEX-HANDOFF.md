@@ -48,7 +48,9 @@ redaction grep because this repo is public.
 
 - a case 2 rerun with real Client ID Enforcement on a connected gateway;
 - a case 9 rerun under cargo-anypoint 1.10.0;
-- finding F1 (lazy tombstones) and F2 (single-worker note), not yet filed.
+- optional finding F2: a README note on single-worker budgets.
+
+Finding F1 (lazy tombstones) is resolved by a docs fix in the same change.
 
 ## Earlier task (done): approval-binding P5/P6
 

@@ -445,8 +445,8 @@ async fn case5a_late_commit_inside_one_extra_ttl() -> anyhow::Result<()> {
 }
 
 /// No call touches the scope after reclaim, so the tombstone is still held
-/// when the slow response lands at 2.6 s and it settles late, even though that
-/// is past the README's "within one more timeout".
+/// when the slow response lands at 2.6 s and it settles late, past two
+/// timeouts. The README documents this as finding F1.
 #[pdk_test]
 #[ignore]
 async fn case5b_untouched_tombstone_still_settles_late_after_two_ttls() -> anyhow::Result<()> {
