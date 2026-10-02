@@ -555,6 +555,9 @@ async fn case7_restart_resets_the_ledger() -> anyhow::Result<()> {
 
 /// Case 8: fire many parallel calls over separate connections and record how
 /// many the per-worker ledgers admit. Observational: no fixed number asserted.
+/// It also records gateway config applies around each burst, and probes the
+/// exhausted scope after a pause: a config apply that rebuilds the listener
+/// creates fresh wasm VMs, and with them fresh ledgers.
 #[pdk_test]
 #[ignore]
 async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
@@ -578,10 +581,93 @@ async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
         .find(|w| w[0] == "--concurrency")
         .map(|w| w[1].to_string());
 
-    let total = 200u64;
+    // The first burst starts as soon as the gateway answers. The second, on a
+    // fresh scope, starts 15 s later, so a difference between them shows
+    // whether the gateway had extra ledgers only while it was starting.
+    let logs_before = gateway_log_counts(&container)?;
+    let first = burst(&url, "broker-7").await?;
+    let logs_after_first = gateway_log_counts(&container)?;
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    let logs_after_pause = gateway_log_counts(&container)?;
+    // broker-7 was exhausted on every ledger by the first burst. Sequential calls on one
+    // connection, so they spread over workers only as Envoy assigns that connection.
+    let c = client()?;
+    let mut same_scope_after_pause = Vec::new();
+    for id in 1..=4 {
+        let w = send(&c, &url, 1000 + id, &[("x-agent-id", "broker-7")]).await?;
+        same_scope_after_pause
+            .push(json!({"status": w.status, "rpc_error": w.rpc_error, "stamp": w.stamp}));
+    }
+    let second = burst(&url, "broker-8").await?;
+    let logs_after_second = gateway_log_counts(&container)?;
+    let hits = upstream.hits();
+
+    // Count Envoy processes and their worker threads (named wrk:worker_N).
+    let envoy_processes = docker(&[
+        "exec",
+        &container,
+        "sh",
+        "-c",
+        "ps -e -o comm | grep -c '^envoy$' || true",
+    ])
+    .unwrap_or_default();
+    let worker_threads = docker(&[
+        "exec",
+        &container,
+        "sh",
+        "-c",
+        "cat /proc/[0-9]*/task/*/comm 2>/dev/null | grep -c '^wrk:' || true",
+    ])
+    .unwrap_or_default();
+
+    record(
+        "8-per-worker-budget",
+        "observed",
+        json!({
+            "calls_per_burst": BURST_CALLS, "per_worker_admit_limit": 3,
+            "first_burst": first.to_json(), "second_burst_after_15s": second.to_json(),
+            "same_scope_after_pause": same_scope_after_pause,
+            "upstream_hits": hits,
+            "container_nproc": nproc, "envoy_concurrency_flag": concurrency,
+            "envoy_processes": envoy_processes, "envoy_worker_threads": worker_threads,
+            "gateway_log_counts": {
+                "before_first": logs_before, "after_first": logs_after_first,
+                "after_pause": logs_after_pause, "after_second": logs_after_second
+            }
+        }),
+    );
+    anyhow::ensure!(
+        first.other == 0 && second.other == 0,
+        "case 8 transport errors or hit mismatch"
+    );
+    Ok(())
+}
+
+const BURST_CALLS: u64 = 200;
+
+struct Burst {
+    admitted: u64,
+    refused: u64,
+    other: u64,
+    // Each ledger stamps its first admitted call total=800, its second 1600 and
+    // its third 2400, so the count of each total is the number of ledgers that
+    // reached that step.
+    admitted_by_total: std::collections::BTreeMap<String, u64>,
+}
+
+impl Burst {
+    fn to_json(&self) -> Value {
+        json!({
+            "admitted": self.admitted, "refused": self.refused, "other": self.other,
+            "admitted_by_total": self.admitted_by_total
+        })
+    }
+}
+
+async fn burst(url: &str, agent: &'static str) -> anyhow::Result<Burst> {
     let mut handles = Vec::new();
-    for id in 1..=total {
-        let url = url.clone();
+    for id in 1..=BURST_CALLS {
+        let url = url.to_string();
         handles.push(tokio::spawn(async move {
             // One client per call: a fresh connection each time, so calls can
             // land on different worker threads.
@@ -590,33 +676,47 @@ async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
                 .timeout(Duration::from_secs(30))
                 .build()
                 .unwrap();
-            send(&c, &url, id, &[("x-agent-id", "broker-7")]).await
+            send(&c, &url, id, &[("x-agent-id", agent)]).await
         }));
     }
-    let mut admitted = 0u64;
-    let mut refused = 0u64;
-    let mut other = 0u64;
+    let mut result = Burst {
+        admitted: 0,
+        refused: 0,
+        other: 0,
+        admitted_by_total: Default::default(),
+    };
     for handle in handles {
         match handle.await? {
-            Ok(w) if w.status == 200 && w.rpc_error.is_none() => admitted += 1,
-            Ok(w) if w.rpc_error == Some(-32008) => refused += 1,
-            _ => other += 1,
+            Ok(w) if w.status == 200 && w.rpc_error.is_none() => {
+                result.admitted += 1;
+                let total = w
+                    .stamp
+                    .split(';')
+                    .find_map(|f| f.strip_prefix("total="))
+                    .unwrap_or("none")
+                    .to_string();
+                *result.admitted_by_total.entry(total).or_default() += 1;
+            }
+            Ok(w) if w.rpc_error == Some(-32008) => result.refused += 1,
+            _ => result.other += 1,
         }
     }
-    let hits = upstream.hits();
-    record(
-        "8-per-worker-budget",
-        "observed",
-        json!({
-            "calls": total, "admitted": admitted, "refused": refused, "other": other,
-            "upstream_hits": hits, "per_worker_admit_limit": 3,
-            "container_nproc": nproc, "envoy_concurrency_flag": concurrency,
-            "implied_workers_with_traffic_at_least": admitted.div_ceil(3)
-        }),
+    Ok(result)
+}
+
+/// Counts of gateway log lines by keyword. Only counts are recorded: the lines
+/// themselves can carry addresses.
+fn gateway_log_counts(container: &str) -> anyhow::Result<Value> {
+    let logs = Command::new("docker").args(["logs", container]).output()?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&logs.stdout),
+        String::from_utf8_lossy(&logs.stderr)
     );
-    anyhow::ensure!(
-        other == 0 && admitted == hits as u64,
-        "case 8 transport errors or hit mismatch"
-    );
-    Ok(())
+    let count = |needle: &str| text.lines().filter(|l| l.contains(needle)).count();
+    Ok(json!({
+        "lines": text.lines().count(), "wasm": count("wasm"), "listener": count("listener"),
+        "configuration_applied": count("Configuration applied"),
+        "wasm_vms_created": count("Thread-Local Wasm created")
+    }))
 }
