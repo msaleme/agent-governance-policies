@@ -1,0 +1,111 @@
+{
+  "case": "9",
+  "disposition": "pass",
+  "started_at": "2026-10-02T11:27:02.511253+00:00",
+  "assets": {
+    "definition": {
+      "asset_get_status": 200,
+      "metadata_get_status": 200,
+      "assetTypes": [
+        "mcp"
+      ],
+      "description_length": 232,
+      "minRuntimeVersion": null,
+      "delete_status": 204,
+      "version_get_after_delete": 404,
+      "asset_get_after_delete": 404
+    },
+    "implementation": {
+      "asset_get_status": 200,
+      "metadata_get_status": 200,
+      "assetTypes": null,
+      "description_length": 0,
+      "minRuntimeVersion": "1.14.0",
+      "delete_status": 204,
+      "version_get_after_delete": 404,
+      "asset_get_after_delete": 404
+    }
+  },
+  "finished_at": "2026-10-02T11:27:12.586495+00:00",
+  "work_package": "WP2",
+  "issue": 16,
+  "source_commit": "5b71d80",
+  "brief_commit": "127f0d0",
+  "rust_toolchain": "1.89.0",
+  "cargo_anypoint": "1.10.0",
+  "pdk_cli_plugin": "1.9.0",
+  "publish_mode": "development",
+  "wasm_sha256": "33443716859f371bead629ab61cf326cb6b63496442fab0688e3898b4cce5ff9",
+  "build": {
+    "command": "make build",
+    "exit_code": 0,
+    "cargo_anypoint": "1.10.0"
+  },
+  "publish": {
+    "command": "make publish",
+    "exit_code": 0,
+    "started_at": "2026-10-02T11:22:58.778261+00:00",
+    "finished_at": "2026-10-02T11:24:50.932776+00:00",
+    "cargo_anypoint": "1.10.0"
+  },
+  "original_asset_rebuild": {
+    "command": "make build (original asset IDs)",
+    "exit_code": 0,
+    "wasm_sha256": "33443716859f371bead629ab61cf326cb6b63496442fab0688e3898b4cce5ff9",
+    "matches_prior_run": true,
+    "metadata_check_exit_code": 0,
+    "policy_ref": "aggregate-risk-gate-v1-0-impl"
+  },
+  "metadata_validation": {
+    "command": "python3 scripts/check_exchange_metadata.py aggregate-risk-gate --assets",
+    "exit_code": 0
+  },
+  "source_and_definition_unchanged": true,
+  "runtime_cases_rerun": false,
+  "resources_deleted_confirmed": true,
+  "limitations": [
+    "Development publication only; no release published.",
+    "No runtime cases rerun for WP2.",
+    "Packaging CI remains blocked by missing ANYPOINT_GROUP_ID.",
+    "WP1 and WP3 authorization/operator steps remain pending; this is not an issue-wide pass."
+  ],
+  "requests": [
+    {
+      "operation": "asset verification",
+      "method": "GET",
+      "path": "/exchange/api/v2/assets/<org-id>/<disposable-asset-id>/<dev-version>",
+      "status": 200,
+      "body": "Asset descriptor retained privately; sanitized metadata observations recorded in assets.",
+      "x-aggregate-risk-gate": null,
+      "upstream_hit_count": null
+    },
+    {
+      "operation": "stored metadata",
+      "method": "GET",
+      "path": "<metadata-download-url>",
+      "status": 200,
+      "body": "Definition: assetTypes [mcp], description length 232. Implementation: minRuntimeVersion 1.14.0.",
+      "x-aggregate-risk-gate": null,
+      "upstream_hit_count": null
+    },
+    {
+      "operation": "hard deletion",
+      "method": "DELETE",
+      "path": "/exchange/api/v1/organizations/<org-id>/assets/<org-id>/<disposable-asset-id>/<dev-version>",
+      "headers": {
+        "x-delete-type": "hard-delete"
+      },
+      "status": 204,
+      "x-aggregate-risk-gate": null,
+      "upstream_hit_count": null
+    },
+    {
+      "operation": "confirm deletion",
+      "method": "GET",
+      "path": "/exchange/api/v2/assets/<org-id>/<disposable-asset-id>[/<dev-version>]",
+      "status": 404,
+      "x-aggregate-risk-gate": null,
+      "upstream_hit_count": null
+    }
+  ]
+}
