@@ -7,7 +7,7 @@ Mac against a real Flex Gateway 1.14.0 container, not on Astra. Machine-readable
 
 **Summary:**
 
-- 6 cases pass: 1, 3, 4, 5a, 5c, 6 and 7. (Case 5 is split into 5a, 5b and 5c.)
+- 7 cases pass: 1, 3, 4, 5a, 5c, 6 and 7. (Case 5 is split into 5a, 5b and 5c.)
 - 3 are qualified: 2, 5b and 9.
 - 1 is observed: 8.
 - None failed.
