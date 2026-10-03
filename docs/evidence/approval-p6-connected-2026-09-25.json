@@ -11,14 +11,14 @@
   "artifact": {
     "wasm_sha256": "52aa23bb5aa5563752b0e46b76d3693eba852cc5baeef7ca6eb7eea20ffc1f20",
     "definition": {
-      "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+      "groupId": "<ANYPOINT_ORG_ID>",
       "assetId": "approval-binding-live-20260925-dev",
       "version": "0.0.1-20260925144221",
       "type": "policy",
       "confirm_get_status": 200
     },
     "implementation": {
-      "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+      "groupId": "<ANYPOINT_ORG_ID>",
       "assetId": "approval-binding-live-20260925-flex-dev",
       "version": "0.0.1-20260925144221",
       "type": "policy-implementation",
@@ -41,14 +41,14 @@
       "wasm_sha256": "8f360d95df5605050dd12d5fe362c226a7c40f029b308d2c35b3c876fdf3720b",
       "assets": [
         {
-          "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+          "groupId": "<ANYPOINT_ORG_ID>",
           "assetId": "approval-binding-live-20260925-dev",
           "version": "0.0.1-20260925143950",
           "type": "policy",
           "confirm_get_status": 200
         },
         {
-          "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+          "groupId": "<ANYPOINT_ORG_ID>",
           "assetId": "approval-binding-live-20260925-flex-dev",
           "version": "0.0.1-20260925143950",
           "type": "policy-implementation",
@@ -67,35 +67,35 @@
     "generated_config_issue": "https://github.com/msaleme/agent-governance-policies/issues/24",
     "all_disposable_assets": [
       {
-        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "groupId": "<ANYPOINT_ORG_ID>",
         "assetId": "approval-binding-live-20260925-dev",
         "version": "0.0.1-20260925143950",
         "type": "policy",
         "confirm_get_status": 200
       },
       {
-        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "groupId": "<ANYPOINT_ORG_ID>",
         "assetId": "approval-binding-live-20260925-flex-dev",
         "version": "0.0.1-20260925143950",
         "type": "policy-implementation",
         "confirm_get_status": 200
       },
       {
-        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "groupId": "<ANYPOINT_ORG_ID>",
         "assetId": "approval-binding-live-20260925-dev",
         "version": "0.0.1-20260925144221",
         "type": "policy",
         "confirm_get_status": 200
       },
       {
-        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "groupId": "<ANYPOINT_ORG_ID>",
         "assetId": "approval-binding-live-20260925-flex-dev",
         "version": "0.0.1-20260925144221",
         "type": "policy-implementation",
         "confirm_get_status": 200
       },
       {
-        "groupId": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
+        "groupId": "<ANYPOINT_ORG_ID>",
         "assetId": "approval-binding-live-20260925-mcp",
         "version": "0.0.1",
         "type": "mcp",
@@ -105,11 +105,11 @@
     ]
   },
   "scope": {
-    "organization_id": "4ac1188d-b7b2-469d-9ec5-e68c760bf874",
-    "environment_id": "67ebd3a4-afb7-4f6f-be27-3c4a8611be15",
+    "organization_id": "<ANYPOINT_ORG_ID>",
+    "environment_id": "<ANYPOINT_ENV_ID>",
     "environment": "Sandbox",
     "api_id": 21197857,
-    "gateway_target_id": "05a29d01-d0b5-4ee3-832b-0381fdacb3cf",
+    "gateway_target_id": "<GATEWAY_TARGET_ID>",
     "deployment_id": 28449921,
     "policies": [
       {
@@ -811,7 +811,7 @@
       "event": "deployment_created",
       "http_status": 201,
       "id": 28449921,
-      "target_id": "05a29d01-d0b5-4ee3-832b-0381fdacb3cf"
+      "target_id": "<GATEWAY_TARGET_ID>"
     },
     {
       "at": "2026-09-25T15:08:14.969989+00:00",
@@ -1063,7 +1063,7 @@
     "queried_at": "2026-09-25T15:17:04.165413+00:00",
     "http_status": 200,
     "dataset": "mulesoft.api.summary",
-    "query": "SELECT timestamp, COUNT(requests), \"api.instance.id\", \"policy.violation.status\", \"policy.id\", \"http.status_code\", \"request.disposition\" FROM \"mulesoft.api.summary\" WHERE \"sub_org.id\" = '4ac1188d-b7b2-469d-9ec5-e68c760bf874' AND \"env.id\" = '67ebd3a4-afb7-4f6f-be27-3c4a8611be15' AND \"api.instance.id\" = '21197857' AND timestamp BETWEEN 1790348820000 AND 1790349423141 GROUP BY \"api.instance.id\", \"policy.violation.status\", \"policy.id\", \"http.status_code\", \"request.disposition\" TIMESERIES",
+    "query": "SELECT timestamp, COUNT(requests), \"api.instance.id\", \"policy.violation.status\", \"policy.id\", \"http.status_code\", \"request.disposition\" FROM \"mulesoft.api.summary\" WHERE \"sub_org.id\" = '<ANYPOINT_ORG_ID>' AND \"env.id\" = '<ANYPOINT_ENV_ID>' AND \"api.instance.id\" = '21197857' AND timestamp BETWEEN 1790348820000 AND 1790349423141 GROUP BY \"api.instance.id\", \"policy.violation.status\", \"policy.id\", \"http.status_code\", \"request.disposition\" TIMESERIES",
     "rows": [
       {
         "http.status_code": "200",
@@ -1250,7 +1250,7 @@
       },
       {
         "kind": "registration",
-        "id": "05a29d01-d0b5-4ee3-832b-0381fdacb3cf",
+        "id": "<GATEWAY_TARGET_ID>",
         "at": "2026-09-25T15:17:40.596866+00:00",
         "delete_status": "flexctl_exit_0",
         "confirmation_status": "delete_command_succeeded"
