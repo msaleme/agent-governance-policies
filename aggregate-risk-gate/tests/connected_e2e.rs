@@ -2,15 +2,17 @@
 
 //! Real-gateway validation cases 2–8 from
 //! `docs/ASTRA-TASK-aggregate-risk-connected.md`. Every test drives a real
-//! Flex 1.14.0 container (local mode) and a real HTTP mock upstream. Each case
+//! Flex 1.14.0 container (local mode, except cases 2c/2d, which use a
+//! connected-mode registration and a control-plane API instance described by
+//! `AGP_CONNECTED_FIXTURE`) and a real HTTP mock upstream. Each case
 //! appends one sanitized JSON line to the file named by `AGP_E2E_EVIDENCE`
 //! (no credentials, registration data or digest keys are written).
 //!
 //! Run, one case at a time, on a Docker daemon hosting no other PDK test:
 //! `DOCKER_DEFAULT_PLATFORM=linux/amd64 AGP_E2E_EVIDENCE=/private/cases.jsonl \
 //!  cargo test --test connected_e2e -- --ignored --test-threads=1 --nocapture`
-//! Run the case 5 tests with `PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY=1`, so all calls
-//! share one worker ledger. Results are in `docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`.
+//! Run the case 5 and case 2c/2d tests with `PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY=1`,
+//! so all calls share one worker ledger. Results are in `docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`.
 
 mod common;
 
@@ -768,4 +770,229 @@ fn gateway_log_counts(container: &str) -> anyhow::Result<Value> {
         "configuration_applied": count("Configuration applied"),
         "wasm_vms_created": count("Thread-Local Wasm created")
     }))
+}
+
+/// Waits until the config-apply count has not changed for `quiet`, or until
+/// `timeout`. Returns the count it settled on.
+async fn wait_for_quiet_applies(
+    container: &str,
+    quiet: Duration,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let started = Instant::now();
+    let mut seen = gateway_log_counts(container)?["configuration_applied"]
+        .as_u64()
+        .unwrap_or(0);
+    let mut since = Instant::now();
+    while since.elapsed() < quiet && started.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = gateway_log_counts(container)?["configuration_applied"]
+            .as_u64()
+            .unwrap_or(0);
+        if now != seen {
+            seen = now;
+            since = Instant::now();
+        }
+    }
+    Ok(json!({
+        "configuration_applied": seen, "quiet": since.elapsed() >= quiet,
+        "waited_ms": started.elapsed().as_millis() as u64
+    }))
+}
+
+/// Private inputs for the connected cases: a mode-0600 JSON file named by
+/// `AGP_CONNECTED_FIXTURE` with `registration_directory`, `route`, `client_id`
+/// and `client_secret`. The operator writes `ui-save-apply-<n>.json` next to it
+/// after each real UI Save & Apply. None of these values are recorded.
+struct Connected {
+    dir: std::path::PathBuf,
+    fixture: Value,
+}
+
+impl Connected {
+    fn load() -> anyhow::Result<Self> {
+        let path = std::path::PathBuf::from(std::env::var("AGP_CONNECTED_FIXTURE")?);
+        let fixture: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let dir = path.parent().unwrap().to_path_buf();
+        Ok(Self { dir, fixture })
+    }
+
+    fn field(&self, key: &str) -> String {
+        self.fixture[key].as_str().unwrap_or_default().to_string()
+    }
+
+    fn phase(&self, phase: &str) {
+        let state = json!({"phase": phase, "at_ms": epoch_ms() as u64});
+        std::fs::write(self.dir.join("state.json"), state.to_string()).unwrap();
+    }
+
+    /// Waits up to 30 minutes for the operator's marker of UI Save & Apply `n`.
+    async fn wait_for_save_apply(&self, n: u32) -> anyhow::Result<Value> {
+        let marker = self.dir.join(format!("ui-save-apply-{n}.json"));
+        let deadline = Instant::now() + Duration::from_secs(1800);
+        while !marker.exists() {
+            anyhow::ensure!(Instant::now() < deadline, "no UI Save & Apply {n} marker");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(serde_json::from_slice(&std::fs::read(marker)?)?)
+    }
+
+    /// Removes the client id from a stamp before it is recorded.
+    fn scrub(&self, stamp: &str) -> String {
+        stamp.replace(&self.field("client_id"), "<client_id>")
+    }
+}
+
+/// Case 2c: the same ordering as case 2, with real Client ID Enforcement on a
+/// connected gateway. The API, its Client ID Enforcement → gate chain and an
+/// approved contract are configured in the control plane, and the gateway gets
+/// them only after a real UI Save & Apply. The gate keys on the verified
+/// `client_id`, so a spoofed, ever-changing `x-agent-id` has no effect.
+///
+/// Then, with the client's budget exhausted, a second UI Save & Apply is made
+/// and the same client calls again. Admitted at total=800 means that Save &
+/// Apply gave it a fresh ledger (finding F4). Run with
+/// `PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY=1`, so there is one ledger.
+#[pdk_test]
+#[ignore]
+async fn case2c_client_id_enforcement_on_a_connected_gateway() -> anyhow::Result<()> {
+    let ctx = Connected::load()?;
+    let httpmock_config = HttpMockConfig::builder()
+        .port(80)
+        .version("latest")
+        .hostname("backend")
+        .build();
+    let registration = ctx.field("registration_directory");
+    let flex_config = FlexConfig::builder()
+        .version("1.14.0")
+        .hostname("connected-flex")
+        .ports([FLEX_PORT])
+        .config_mounts([(registration.as_str(), "registration")])
+        .build();
+    let composite = TestComposite::builder()
+        .with_service(flex_config)
+        .with_service(httpmock_config)
+        .build()
+        .await?;
+    let flex: Flex = composite.service()?;
+    let url = format!(
+        "{}{}",
+        flex.external_url(FLEX_PORT).unwrap(),
+        ctx.field("route")
+    );
+    let httpmock: HttpMock = composite.service()?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let container = flex_container()?;
+    let client = client()?;
+    let (id, secret) = (ctx.field("client_id"), ctx.field("client_secret"));
+    let creds = |spoof: &str| -> Vec<(String, String)> {
+        vec![
+            ("client_id".into(), id.clone()),
+            ("client_secret".into(), secret.clone()),
+            ("x-agent-id".into(), spoof.into()),
+        ]
+    };
+    let send_with = |c: &reqwest::Client, n: u64, h: Vec<(String, String)>| {
+        let (c, url) = (c.clone(), url.clone());
+        async move {
+            let refs: Vec<(&str, &str)> = h.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            send(&c, &url, n, &refs).await
+        }
+    };
+
+    // First UI Save & Apply, then wait for enforcement (401 without
+    // credentials) and for the config applies to go quiet.
+    ctx.phase("awaiting-ui-save-apply-1");
+    let apply1 = ctx.wait_for_save_apply(1).await?;
+    let probe = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        match send(&probe, &url, 900, &[]).await {
+            Ok(w) if w.status == 401 => break,
+            _ if Instant::now() < deadline => tokio::time::sleep(Duration::from_secs(2)).await,
+            other => anyhow::bail!("Client ID Enforcement never answered 401: {other:?}"),
+        }
+    }
+    let settle1 = wait_for_quiet_applies(
+        &container,
+        Duration::from_secs(20),
+        Duration::from_secs(300),
+    )
+    .await?;
+    ctx.phase("running-case-2c");
+    let upstream = ok_mock(&server);
+
+    // (a) No credentials: Client ID Enforcement refuses before the gate runs.
+    let no_creds = send(&client, &url, 1, &[]).await?;
+    let hits_a = upstream.hits();
+
+    // (b) Valid client credentials, a different spoofed scope header each call.
+    let mut calls = Vec::new();
+    for n in 1..=4u64 {
+        calls.push(send_with(&client, n + 1, creds(&format!("spoofed-{n}"))).await?);
+    }
+    let hits_b = upstream.hits() - hits_a;
+    let wire = |w: &Wire| {
+        let mut v = w.json();
+        v["stamp"] = json!(ctx.scrub(&w.stamp));
+        v
+    };
+    let pass = no_creds.status == 401
+        && hits_a == 0
+        && calls[..3]
+            .iter()
+            .all(|w| w.status == 200 && w.rpc_error.is_none())
+        && calls[3].rpc_error == Some(-32008)
+        && calls
+            .iter()
+            .all(|w| !w.stamp.contains("spoofed") && !w.stamp.contains(&id))
+        && hits_b == 3;
+    record(
+        "2c-client-id-enforcement-connected",
+        if pass { "pass" } else { "fail" },
+        json!({
+            "auth_policy": "client-id-enforcement (connected, approved contract)",
+            "gate_identity": "authentication/client_id",
+            "ui_save_apply_1": apply1, "settle": settle1,
+            "no_credentials": no_creds.json(), "upstream_hits_no_credentials": hits_a,
+            "with_credentials": calls.iter().map(wire).collect::<Vec<_>>(),
+            "upstream_hits_with_credentials": hits_b
+        }),
+    );
+    anyhow::ensure!(pass, "case 2c expectations not met");
+
+    // Second UI Save & Apply with the budget exhausted, then the same client.
+    let before = gateway_log_counts(&container)?["configuration_applied"].clone();
+    ctx.phase("awaiting-ui-save-apply-2");
+    let apply2 = ctx.wait_for_save_apply(2).await?;
+    // The apply can land after the marker: wait up to 5 minutes for a new
+    // config apply, then for quiet. No new apply is a result too.
+    let wait = Instant::now();
+    while gateway_log_counts(&container)?["configuration_applied"] == before
+        && wait.elapsed() < Duration::from_secs(300)
+    {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let settle2 = wait_for_quiet_applies(
+        &container,
+        Duration::from_secs(20),
+        Duration::from_secs(300),
+    )
+    .await?;
+    ctx.phase("running-case-2d");
+    let after = send_with(&client, 10, creds("spoofed-after")).await?;
+    let reset_observed = after.rpc_error.is_none() && after.stamp.contains("total=800/");
+    record(
+        "2d-ui-save-apply-ledger",
+        "observed",
+        json!({
+            "ui_save_apply_2": apply2, "applies_before": before,
+            "settle": settle2, "same_client_after": wire(&after),
+            "reset_observed": reset_observed
+        }),
+    );
+    ctx.phase("done");
+    Ok(())
 }

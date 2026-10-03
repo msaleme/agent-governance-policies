@@ -297,8 +297,9 @@ config apply that rebuilds the listener does the same, because Envoy then builds
 with an empty ledger. On a real Flex 1.14.0 gateway this happens at startup: the gateway applies its
 config a second time about 5 s after the first, and a scope exhausted before that apply is admitted
 again after it ([case 8b](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#f4-a-config-apply-resets-the-ledger)).
-Other config changes, such as a policy update or a UI Save & Apply, are likely to do the same but
-were not tested. Both fail open. Apart from window boundaries, a restart or a config apply is the
+Not every apply rebuilds the listener. On a connected gateway, a UI Save & Apply with no config
+change was applied, but the exhausted scope stayed denied (case 2d in the same doc). A policy
+config change was not tested and may reset the ledger. A reset fails open. Apart from window boundaries, a restart or a config apply is the
 only thing that resets totals. Settlement is an in-process map update, so it has no transient
 failure to retry.
 
@@ -357,7 +358,7 @@ holding the budget under contention where a naive read-then-write counter breach
   lost and all scopes start again at zero, even mid-window. A config apply resets it when it
   rebuilds the listener, which gives Envoy new wasm VMs. The gateway does this once at startup,
   about 5 s after it first applies its config, so a scope can be admitted up to its budget again
-  after that apply. There is no persistence and no storage dependency, so there are no storage
+  after that apply. A UI Save & Apply with no config change did not reset it. There is no persistence and no storage dependency, so there are no storage
   conflicts or storage errors to handle.
 - **No signed decision records.** Every ledger operation happens in-process and is not
   independently attestable outside this policy's own process. This build makes no claim that its

@@ -12,6 +12,10 @@ Mac against a real Flex Gateway 1.14.0 container, not on Astra. Machine-readable
 - 1 is observed: 8. A follow-up adds case 8b, also observed (finding F4).
 - None failed.
 
+*Follow-up, 2026-10-03:* a connected-mode run adds case 2c (PASS), which closes case 2's
+substitution with real Client ID Enforcement, and case 2d (OBSERVED, F4). It also rebuilt and
+dev-published with cargo-anypoint 1.10.0, which closes case 9's toolchain qualification.
+
 The policy source was not changed for this run.
 
 ## Run identity
@@ -24,7 +28,7 @@ The policy source was not changed for this run.
 | Workers | container nproc 14. Envoy `--concurrency 4` (pdk_test default). Single-worker runs set `FLEX_SERVICE_ENVOY_CONCURRENCY=1`. |
 | Toolchain | rustc 1.89.0, pdk-test 1.10.0, anypoint PDK plugin 1.9.0, cargo-anypoint **1.9.0** (the Makefile pins 1.10.0) |
 | Harness | Case 1 runs the unmodified `tests/requests.rs`. Cases 2–8 are `tests/connected_e2e.rs` (`#[ignore]`, one real Flex container plus a real httpmock upstream per case). |
-| Identity | A disposable local-mode registration, deleted afterwards (see below) |
+| Identity | A disposable local-mode registration, deleted afterwards (see below). Cases 2c/2d (2026-10-03) used a disposable connected-mode registration. |
 
 Unless noted, every case uses this config:
 
@@ -57,13 +61,52 @@ have. So the chain was built-in `http-basic-authentication-flex` → gate, with
   - The upstream was hit **3** times.
 
 The policy ordering and spoof resistance hold with a real authentication policy. A run with
-Client ID Enforcement itself is still pending and needs a connected-mode gateway.
+Client ID Enforcement itself needed a connected-mode gateway; see case 2c below.
 
 The Basic Auth password is generated per run and never recorded. The first run used a hardcoded
 test value. After the harness was changed, case 2 was rerun with the same wire results. One
 rerun in between was invalid: stale `target/` assets from the case 9 publish build had renamed
 the policy, so Flex loaded no gate (empty stamps, 4 hits). The case's predicate failed that run.
 After a rebuild with the original asset ids (WASM SHA-256 unchanged), it passed.
+
+### 2c: Client ID Enforcement on a connected gateway (PASS, 2026-10-03, #14)
+
+This follow-up closes the case 2 substitution. The harness is
+`case2c_client_id_enforcement_on_a_connected_gateway` in `tests/connected_e2e.rs`, run with
+`FLEX_SERVICE_ENVOY_CONCURRENCY=1`, so there is one ledger.
+
+**Setup.** Everything below was disposable, made for this run in Sandbox, and is deleted now.
+
+- A connected-mode Flex 1.14.0 gateway ran in the pdk_test container, with an httpmock upstream.
+- An MCP API instance had this ordered chain:
+  1. Client ID Enforcement 1.3.3, reading `client_id`/`client_secret` headers.
+  2. A dev publish of this gate, with `identitySource: authentication`, `identityField: client_id`,
+     digest disclosure and the default config above.
+- A client application had an approved contract.
+
+**UI Save & Apply.** The API created the deployment, but enforcement was asserted only after one
+real UI Save & Apply.
+
+- `deployment.updatedDate` moved from `14:40:53.314Z` to `14:52:54.501Z`, and the deployment
+  status was `applied`.
+- The harness waited for a 401 without credentials, and then for 20 s with no new config apply,
+  before sending calls.
+
+| Call | Credentials | `x-agent-id` | HTTP | Gate stamp / RPC error | Upstream hits |
+|---|---|---|---|---|---|
+| (a) | none | — | **401** | none (Client ID Enforcement refused first) | 0 |
+| (b) 1–3 | valid client | `spoofed-1` … `spoofed-3` | 200 | `allowed;scope=agent:hmac-2fec5296612fd17e;…;total=800`, `1600`, `2400/3000` | 3 |
+| (b) 4 | valid client | `spoofed-4` | 200 | `-32008`, `denied;…;would-be-total=3200;budget=3000` | 0 |
+
+All four calls share one scope digest, whatever the spoofed header said. No stamp contains the
+spoofed value or the client id. The gate keys on the identity that Client ID Enforcement verified.
+
+### 2d: a UI Save & Apply with no config change (OBSERVED, 2026-10-03, F4)
+
+The client stayed exhausted after case 2c. A second real UI Save & Apply with no changes moved
+`deployment.updatedDate` from `14:52:54.501Z` to `14:57:43.980Z`, with status `applied`. The gateway
+logged a new `Configuration applied` (4 → 5). After 20 s with no further apply, the same client
+called again: **`-32008`, `would-be-total=3200`.** The ledger was **not** reset. See F4.
 
 ### 3: default digest disclosure (PASS, #14)
 
@@ -178,7 +221,12 @@ ledgers a burst reached, without depending on Envoy's process list.
 So a scope can be admitted up to its budget again after any config apply that rebuilds the
 listener, not only after a restart. This is the over-admit direction. It is the same in-process
 limitation as the restart reset, but the README said a restart was the only reset. Startup is the
-only trigger confirmed. A policy update or a UI Save & Apply is likely to do the same, but was not
+only trigger confirmed.
+
+*Follow-up, 2026-10-03 (case 2d):* a real UI Save & Apply with no config change, on a connected
+gateway, did **not** reset the ledger. The gateway logged a new `Configuration applied` (4 → 5), but
+once that apply settled, the client exhausted in case 2c was still denied (`-32008`,
+`would-be-total=3200`). So not every apply rebuilds the listener. A policy config change was not
 tested.
 
 **Resolved as a docs fix in this change.** The policy code is unchanged. The README's restart
@@ -203,14 +251,30 @@ Qualifications:
 - The PDK CLI rejects any asset id containing a digit with "Invalid asset-id", even though the
   message says numbers are allowed. A disposable id must therefore be digit-free.
 
+*Follow-up, 2026-10-03:* for case 2c, the policy was rebuilt and dev-published with the pinned
+cargo-anypoint **1.10.0** (rustc 1.89.0). `make publish` exited 0 and the WASM SHA-256 was
+identical to the 1.9.0 build above. That closes the toolchain qualification. Case 9 stays
+qualified only because it is a dev publish, not a release.
+
 ## Resource deletion (all confirmed)
 
 | Resource | Action | Confirmation |
 |---|---|---|
 | Test Exchange definition and implementation | `DELETE` with `x-delete-type: hard-delete` → 204 | GET by version and by asset → 404. A search shows no test ids left. |
-| Flex registrations (two local-mode: the original, plus one for the case 2 rerun) | Local mode creates no Runtime Manager record (checked: absent from both environments' gateway lists and from ARM servers) | Certificates, keys and registration files securely removed from disk |
+| Flex registrations (two local-mode: the original, plus one for the case 2 rerun) | Certificates, keys and registration files securely removed from disk | **Correction, 2026-10-03:** these registrations are absent from both environments' gateway lists and from ARM servers, but a local-mode registration *does* create a server-side registry target (a new registration under the same name fails with "already exists"). Those targets remain. They are inert because their certificates are gone. Deleting them needs their gateway ids, which went with the shredded files. |
 | Flex and mock containers and networks | Removed by the pdk_test harness | 0 containers and 0 networks labelled `CreatedBy=pdk-test` |
 | Shared gateways and APIs | Not touched | — |
+
+**Cases 2c/2d (2026-10-03).** Every resource was disposable and created for this run.
+
+| Resource | Action | Confirmation |
+|---|---|---|
+| Client application (its contract cascades) | `DELETE` → 204 | Application and contract GET → 404 |
+| MCP API instance, with its two policies and its deployment | `DELETE` after the contract was gone | API and deployment GET → 404 |
+| Dev Exchange definition and implementation of the gate | `DELETE` with `x-delete-type: hard-delete` → 204 | GET → 404 |
+| Disposable MCP Exchange asset | `DELETE` | GET → 404 |
+| Connected-mode Flex registration | `flexctl registration delete --file` → "Gateway deleted successfully" | Target shows `DELETED`, and the gateway is absent from the CONNECTED and DISCONNECTED lists. Registration files securely removed. |
+| Flex and mock containers and networks | Removed | 0 containers and 0 networks labelled `CreatedBy=pdk-test` |
 
 ## Redaction
 

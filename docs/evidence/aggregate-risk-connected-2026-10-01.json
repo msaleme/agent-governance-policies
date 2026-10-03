@@ -427,7 +427,7 @@
       "id": "F4",
       "case": "8b",
       "found_utc": "2026-10-02",
-      "summary": "The gateway applies its config twice at startup, about 5 s apart. The second apply replaces the listener; Envoy builds new wasm VMs, so every ledger resets. Mac: a scope exhausted before the apply (12 admitted on 4 ledgers) was admitted again after it at total=800/1600/2400, then denied at 3200. Linux CI runner: the first burst straddled the apply (applies 1 -> 2 during the burst) and reached 8 ledgers, admitting 20 of 200. README said a restart was the only reset. Over-admit direction. Startup is the only trigger confirmed; policy update / UI Save & Apply untested.",
+      "summary": "The gateway applies its config twice at startup, about 5 s apart. The second apply replaces the listener; Envoy builds new wasm VMs, so every ledger resets. Mac: a scope exhausted before the apply (12 admitted on 4 ledgers) was admitted again after it at total=800/1600/2400, then denied at 3200. Linux CI runner: the first burst straddled the apply (applies 1 -> 2 during the burst) and reached 8 ledgers, admitting 20 of 200. README said a restart was the only reset. Over-admit direction. Startup is the only trigger confirmed. Follow-up 2026-10-03 (case 2d): a UI Save & Apply with no config change on a connected gateway applied config (4 -> 5) but did NOT reset the ledger (exhausted client still denied, would-be-total=3200). A policy config change remains untested.",
       "resolution": "docs fix: README restart paragraph and limitations, CHANGELOG #15 entry and known limitations now say a restart or a config apply that rebuilds the listener resets the ledger; case 8 waits for the second apply; case 8b records the reset; policy code unchanged"
     }
   ],
@@ -439,13 +439,22 @@
     },
     "flex_registration": {
       "deleted": true,
-      "note": "two local-mode registrations (original + one for the case 2 rerun); local mode creates no Runtime Manager record (verified absent from both env gateway lists and ARM servers); certificates + keys securely removed from disk"
+      "note": "two local-mode registrations (original + one for the case 2 rerun); certificates + keys securely removed from disk. Correction 2026-10-03: they are absent from both env gateway lists and ARM servers, but local mode DOES create a server-side registry target (re-registering the same name fails with \"already exists\"); those targets remain, inert (certificates gone), and cannot be deleted without their gateway ids, which went with the shredded files."
     },
     "containers_networks": {
       "deleted": true,
       "confirmed": "0 containers / 0 networks labelled CreatedBy=pdk-test"
     },
-    "shared_resources_touched": false
+    "shared_resources_touched": false,
+    "follow_up_2026_10_03": {
+      "client_application": "DELETE -> 204; contract cascaded; GET -> 404",
+      "mcp_api_instance": "deleted with its two policies and deployment after the contract was gone; API and deployment GET -> 404",
+      "gate_dev_exchange_assets": "DELETE x-delete-type: hard-delete -> 204; GET -> 404",
+      "mcp_exchange_asset": "deleted; GET -> 404",
+      "flex_registration": "connected mode; flexctl registration delete --file -> deleted; target DELETED, absent from CONNECTED and DISCONNECTED lists; files securely removed",
+      "containers_networks": "0 containers / 0 networks labelled CreatedBy=pdk-test",
+      "shared_resources_touched": false
+    }
   },
   "follow_up_runs": [
     {
@@ -484,6 +493,114 @@
         "reset_observed": true
       },
       "ci_wasm_sha256_note": "CI builds on Linux produce a different WASM SHA-256 from the Mac build recorded above; the CI job prints its own hash"
+    },
+    {
+      "date_utc": "2026-10-03",
+      "where": "maintainer Mac, disposable connected-mode Flex 1.14.0 gateway in a pdk_test container, FLEX_SERVICE_ENVOY_CONCURRENCY=1; disposable MCP API instance (Client ID Enforcement 1.3.3 -> gate dev publish), client app with approved contract; two real UI Save & Apply presses",
+      "toolchain": {
+        "rustc": "1.89.0",
+        "cargo-anypoint": "1.10.0 (pinned)",
+        "pdk-test": "1.10.0"
+      },
+      "wasm_sha256": "33443716859f371bead629ab61cf326cb6b63496442fab0688e3898b4cce5ff9",
+      "wasm_sha256_note": "identical to the 2026-10-01 cargo-anypoint 1.9.0 build",
+      "dev_publish": {
+        "make_publish_exit": 0,
+        "release": false
+      },
+      "closes": [
+        "case 2 substitution (real Client ID Enforcement)",
+        "case 9 toolchain qualification (cargo-anypoint 1.10.0)"
+      ],
+      "test_result": "1 passed; 0 failed (1247.63 s)",
+      "cases": [
+        {
+          "case": "2c-client-id-enforcement-connected",
+          "detail": {
+            "auth_policy": "client-id-enforcement (connected, approved contract)",
+            "gate_identity": "authentication/client_id",
+            "no_credentials": {
+              "at_ms": 1791039233494,
+              "rpc_error": null,
+              "stamp": "",
+              "status": 401
+            },
+            "settle": {
+              "configuration_applied": 4,
+              "quiet": true,
+              "waited_ms": 20063
+            },
+            "ui_save_apply_1": {
+              "action": "Save & Apply",
+              "api_status": "active",
+              "at": "2026-10-03T14:53:31Z",
+              "deployment_status": "applied",
+              "method": "ui",
+              "n": 1,
+              "updated_after": "2026-10-03T14:52:54.501Z",
+              "updated_before": "2026-10-03T14:40:53.314Z"
+            },
+            "upstream_hits_no_credentials": 0,
+            "upstream_hits_with_credentials": 3,
+            "with_credentials": [
+              {
+                "at_ms": 1791039233549,
+                "rpc_error": null,
+                "stamp": "allowed;scope=agent:hmac-2fec5296612fd17e;contribution=800;total=800/3000;unit=points;settlement=committed",
+                "status": 200
+              },
+              {
+                "at_ms": 1791039233552,
+                "rpc_error": null,
+                "stamp": "allowed;scope=agent:hmac-2fec5296612fd17e;contribution=800;total=1600/3000;unit=points;settlement=committed",
+                "status": 200
+              },
+              {
+                "at_ms": 1791039233554,
+                "rpc_error": null,
+                "stamp": "allowed;scope=agent:hmac-2fec5296612fd17e;contribution=800;total=2400/3000;unit=points;settlement=committed",
+                "status": 200
+              },
+              {
+                "at_ms": 1791039233560,
+                "rpc_error": -32008,
+                "stamp": "denied;scope=agent:hmac-2fec5296612fd17e;would-be-total=3200;budget=3000;unit=points",
+                "status": 200
+              }
+            ]
+          },
+          "disposition": "pass"
+        },
+        {
+          "case": "2d-ui-save-apply-ledger",
+          "detail": {
+            "applies_before": 4,
+            "reset_observed": false,
+            "same_client_after": {
+              "at_ms": 1791039582522,
+              "rpc_error": -32008,
+              "stamp": "denied;scope=agent:hmac-2fec5296612fd17e;would-be-total=3200;budget=3000;unit=points",
+              "status": 200
+            },
+            "settle": {
+              "configuration_applied": 5,
+              "quiet": true,
+              "waited_ms": 20526
+            },
+            "ui_save_apply_2": {
+              "action": "Save & Apply",
+              "api_status": "active",
+              "at": "2026-10-03T14:59:20Z",
+              "deployment_status": "applied",
+              "method": "ui",
+              "n": 2,
+              "updated_after": "2026-10-03T14:57:43.980Z",
+              "updated_before": "2026-10-03T14:52:54.501Z"
+            }
+          },
+          "disposition": "observed"
+        }
+      ]
     }
   ]
 }
