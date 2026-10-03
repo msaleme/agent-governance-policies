@@ -157,7 +157,9 @@ jobs:
   # container in local mode. The registration comes from the
   # FLEX_REGISTRATION_YAML secret (a disposable local-mode identity), is written
   # with mode 600 and is deleted even if a step fails. Case 5 runs on one Envoy
-  # worker so every call shares a ledger. Fork PRs have no secrets and skip.
+  # worker so every call shares a ledger. Case 2c/2d is skipped: it needs a
+  # connected-mode registration, a control-plane API instance and two real UI
+  # Save & Apply presses, so it is run by hand. Fork PRs have no secrets and skip.
   runtime-e2e:
     needs: exchange-availability
     if: needs.exchange-availability.outputs.runtime == 'true'
@@ -203,7 +205,7 @@ jobs:
       - name: Connected cases 2-4 and 6-8 (default workers)
         env:
           AGP_E2E_EVIDENCE: ${{ runner.temp }}/cases.jsonl
-        run: cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 --skip case5
+        run: cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 --skip case5 --skip case2c
       - name: Connected case 5 (one Envoy worker)
         env:
           AGP_E2E_EVIDENCE: ${{ runner.temp }}/cases.jsonl
