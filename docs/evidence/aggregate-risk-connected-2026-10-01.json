@@ -415,13 +415,20 @@
       "id": "F2",
       "case": "8",
       "summary": "Observed 12/200 admitted at envoy concurrency 4 (= 4 x 3) and 3/200 at concurrency 1, matching README's N x aggregateBudget. FLEX_SERVICE_ENVOY_CONCURRENCY=1 gives one budget per replica; README could say so.",
-      "resolution": "open"
+      "resolution": "docs fix: README single-worker note (PR #40)"
     },
     {
       "id": "F3",
       "case": "2",
       "summary": "Client ID Enforcement could not be exercised in local mode (needs control-plane contracts); http-basic-authentication-flex used as the upstream authentication policy. Ordering and spoof-resistance proven; Client-ID-specific run still pending on a connected gateway.",
       "resolution": "open"
+    },
+    {
+      "id": "F4",
+      "case": "8b",
+      "found_utc": "2026-10-02",
+      "summary": "The gateway applies its config twice at startup, about 5 s apart. The second apply replaces the listener; Envoy builds new wasm VMs, so every ledger resets. Mac: a scope exhausted before the apply (12 admitted on 4 ledgers) was admitted again after it at total=800/1600/2400, then denied at 3200. Linux CI runner: the first burst straddled the apply (applies 1 -> 2 during the burst) and reached 8 ledgers, admitting 20 of 200. README said a restart was the only reset. Over-admit direction. Startup is the only trigger confirmed; policy update / UI Save & Apply untested.",
+      "resolution": "docs fix: README restart paragraph and limitations, CHANGELOG #15 entry and known limitations now say a restart or a config apply that rebuilds the listener resets the ledger; case 8 waits for the second apply; case 8b records the reset; policy code unchanged"
     }
   ],
   "resource_deletion": {
@@ -439,5 +446,44 @@
       "confirmed": "0 containers / 0 networks labelled CreatedBy=pdk-test"
     },
     "shared_resources_touched": false
-  }
+  },
+  "follow_up_runs": [
+    {
+      "date_utc": "2026-10-02",
+      "where": "GitHub Actions ubuntu-24.04 runner (runtime-e2e job), Flex 1.14.0, local mode",
+      "case_8_first_ci_run": {
+        "admitted": 24,
+        "calls": 200,
+        "envoy_concurrency_flag": "4",
+        "note": "burst straddled the second startup config apply"
+      },
+      "case_8_diagnostic_ci_run": {
+        "admitted": 20,
+        "ledgers_reached": 8,
+        "config_applies_before_burst": 1,
+        "config_applies_after_burst": 2,
+        "envoy_processes": "1",
+        "envoy_worker_threads": "4",
+        "same_scope_after_pause": "denied x4",
+        "second_burst_fresh_scope_admitted": 12
+      },
+      "case_8_mac_settled": {
+        "admitted": 12,
+        "ledgers_reached": 4,
+        "settle_waited_ms": 5798
+      },
+      "case_8b_mac": {
+        "exhaust_admitted": 12,
+        "applies_during_exhaust": 1,
+        "probe_same_scope": [
+          "total=800/3000",
+          "total=1600/3000",
+          "total=2400/3000",
+          "denied would-be-total=3200"
+        ],
+        "reset_observed": true
+      },
+      "ci_wasm_sha256_note": "CI builds on Linux produce a different WASM SHA-256 from the Mac build recorded above; the CI job prints its own hash"
+    }
+  ]
 }

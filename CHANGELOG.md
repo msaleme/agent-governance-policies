@@ -125,7 +125,8 @@ publication are included.
   period, and a clock stepping backwards never resets a total. The new `window: worker-lifetime`
   never resets. The unimplemented `ledgerEndpoint` field is removed. The README, GCL and P4A text now
   say the budget is per policy instance per gateway worker: `N` workers admit up to
-  `N × aggregateBudget`, and a restart resets the ledger. A shared, durable ledger is future (v2)
+  `N × aggregateBudget`, and a restart or a config apply that rebuilds the listener resets the
+  ledger (confirmed on a real gateway on 2026-10-02). A shared, durable ledger is future (v2)
   work. **Breaking:** `window: rolling-24h` (the old default) never rolled and is now rejected with
   its replacements named, the default is now `fixed-period` with a 24-hour window, and a config that
   sets `ledgerEndpoint` must drop it.
@@ -149,7 +150,8 @@ publication are included.
   shared/remote store is the single change that would close both: it makes single-use
   global across replicas and makes the storage-unavailable branch reachable.
 - The aggregate-risk gate's ledger is in-process: one budget per policy instance per
-  gateway worker (not shared across workers or replicas), reset by a restart, and with
+  gateway worker (not shared across workers or replicas), reset by a restart or by a config
+  apply that rebuilds the listener (which the gateway does once at startup), and with
   no cryptographic non-repudiation of decisions.
   Reference concurrency scenarios are synthetic, not production telemetry.
 - Inspection targets admitted JSON-RPC envelopes and bodies, not paths, query

@@ -291,10 +291,16 @@ A response that is not one of the normal kinds (`committed`, `released`) writes 
 the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned
 and not-active. The line carries no identity.
 
-**Worker restart.** The ledger is in worker memory. When the worker restarts, every committed and
-reserved amount is gone and all scopes start again at zero. This fails open, and it is deterministic:
-apart from window boundaries, a restart is the only thing that resets totals. Settlement is an in-process map update, so it has
-no transient failure to retry.
+**Worker restart and config apply.** The ledger is in the memory of the worker's wasm VM. When the
+worker restarts, every committed and reserved amount is gone and all scopes start again at zero. A
+config apply that rebuilds the listener does the same, because Envoy then builds new wasm VMs, each
+with an empty ledger. On a real Flex 1.14.0 gateway this happens at startup: the gateway applies its
+config a second time about 5 s after the first, and a scope exhausted before that apply is admitted
+again after it ([case 8b](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#f4-a-config-apply-resets-the-ledger)).
+Other config changes, such as a policy update or a UI Save & Apply, are likely to do the same but
+were not tested. Both fail open. Apart from window boundaries, a restart or a config apply is the
+only thing that resets totals. Settlement is an in-process map update, so it has no transient
+failure to retry.
 
 ## Accounting window
 
@@ -346,10 +352,13 @@ holding the budget under contention where a naive read-then-write counter breach
   at the cost of worker parallelism. In the [real Flex 1.14.0 run, case 8](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#8-per-worker-scope-observed-15),
   12 of 200 calls were admitted with four workers and 3 of 200 with one worker, using
   `aggregateBudget: 3000` and `fixedWeight: 800`. These are observations from that run;
-  replicas still have independent budgets, and restart still resets the ledger.
-- **A restart or redeploy resets the ledger.** Every committed and reserved amount is lost and all
-  scopes start again at zero, even mid-window. There is no persistence and no storage dependency,
-  so there are no storage conflicts or storage errors to handle.
+  replicas still have independent budgets, and a restart or config apply still resets the ledger.
+- **A restart, redeploy or config apply resets the ledger.** Every committed and reserved amount is
+  lost and all scopes start again at zero, even mid-window. A config apply resets it when it
+  rebuilds the listener, which gives Envoy new wasm VMs. The gateway does this once at startup,
+  about 5 s after it first applies its config, so a scope can be admitted up to its budget again
+  after that apply. There is no persistence and no storage dependency, so there are no storage
+  conflicts or storage errors to handle.
 - **No signed decision records.** Every ledger operation happens in-process and is not
   independently attestable outside this policy's own process. This build makes no claim that its
   admit/deny decisions are cryptographically non-repudiable.
