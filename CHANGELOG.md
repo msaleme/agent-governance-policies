@@ -2,10 +2,33 @@
 
 ## Unreleased
 
-First source snapshot of the Agent Governance Policies family. Two independent
-Rust + PDK 1.10.0 policies for MuleSoft Flex/Omni Gateway, built with Rust 1.89.0
-and compiled for `wasm32-wasip1`. No compiled release assets and no Exchange
-publication are included.
+Nothing yet.
+
+## 0.1.0-rc.1 — 2026-10-03
+
+This is the first source prerelease of the Agent Governance Policies family: two
+independent Rust and PDK 1.10.0 policies for MuleSoft Flex/Omni Gateway, built
+with Rust 1.89.0 for `wasm32-wasip1`. Both policies are at version `1.0.0` in their
+`Cargo.toml`, and the repository version is separate from that. Only the source
+is released. There are no compiled WASM assets. Both policies were dev-published to
+Exchange during verification and then deleted. No production Exchange asset is
+published.
+
+### Verification summary
+
+- **Library tests:** 46 for approval binding and 140 for the aggregate-risk gate, all
+  passing.
+- **CI:** CI runs fmt, strict Clippy, the library tests, integration-test compilation
+  and a release WASM build. It runs the full PDK packaging path with Exchange metadata
+  validation. It also runs the aggregate-risk `#[pdk_test]` suites on a real Flex
+  Gateway 1.14.0 container.
+- **Real-gateway evidence:** the full set is listed in [docs/README.md](docs/README.md).
+  - Approval binding: P5/P6 is a qualified partial. P5 and same-replica replay
+    rejection were proven, and `local()` limits P6 to one replica.
+  - Aggregate-risk gate: eight cases pass, including real Client ID Enforcement on a
+    connected gateway. Three are qualified and three observed. None failed.
+- **Review findings:** P4A reviewer findings #1–#7 and #14–#18 are resolved and
+  closed.
 
 ### Added
 

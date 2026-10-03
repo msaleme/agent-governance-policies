@@ -1,0 +1,61 @@
+cff-version: 1.2.0
+message: >-
+  If you use these policies, please cite this software at the anchor tag
+  v0.1.0-rc.1. The Cross-Session Aggregate-Risk Gate implements the model in the
+  "Authorized but Composed" position paper listed under references; please cite it
+  too when you use that policy.
+title: "Agent Governance Policies"
+abstract: >-
+  MuleSoft Flex/Omni Gateway custom policies (PDK, Rust to WebAssembly) that check
+  the authorization integrity of AI agent Model Context Protocol tool calls at a
+  gateway enforcement point. Approval-to-Execution Binding checks that the executed
+  MCP tools/call is the call an approval record approved. It uses five
+  approval-binding-vectors (ABV v0.1) predicates, with HMAC separate-attester and
+  single-use checks. The Cross-Session Aggregate-Risk Gate reserves and authorizes
+  each call against a shared exposure budget that is keyed on a verified identity.
+  It refuses individually valid calls whose total would exceed that budget. This is
+  not a compliance certification, and the policies are not production-certified.
+type: software
+authors:
+  - family-names: Saleme
+    given-names: Michael K.
+    orcid: "https://orcid.org/0009-0003-6736-1900"
+repository-code: "https://github.com/msaleme/agent-governance-policies"
+license: MIT
+version: "0.1.0-rc.1"
+date-released: "2026-10-03"
+keywords:
+  - agent-governance
+  - ai-security
+  - authorization
+  - model-context-protocol
+  - api-gateway
+  - risk-management
+references:
+  - type: article
+    title: >-
+      Authorized but Composed: Cross-Session Risk Composition as an
+      Agent-Governance Control
+    authors:
+      - family-names: Saleme
+        given-names: Michael K.
+        orcid: "https://orcid.org/0009-0003-6736-1900"
+    doi: "10.5281/zenodo.21400261"
+    url: "https://doi.org/10.5281/zenodo.21400261"
+    publisher:
+      name: Zenodo
+    notes: >-
+      Concept DOI. Position paper whose reserve-then-authorize model the
+      Cross-Session Aggregate-Risk Gate implements. Companion code:
+      https://github.com/msaleme/authorized-but-composed
+  - type: article
+    title: "Authorized but Refused"
+    authors:
+      - family-names: Saleme
+        given-names: Michael K.
+        orcid: "https://orcid.org/0009-0003-6736-1900"
+    doi: "10.5281/zenodo.21263262"
+    url: "https://doi.org/10.5281/zenodo.21263262"
+    publisher:
+      name: Zenodo
+    notes: Single-action sibling of "Authorized but Composed".

@@ -229,9 +229,15 @@ Further honest limitations, disclosed rather than hidden:
   mode never reserves. But `local()` storage is **per-replica** and its durability across a gateway
   **restart** is runtime-defined: a replayed approval can slip through on a second replica or after
   a restart. A horizontally-scaled deployment needing durable, global P6 must swap `local()` for a
-  shared/remote store. The cross-replica / restart / storage-unavailable behaviours can only be
-  proven on a real gateway — that end-to-end validation is handed to Astra
-  (`docs/ASTRA-TASK-approval-p6-replay.md`).
+  shared/remote store. These behaviours can only be shown on a real gateway. The 2026-09-25
+  connected run (brief: `docs/ASTRA-TASK-approval-p6-replay.md`) is a **qualified partial**
+  verification. It proved P5 with real Client ID Enforcement and same-replica replay rejection.
+  It observed replays reopening across replicas and after a restart, the expected `local()`
+  limitation. It left shared-store global reservations unproven. It also found the
+  storage-unavailable fail-closed branch correct by inspection but unreachable on `local()`,
+  because the pinned proxy-wasm SDK panics on unexpected host statuses. See
+  [`APPROVAL-P6-CONNECTED-2026-09-25`](../docs/APPROVAL-P6-CONNECTED-2026-09-25.md) and
+  [`APPROVAL-STORAGE-UNAVAILABLE-2026-09-25`](../docs/APPROVAL-STORAGE-UNAVAILABLE-2026-09-25.md).
 - **No `.on_response()` handler, by design.** Unlike the sibling MCP Honeytoken Tripwire, this
   filter registers only an `on_request` handler. PDK's `DualFilter` re-runs a configured response
   handler even over a request filter's own `Flow::Break` early reply, and a response handler that
@@ -290,7 +296,10 @@ adds a small Docker/`pdk_test` end-to-end suite (sound-approval-reaches-upstream
 action-mismatch-denied-and-never-reaches-upstream) — deliberately smaller than Tripwire's
 integration suite, since this policy's threat model ("is this record proof of this execution") is
 already covered exhaustively by the unit tests; it adds only what an in-process harness cannot
-exercise.
+exercise. Behaviour that needs a connected gateway was checked on a real Flex Gateway: P5 with
+real Client ID Enforcement, and same-replica P6 replay rejection. That run was a qualified
+partial verification; the evidence is in [`docs/`](../docs/README.md). `tests/CONNECTED.md`
+describes the runnable connected extension.
 
 ---
 
