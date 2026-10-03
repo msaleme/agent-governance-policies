@@ -108,9 +108,12 @@ publication are included.
   time and an expiry from the new `reservationTimeoutMs` (default 60000, range 1000–86400000), read
   from the gateway clock. An expired reservation is reclaimed under the ledger lock, freeing its
   budget, and committed exposure is untouched. Settlement is by id and happens at most once, so a
-  duplicate, reordered or crossed commit/release changes nothing. A response within one more timeout
-  after reclaim settles late: a success is charged without a budget check, a failure changes nothing.
-  After that the reservation is counted abandoned. `resultHeader` on an allowed or monitored call now
+  duplicate, reordered or crossed commit/release changes nothing. A response after reclaim settles
+  late while the reservation's tombstone is held: a success is charged without a budget check, a
+  failure changes nothing. Reclaim is lazy. The tombstone is held for at least one more timeout and
+  dropped when the scope is next touched after that. From then on the reservation is counted
+  abandoned. An untouched scope can therefore settle late after more than two timeouts. That
+  over-counts, the safe direction, and was confirmed on a real gateway on 2026-10-01. `resultHeader` on an allowed or monitored call now
   ends with `settlement=committed|released|late-committed|late-released|not-active`, and any
   settlement that isn't on time logs the ledger counters, with no identities. A worker restart still
   resets the in-memory ledger. That is now documented and tested. **Breaking:** the allowed/monitor
@@ -122,7 +125,8 @@ publication are included.
   period, and a clock stepping backwards never resets a total. The new `window: worker-lifetime`
   never resets. The unimplemented `ledgerEndpoint` field is removed. The README, GCL and P4A text now
   say the budget is per policy instance per gateway worker: `N` workers admit up to
-  `N × aggregateBudget`, and a restart resets the ledger. A shared, durable ledger is future (v2)
+  `N × aggregateBudget`, and a restart or a config apply that rebuilds the listener resets the
+  ledger (confirmed on a real gateway on 2026-10-02). A shared, durable ledger is future (v2)
   work. **Breaking:** `window: rolling-24h` (the old default) never rolled and is now rejected with
   its replacements named, the default is now `fixed-period` with a 24-hour window, and a config that
   sets `ledgerEndpoint` must drop it.
@@ -146,7 +150,8 @@ publication are included.
   shared/remote store is the single change that would close both: it makes single-use
   global across replicas and makes the storage-unavailable branch reachable.
 - The aggregate-risk gate's ledger is in-process: one budget per policy instance per
-  gateway worker (not shared across workers or replicas), reset by a restart, and with
+  gateway worker (not shared across workers or replicas), reset by a restart or by a config
+  apply that rebuilds the listener (which the gateway does once at startup), and with
   no cryptographic non-repudiation of decisions.
   Reference concurrency scenarios are synthetic, not production telemetry.
 - Inspection targets admitted JSON-RPC envelopes and bodies, not paths, query

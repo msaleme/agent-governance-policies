@@ -30,6 +30,8 @@ pdk-test = { version = "=1.10.0" }
 pdk-unit = { version = "=1.10.0", features = ["enable_stop_iteration", "experimental"] }
 httpmock = "0.6"
 reqwest = "0.11"
+tokio = { version = "1", features = ["rt", "time"] }
+base64 = "0.22"
 
 [lib]
 crate-type = ["cdylib"]

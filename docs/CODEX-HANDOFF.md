@@ -25,10 +25,34 @@ maintainer's machine** — it is *not* an Astra-owned autonomous worktree. So:
   and **GitGuardian** both green on that PR; local `main` == `origin/main`, clean tree.
 - There are **no release tags** in this repo. Anchor on the merged commit above; do not
   cut or publish a release as part of this task.
-- `aggregate-risk-gate` was untouched by #1–#7 except a `Makefile` `cargo-anypoint`
-  version bump; its suite is green (no regression). It has **no open reviewer findings**.
+- `aggregate-risk-gate` reviewer findings **#14–#18** are code-resolved and merged in PRs
+  #35–#39 (merge commit **`5b71d80`**). Its 140-test lib suite is green in CI, but its
+  `#[pdk_test]` cases have never been run against a gateway.
 
-## Your task
+## Current task (2026-10): aggregate-risk-gate on a real gateway
+
+The approval-binding run below is done (see `docs/APPROVAL-P6-CONNECTED-2026-09-25.md`). The
+open task is now:
+
+> `aggregate-risk-gate/docs/ASTRA-TASK-aggregate-risk-connected.md`
+
+It has nine cases: the committed `#[pdk_test]` cases, the Client ID Enforcement → gate
+ordering, digest disclosure, monitor mode, reservation reclaim and late settlement, the fixed
+window reset, restart, the observed per-worker budget, and Exchange publication. The
+authorization, handling and honesty rules below apply unchanged. The brief adds a mandatory
+redaction grep because this repo is public.
+
+**Status (2026-10-01):** run on the maintainer's Mac in local mode, not on Astra. Evidence is in
+`docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`, and the harness is
+`aggregate-risk-gate/tests/connected_e2e.rs`. Three items are still open:
+
+- a case 2 rerun with real Client ID Enforcement on a connected gateway;
+- a case 9 rerun under cargo-anypoint 1.10.0;
+- optional finding F2: a README note on single-worker budgets.
+
+Finding F1 (lazy tombstones) is resolved by a docs fix in the same change.
+
+## Earlier task (done): approval-binding P5/P6
 
 **Prove — on a real, disposable, explicitly-authorized Flex/Omni Gateway — the small set
 of behaviours that Local Mode cannot,** enumerated in:

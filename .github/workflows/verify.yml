@@ -37,16 +37,44 @@ jobs:
               cargo +1.89.0 build --release --target wasm32-wasip1 --locked --offline
             )
           done
-      # Runtime suites require separately authorized disposable Flex registrations.
-      # No registration or platform credentials are supplied to this workflow.
+      # The runtime suite needs a Flex registration; it runs in runtime-e2e below.
+
+  # Only expose secret availability as a job output: secrets cannot be used
+  # directly in a job-level if. Fork PRs without the secret skip packaging.
+  exchange-availability:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      available: ${{ steps.check.outputs.available }}
+      runtime: ${{ steps.check.outputs.runtime }}
+    steps:
+      - name: Check packaging secret availability
+        id: check
+        shell: bash
+        env:
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
+          FLEX_REGISTRATION_YAML: ${{ secrets.FLEX_REGISTRATION_YAML }}
+        run: |
+          if [[ -n "${ANYPOINT_GROUP_ID:-}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ -n "${ANYPOINT_GROUP_ID:-}" && -n "${FLEX_REGISTRATION_YAML:-}" ]]; then
+            echo "runtime=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "runtime=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Full PDK packaging path from a clean checkout: generate the definition and
   # implementation assets exactly as `make build` / `make release` would, prove
   # src/generated/config.rs is in sync with gcl.yaml, reject placeholder or
-  # invalid Exchange metadata, and keep the generated files as an artifact.
-  # ANYPOINT_GROUP_ID is a repository *variable* (an org UUID, not a secret);
+  # invalid Exchange metadata, and keep the redacted files as an artifact.
+  # ANYPOINT_GROUP_ID is a repository secret;
   # Cargo.toml keeps its placeholder and is only rewritten inside this job.
   exchange-assets:
+    needs: exchange-availability
+    if: needs.exchange-availability.outputs.available == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -71,20 +99,48 @@ jobs:
       - name: Generate assets
         shell: bash
         env:
-          ANYPOINT_GROUP_ID: ${{ vars.ANYPOINT_GROUP_ID }}
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
         working-directory: ${{ matrix.policy }}
         run: |
           set -euo pipefail
           if [[ ! "${ANYPOINT_GROUP_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-            echo "::error::Repository variable ANYPOINT_GROUP_ID must be the owning Anypoint org UUID"
+            echo "::error::Repository secret ANYPOINT_GROUP_ID must be the owning Anypoint org UUID"
             exit 1
           fi
+          trap 'git checkout -- Cargo.toml' EXIT
           sed -i "s/REPLACE_WITH_YOUR_ANYPOINT_ORG_ID/${ANYPOINT_GROUP_ID}/" Cargo.toml
           make build
           git checkout -- Cargo.toml
           git diff --exit-code -- src/generated/config.rs
       - name: Validate Exchange metadata
         run: python3 scripts/check_exchange_metadata.py ${{ matrix.policy }} --assets
+      - name: Redact and check generated artifacts
+        env:
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
+        working-directory: ${{ matrix.policy }}
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+
+          group_id = os.environ["ANYPOINT_GROUP_ID"].encode()
+          if not group_id:
+              raise SystemExit("::error::Packaging secret is unavailable")
+          files = []
+          for directory in ("target/implementation", "target/implementation-dev"):
+              files.extend(path for path in Path(directory).rglob("*") if path.is_file())
+          release = Path("target/wasm32-wasip1/release")
+          for pattern in ("*.wasm", "*_definition.yaml", "*_implementation.yaml"):
+              files.extend(release.glob(pattern))
+          if not files:
+              raise SystemExit("::error::No generated artifacts to redact")
+          for path in files:
+              data = path.read_bytes()
+              if group_id in data and path.suffix != ".wasm":
+                  path.write_bytes(data.replace(group_id, b"<org-id>"))
+          # Check every uploaded file, including binaries, without logging values.
+          if any(group_id in path.read_bytes() or group_id in str(path).encode() for path in files):
+              raise SystemExit("::error::Group ID remains in generated artifacts")
       - uses: actions/upload-artifact@v4
         with:
           name: exchange-assets-${{ matrix.policy }}
@@ -95,3 +151,94 @@ jobs:
             ${{ matrix.policy }}/target/wasm32-wasip1/release/*.wasm
             ${{ matrix.policy }}/target/wasm32-wasip1/release/*_definition.yaml
             ${{ matrix.policy }}/target/wasm32-wasip1/release/*_implementation.yaml
+
+  # Real-gateway suite for aggregate-risk-gate: tests/requests.rs plus the
+  # #[ignore] connected_e2e cases 2-8, each against a real Flex 1.14.0
+  # container in local mode. The registration comes from the
+  # FLEX_REGISTRATION_YAML secret (a disposable local-mode identity), is written
+  # with mode 600 and is deleted even if a step fails. Case 5 runs on one Envoy
+  # worker so every call shares a ledger. Case 2c/2d is skipped: it needs a
+  # connected-mode registration, a control-plane API instance and two real UI
+  # Save & Apply presses, so it is run by hand. Fork PRs have no secrets and skip.
+  runtime-e2e:
+    needs: exchange-availability
+    if: needs.exchange-availability.outputs.runtime == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: aggregate-risk-gate
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install pinned PDK tooling
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --target wasm32-wasip1
+          npm install -g anypoint-cli-v4-public@1.6.27
+          anypoint-cli-v4 plugins:install anypoint-pdk-plugin@1.9.0
+          cargo +1.89.0 install --locked cargo-anypoint@1.10.0
+      - name: Build the policy
+        env:
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
+        run: |
+          set -euo pipefail
+          trap 'git checkout -- Cargo.toml' EXIT
+          sed -i "s/REPLACE_WITH_YOUR_ANYPOINT_ORG_ID/${ANYPOINT_GROUP_ID}/" Cargo.toml
+          make build
+          sha256sum target/wasm32-wasip1/release/*.wasm
+      - name: Write the Flex registration
+        env:
+          FLEX_REGISTRATION_YAML: ${{ secrets.FLEX_REGISTRATION_YAML }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$FLEX_REGISTRATION_YAML" > tests/config/registration.yaml
+          # Flex runs as uid 65532; keep the file 600 but readable by the gateway.
+          sudo chown 65532 tests/config/registration.yaml
+      - name: Committed pdk_test cases (tests/requests.rs)
+        run: cargo +1.89.0 test --test requests --locked -- --test-threads=1
+      - name: Connected cases 2-4 and 6-8 (default workers)
+        env:
+          AGP_E2E_EVIDENCE: ${{ runner.temp }}/cases.jsonl
+        run: cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 --skip case5 --skip case2c
+      - name: Connected case 5 (one Envoy worker)
+        env:
+          AGP_E2E_EVIDENCE: ${{ runner.temp }}/cases.jsonl
+          PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY: "1"
+        run: cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 case5
+      - name: Remove the Flex registration
+        if: always()
+        run: |
+          sudo rm -f tests/config/registration.yaml
+          test ! -e tests/config/registration.yaml
+      - name: Check evidence for identifiers
+        id: scan
+        if: always()
+        env:
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
+          EVIDENCE: ${{ runner.temp }}/cases.jsonl
+        shell: python
+        run: |
+          import os, re
+          from pathlib import Path
+
+          path = Path(os.environ["EVIDENCE"])
+          if not path.exists():
+              raise SystemExit("::error::No evidence was recorded")
+          text = path.read_text()
+          uuid = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+          ipv4 = re.compile(r"\b(?!127\.0\.0\.1\b)(?!0\.0\.0\.0\b)\d{1,3}(\.\d{1,3}){3}\b")
+          if os.environ["ANYPOINT_GROUP_ID"] in text or uuid.search(text) or ipv4.search(text):
+              raise SystemExit("::error::Evidence contains an identifier; not uploading it")
+          print(f"{len(text.splitlines())} evidence lines, no identifiers")
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scan.outcome == 'success'
+        with:
+          name: runtime-e2e-evidence
+          if-no-files-found: error
+          path: ${{ runner.temp }}/cases.jsonl

@@ -260,14 +260,20 @@ these states, and the response stamps which one as `settlement=`:
 |---|---|---|
 | `committed` | Success response before the reservation was reclaimed | Reserved amount moves to committed |
 | `released` | Failure response before the reservation was reclaimed | Reserved amount is freed |
-| `late-committed` | Success response after reclaim, within one more timeout | Amount is added to committed, with no budget check: the call did happen, and under-counting it is the unsafe direction |
-| `late-released` | Failure response after reclaim, within one more timeout | Nothing; the amount was already freed |
-| `not-active` | The reservation was already settled, or was reclaimed more than one timeout ago | Nothing |
+| `late-committed` | Success response after reclaim, while the reservation's tombstone is still held (see below) | Amount is added to committed, with no budget check: the call did happen, and under-counting it is the unsafe direction |
+| `late-released` | Failure response after reclaim, while the tombstone is still held | Nothing; the amount was already freed |
+| `not-active` | The reservation was already settled, or its tombstone was dropped | Nothing |
 
 Reclaim is lazy. It runs, under the same lock as admission, whenever a call touches the scope, and
-across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is reclaimed once `now` reaches
-its expiry. Its id is then kept for one more timeout so a slow response can still settle late, and
-after that it is counted as abandoned. This covers a client that disconnects, a cancelled request,
+across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is
+reclaimed by the first such pass at or after its expiry, which frees its budget and leaves a
+tombstone so a slow response can still settle late. The tombstone is kept for at least one more
+timeout and dropped by the first pass at or after `expiry + reservationTimeoutMs`. From then on the
+reservation is counted as abandoned. A response settles before that pass runs, so the
+"one more timeout" is a minimum, not a deadline. If nothing touches the scope, a response arriving
+long after two timeouts still settles `late-committed` and is charged. That errs toward
+over-counting, the safe direction, and was observed on a real gateway
+(`docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`, case 5b). This covers a client that disconnects, a cancelled request,
 and an upstream that times out without a response reaching this policy: their reservations free up
 after the timeout instead of pinning the budget for the life of the worker.
 
@@ -285,10 +291,17 @@ A response that is not one of the normal kinds (`committed`, `released`) writes 
 the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned
 and not-active. The line carries no identity.
 
-**Worker restart.** The ledger is in worker memory. When the worker restarts, every committed and
-reserved amount is gone and all scopes start again at zero. This fails open, and it is deterministic:
-apart from window boundaries, a restart is the only thing that resets totals. Settlement is an in-process map update, so it has
-no transient failure to retry.
+**Worker restart and config apply.** The ledger is in the memory of the worker's wasm VM. When the
+worker restarts, every committed and reserved amount is gone and all scopes start again at zero. A
+config apply that rebuilds the listener does the same, because Envoy then builds new wasm VMs, each
+with an empty ledger. On a real Flex 1.14.0 gateway this happens at startup: the gateway applies its
+config a second time about 5 s after the first, and a scope exhausted before that apply is admitted
+again after it ([case 8b](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#f4-a-config-apply-resets-the-ledger)).
+Not every apply rebuilds the listener. On a connected gateway, a UI Save & Apply with no config
+change was applied, but the exhausted scope stayed denied (case 2d in the same doc). A policy
+config change was not tested and may reset the ledger. A reset fails open. Apart from window boundaries, a restart or a config apply is the
+only thing that resets totals. Settlement is an in-process map update, so it has no transient
+failure to retry.
 
 ## Accounting window
 
@@ -335,9 +348,18 @@ holding the budget under contention where a naive read-then-write counter breach
   API, a scope can be admitted up to `N × aggregateBudget` in a window. To make `aggregateBudget`
   an upper bound for the whole deployment, divide the intended budget by `N`. That bound is safe
   but loose: a scope whose traffic lands on one worker gets only `1/N` of the intended budget.
-- **A restart or redeploy resets the ledger.** Every committed and reserved amount is lost and all
-  scopes start again at zero, even mid-window. There is no persistence and no storage dependency,
-  so there are no storage conflicts or storage errors to handle.
+- **Single-worker configuration gives one budget per replica.** Setting
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1` gives each policy instance one worker ledger per replica,
+  at the cost of worker parallelism. In the [real Flex 1.14.0 run, case 8](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#8-per-worker-scope-observed-15),
+  12 of 200 calls were admitted with four workers and 3 of 200 with one worker, using
+  `aggregateBudget: 3000` and `fixedWeight: 800`. These are observations from that run;
+  replicas still have independent budgets, and a restart or config apply still resets the ledger.
+- **A restart, redeploy or config apply resets the ledger.** Every committed and reserved amount is
+  lost and all scopes start again at zero, even mid-window. A config apply resets it when it
+  rebuilds the listener, which gives Envoy new wasm VMs. The gateway does this once at startup,
+  about 5 s after it first applies its config, so a scope can be admitted up to its budget again
+  after that apply. A UI Save & Apply with no config change did not reset it. There is no persistence and no storage dependency, so there are no storage
+  conflicts or storage errors to handle.
 - **No signed decision records.** Every ledger operation happens in-process and is not
   independently attestable outside this policy's own process. This build makes no claim that its
   admit/deny decisions are cryptographically non-repudiable.
@@ -379,8 +401,8 @@ Docker:
   reservation has a bounded expiry; a duplicate commit or release, a commit after a release and a
   release after a commit change nothing; an abandoned reservation is reclaimed at its timeout
   without touching committed exposure; a late commit is charged exactly once and a late release
-  changes nothing; a settlement more than one timeout after reclaim is dropped and the reservation
-  counted abandoned; the counters tell every state apart; and a stranded reservation stops pinning
+  changes nothing; once a call touches the scope more than one timeout after reclaim, the tombstone
+  is dropped, the reservation is counted abandoned and a later settlement is `not-active`; the counters tell every state apart; and a stranded reservation stops pinning
   a full ledger after two timeouts.
   Six cover the accounting window: a fixed window resets committed exposure at the boundary;
   periods are aligned to the epoch, not first use; an in-flight reservation carries across a
