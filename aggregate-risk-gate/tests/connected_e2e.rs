@@ -553,22 +553,38 @@ async fn case7_restart_resets_the_ledger() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Case 8: fire many parallel calls over separate connections and record how
-/// many the per-worker ledgers admit. Observational: no fixed number asserted.
-/// It also records gateway config applies around each burst, and probes the
-/// exhausted scope after a pause: a config apply that rebuilds the listener
-/// creates fresh wasm VMs, and with them fresh ledgers.
-#[pdk_test]
-#[ignore]
-async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
-    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
-    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
-    let upstream = ok_mock(&server);
-    let container = flex_container()?;
-    let nproc = docker(&["exec", &container, "nproc"]).unwrap_or_default();
+/// The gateway applies its config twice at startup, about 5 s apart. The second
+/// apply replaces the listener and Envoy builds new wasm VMs, each with an empty
+/// ledger. Waits until `applies` config applies are logged, plus 2 s for the new
+/// VMs, or until `timeout`. Returns what it saw.
+async fn wait_for_config_applies(
+    container: &str,
+    applies: u64,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let started = Instant::now();
+    loop {
+        let counts = gateway_log_counts(container)?;
+        let seen = counts["configuration_applied"].as_u64().unwrap_or(0);
+        if seen >= applies || started.elapsed() >= timeout {
+            if seen >= applies {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            return Ok(json!({
+                "configuration_applied": seen, "reached": seen >= applies,
+                "waited_ms": started.elapsed().as_millis() as u64
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Envoy's worker layout inside the Flex container.
+fn envoy_layout(container: &str) -> Value {
+    let nproc = docker(&["exec", container, "nproc"]).unwrap_or_default();
     let envoy_args = docker(&[
         "exec",
-        &container,
+        container,
         "sh",
         "-c",
         "ps -eo args | grep -m1 '[e]nvoy'",
@@ -580,66 +596,99 @@ async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
         .windows(2)
         .find(|w| w[0] == "--concurrency")
         .map(|w| w[1].to_string());
-
-    // The first burst starts as soon as the gateway answers. The second, on a
-    // fresh scope, starts 15 s later, so a difference between them shows
-    // whether the gateway had extra ledgers only while it was starting.
-    let logs_before = gateway_log_counts(&container)?;
-    let first = burst(&url, "broker-7").await?;
-    let logs_after_first = gateway_log_counts(&container)?;
-    tokio::time::sleep(Duration::from_secs(15)).await;
-    let logs_after_pause = gateway_log_counts(&container)?;
-    // broker-7 was exhausted on every ledger by the first burst. Sequential calls on one
-    // connection, so they spread over workers only as Envoy assigns that connection.
-    let c = client()?;
-    let mut same_scope_after_pause = Vec::new();
-    for id in 1..=4 {
-        let w = send(&c, &url, 1000 + id, &[("x-agent-id", "broker-7")]).await?;
-        same_scope_after_pause
-            .push(json!({"status": w.status, "rpc_error": w.rpc_error, "stamp": w.stamp}));
-    }
-    let second = burst(&url, "broker-8").await?;
-    let logs_after_second = gateway_log_counts(&container)?;
-    let hits = upstream.hits();
-
-    // Count Envoy processes and their worker threads (named wrk:worker_N).
-    let envoy_processes = docker(&[
+    let processes = docker(&[
         "exec",
-        &container,
+        container,
         "sh",
         "-c",
         "ps -e -o comm | grep -c '^envoy$' || true",
     ])
     .unwrap_or_default();
+    // Envoy names its worker threads wrk:worker_N.
     let worker_threads = docker(&[
         "exec",
-        &container,
+        container,
         "sh",
         "-c",
         "cat /proc/[0-9]*/task/*/comm 2>/dev/null | grep -c '^wrk:' || true",
     ])
     .unwrap_or_default();
+    json!({
+        "container_nproc": nproc, "envoy_concurrency_flag": concurrency,
+        "envoy_processes": processes, "envoy_worker_threads": worker_threads
+    })
+}
 
+/// Case 8: once the gateway has settled, fire many parallel calls over separate
+/// connections and record how many the per-worker ledgers admit. Observational:
+/// no fixed number asserted.
+#[pdk_test]
+#[ignore]
+async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let upstream = ok_mock(&server);
+    let container = flex_container()?;
+    let settle = wait_for_config_applies(&container, 2, Duration::from_secs(30)).await?;
+    let before = gateway_log_counts(&container)?;
+    let result = burst(&url, "broker-7").await?;
+    let after = gateway_log_counts(&container)?;
+    let hits = upstream.hits();
     record(
         "8-per-worker-budget",
         "observed",
         json!({
-            "calls_per_burst": BURST_CALLS, "per_worker_admit_limit": 3,
-            "first_burst": first.to_json(), "second_burst_after_15s": second.to_json(),
-            "same_scope_after_pause": same_scope_after_pause,
-            "upstream_hits": hits,
-            "container_nproc": nproc, "envoy_concurrency_flag": concurrency,
-            "envoy_processes": envoy_processes, "envoy_worker_threads": worker_threads,
-            "gateway_log_counts": {
-                "before_first": logs_before, "after_first": logs_after_first,
-                "after_pause": logs_after_pause, "after_second": logs_after_second
-            }
+            "calls": BURST_CALLS, "per_worker_admit_limit": 3,
+            "burst": result.to_json(), "upstream_hits": hits,
+            "settle": settle, "envoy": envoy_layout(&container),
+            "gateway_log_counts": {"before_burst": before, "after_burst": after}
         }),
     );
     anyhow::ensure!(
-        first.other == 0 && second.other == 0,
+        result.other == 0 && result.admitted == hits as u64,
         "case 8 transport errors or hit mismatch"
     );
+    Ok(())
+}
+
+/// Case 8b: exhaust a scope as soon as the gateway answers, wait for the
+/// gateway's second startup config apply, then call the same scope again. A
+/// call admitted at total=800 means the apply gave it a fresh ledger.
+/// Observational: whether the burst lands before the apply depends on timing,
+/// so the config-apply counts around the burst are recorded too.
+#[pdk_test]
+#[ignore]
+async fn case8b_config_apply_resets_the_ledger() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let _upstream = ok_mock(&server);
+    let container = flex_container()?;
+    let before = gateway_log_counts(&container)?;
+    let exhaust = burst(&url, "broker-7").await?;
+    let after_exhaust = gateway_log_counts(&container)?;
+    let settle = wait_for_config_applies(&container, 2, Duration::from_secs(30)).await?;
+    // Sequential calls on one connection, which Envoy pins to one worker.
+    let c = client()?;
+    let mut probe = Vec::new();
+    for id in 1..=4 {
+        let w = send(&c, &url, 1000 + id, &[("x-agent-id", "broker-7")]).await?;
+        probe.push(json!({"status": w.status, "rpc_error": w.rpc_error, "stamp": w.stamp}));
+    }
+    let reset_observed = probe
+        .iter()
+        .any(|w| w["stamp"].as_str().unwrap_or("").contains("total=800/"));
+    record(
+        "8b-config-apply-resets-ledger",
+        "observed",
+        json!({
+            "exhaust_burst": exhaust.to_json(),
+            "applies_before_exhaust": before["configuration_applied"],
+            "applies_after_exhaust": after_exhaust["configuration_applied"],
+            "settle": settle, "probe_same_scope": probe, "reset_observed": reset_observed,
+            "envoy": envoy_layout(&container)
+        }),
+    );
+    anyhow::ensure!(exhaust.other == 0, "case 8b transport errors");
     Ok(())
 }
 

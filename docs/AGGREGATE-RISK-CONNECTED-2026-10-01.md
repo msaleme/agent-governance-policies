@@ -9,7 +9,7 @@ Mac against a real Flex Gateway 1.14.0 container, not on Astra. Machine-readable
 
 - 7 cases pass: 1, 3, 4, 5a, 5c, 6 and 7. (Case 5 is split into 5a, 5b and 5c.)
 - 3 are qualified: 2, 5b and 9.
-- 1 is observed: 8.
+- 1 is observed: 8. A follow-up adds case 8b, also observed (finding F4).
 - None failed.
 
 The policy source was not changed for this run.
@@ -150,7 +150,41 @@ admits 3 calls (`3000 / 800`).
 
 This matches the README's `N × aggregateBudget`. **F2:** the README could add that
 `FLEX_SERVICE_ENVOY_CONCURRENCY=1` makes `aggregateBudget` a single budget per replica, at the
-cost of worker parallelism.
+cost of worker parallelism. *Resolved by a README note (PR #40).*
+
+*Follow-up, 2026-10-02:* the first CI run of this case on a Linux runner admitted **24** of 200 at
+four workers, not 12. That was not extra workers: the burst straddled a second startup config
+apply that replaced every ledger (finding F4 below). Case 8 now waits for that apply before its
+burst. On the Mac it then admits 12 (four `total=800` stamps, one per ledger), from one Envoy
+process with four worker threads.
+
+### F4: a config apply resets the ledger
+
+Found while explaining the CI result above, on 2026-10-02. The policy source was not changed.
+
+The Flex gateway applies its config **twice** at startup. The gateway log shows `Configuration
+applied` once, then about 5 s later a second `Creating gateway` … `Configuration applied`. The
+second apply replaces the listener, and Envoy builds new thread-local wasm VMs and destroys the old
+ones. The ledger lives in the VM, so every scope starts again at zero.
+
+| Run | Before the burst | During the burst | Ledgers reached (`total=800` stamps) | Admitted | Same scope after the apply |
+|---|---|---|---|---|---|
+| Mac, case 8b | 1 apply | 1 apply | 4 | 12 | admitted again: `total=800`, `1600`, `2400`, then denied at `3200` |
+| Linux CI runner, diagnostic run | 1 apply | **1 → 2** | **8** (4 old + 4 new) | 20 | denied (the new ledgers were exhausted by the rest of the burst) |
+
+Each ledger stamps its first admitted call `total=800/3000`, so counting those stamps counts the
+ledgers a burst reached, without depending on Envoy's process list.
+
+So a scope can be admitted up to its budget again after any config apply that rebuilds the
+listener, not only after a restart. This is the over-admit direction. It is the same in-process
+limitation as the restart reset, but the README said a restart was the only reset. Startup is the
+only trigger confirmed. A policy update or a UI Save & Apply is likely to do the same, but was not
+tested.
+
+**Resolved as a docs fix in this change.** The policy code is unchanged. The README's restart
+paragraph and limitations, and the CHANGELOG `#15` entry and known limitations, now say that a
+restart **or a config apply that rebuilds the listener** resets the ledger. A shared ledger, the
+fix for both, is already listed as v2 work. Case 8b now records the reset on every run.
 
 ### 9: Exchange publication (QUALIFIED, #16)
 
