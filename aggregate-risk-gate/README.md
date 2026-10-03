@@ -461,15 +461,31 @@ Docker:
   cases.
 - **`dot_path_value` unit tests** (4): the dotted-path body reader used for `spend-amount`.
 
-`tests/requests.rs` holds two `pdk_test` integration tests that run the same
-sequential-composition and independent-scope scenarios through a real, containerized Flex
-Gateway — but Docker-based integration coverage was explicitly **out of scope** for this build's
-required verification gate (`fmt --check` / `clippy --lib` / `test --lib`, all of which are
-native and none of which touch this file), so these were written and confirmed to compile
-(`cargo test --no-run`) but were not executed against a live container in this environment.
-They still have not been executed. Running them needs a Flex Gateway registration, and CI is
-deliberately given none (see `.github/workflows/verify.yml`). Until they run, there is **no**
-runtime evidence for this policy on a real gateway.
+Two Docker suites run the policy through a real, containerized Flex Gateway 1.14.0 with a real
+HTTP mock upstream:
+
+- **`tests/requests.rs`** has two `pdk_test` cases: sequential composition refuses the fourth
+  call, and a different agent has an independent budget.
+- **`tests/connected_e2e.rs`** has the real-gateway validation cases from
+  `docs/ASTRA-TASK-aggregate-risk-connected.md`. They are `#[ignore]` and are run explicitly.
+  They cover:
+  - authentication policy ordering, with spoofed headers ignored;
+  - digest disclosure;
+  - monitor mode;
+  - reservation reclaim and late settlement, on one worker;
+  - the fixed-window reset;
+  - a restart;
+  - the per-worker budget;
+  - the reset caused by a config apply.
+
+  One more case, `case2c`, needs a connected-mode registration, a control-plane API instance
+  and two real UI Save & Apply presses, so it is run by hand only.
+
+Both suites need a Flex Gateway registration, which stays untracked. The CI `runtime-e2e` job
+writes a disposable local-mode registration from a repository secret, runs both suites (case 5
+on one Envoy worker; `case2c` skipped), deletes the registration and scans the evidence for
+identifiers. Results, including the hand-run connected cases, are in
+[`docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md).
 
 CI does run the full packaging path on every push: `make build` generates the definition and
 implementation assets, `scripts/check_exchange_metadata.py --assets` validates them, and the

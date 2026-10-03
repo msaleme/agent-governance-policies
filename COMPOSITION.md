@@ -32,6 +32,7 @@ reaches the upstream tool.
   aware of approval records, and approval-binding does not track exposure. Running
   them together does not merge those concerns; it layers two separate checks.
 - **Additive to Agent Fabric.** Both deploy as PDK policies on the Flex/Omni
-  gateway instances already fronting the fabric's A2A brokers and MCP tools, keyed
-  to the identity the fabric already carries. Neither requires a broker, agent, or
-  backend change.
+  gateway MCP API instances already fronting the fabric's MCP tools, keyed to the
+  identity the fabric already carries. Neither requires an agent or backend change.
+  Both declare `assetTypes: mcp` and gate MCP `tools/call` only. A2A broker and
+  model-proxy traffic is not covered.

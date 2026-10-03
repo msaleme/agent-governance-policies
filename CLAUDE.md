@@ -9,8 +9,10 @@ policies (Rust → `wasm32-wasip1`, PDK 1.10.0), a sibling family to
 [`agent-decoy-policies`](https://github.com/msaleme/agent-decoy-policies). Where
 that family adds deception, this one adds authorization integrity:
 
-- `approval-execution-binding/` — proves an executed MCP/A2A action equals the
-  action that was approved (the six `approval-binding-vectors` predicates P1–P6).
+- `approval-execution-binding/` — proves an executed MCP `tools/call` equals the
+  action that was approved. It enforces five `approval-binding-vectors` predicates:
+  P1, P2, P4, P5 and the opt-in P6. P3 is removed, and reference-shaped arguments are
+  denied under P2. MCP only; no A2A.
 - `aggregate-risk-gate/` — a reserve-then-authorize ledger that holds a shared
   exposure budget across sessions of individually-authorized calls.
 
@@ -35,8 +37,10 @@ cargo +1.89.0 test --tests --no-run --locked --offline      # integration tests 
 cargo +1.89.0 build --release --target wasm32-wasip1 --locked
 ```
 
-The `--lib` test suite is the authoritative gate; `tests/requests.rs` needs Docker
-and is not part of the pass counts reported. Regenerate config assets with the
+The `--lib` test suite is the authoritative gate, at 46 tests for approval binding
+and 140 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
+those counts. CI's `runtime-e2e` job runs the aggregate-risk `#[pdk_test]` suites
+on a real Flex Gateway 1.14.0 container. Its `case2c` is run by hand. Regenerate config assets with the
 Makefile (`make build-asset-files`) after changing `definition/gcl.yaml`.
 
 ## Hard rules (inherited from the parent projects)
@@ -47,9 +51,15 @@ Makefile (`make build-asset-files`) after changing `definition/gcl.yaml`.
   untracked. Scan before any push.
 - **Honesty over polish.** Framework references (NIST/OWASP/MITRE/EU AI Act/AIUC-1)
   are design and supporting-measure context, never certification claims. State
-  every limitation plainly (Stage A ledger scope, HMAC-only attestation,
-  unimplemented `ledgerEndpoint`/`window`). Do not weaken a test to make a gate
-  pass; do not invent framework IDs, benchmarks, or counts.
+  every limitation plainly: the per-worker ledger, which a restart resets; HMAC-only
+  attestation; and P6 single use being per replica on `local()`. Do not weaken a
+  test to make a gate pass; do not invent framework IDs, benchmarks, or counts.
+- **The repo is PUBLIC.** Never commit org, environment or client ids, hostnames,
+  IPs, digest keys or registration material. Run the redaction check in
+  `CONTRIBUTING.md` before every commit. `Cargo.toml` keeps the placeholder
+  `group_id`.
+- Real-gateway evidence goes in `docs/` as a report plus a JSON file (see
+  `docs/README.md`). Policy changes count as enforced only after a UI Save & Apply.
 - Match the sibling `agent-decoy-policies` README/attribution style and depth.
 
 ## Provenance

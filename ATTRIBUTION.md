@@ -34,8 +34,10 @@ add the runtime that performs it. The corpora are cited, not relicensed here.
   v0.1) conformance corpus into `approval-execution-binding/tests/fixtures/abv/`
   as its test fixtures (12 vectors: 3 positive controls + 9 negative predicate
   cases). The ABV corpus is MIT-licensed and was built for exactly this purpose;
-  its `SPEC.md` defines the P1–P6 predicate semantics and the P2/P3 precedence and
-  canonicalization rules the policy implements. The corpus tests a *record*; it
+  its `SPEC.md` defines the P1–P6 predicate semantics and canonicalization rules.
+  The policy implements P1, P2, P4, P5 and P6. It does not dereference arguments
+  (P3). Instead, it denies reference-shaped (`$ref`) arguments under P2, which
+  resolved P4A review finding #2. The corpus tests a *record*; it
   explicitly notes that the enforcement boundary is an architectural property the
   corpus itself cannot observe.
 - **Cross-Session Aggregate-Risk Gate** implements the reserve-then-authorize
@@ -57,18 +59,20 @@ add the runtime that performs it. The corpora are cited, not relicensed here.
 
 ## Protocol specifications
 
-These policies inspect and enforce on live agent-protocol traffic; they implement
-the wire formats defined by the following specifications (cited as the governed
-protocols, not as an endorsement or a conformance claim by their maintainers):
+These policies inspect and enforce on live agent-protocol traffic. They implement
+the wire formats defined by the following specifications, which are cited as the
+governed protocols. That is not an endorsement by their maintainers, and the
+policies make no conformance claim.
 
-- **Model Context Protocol (MCP)** — the JSON-RPC tool-calling protocol both
-  policies admit and gate on MCP instances: [modelcontextprotocol.io](https://modelcontextprotocol.io).
-- **Agent2Agent (A2A)** — the agent-to-agent protocol these policies gate on A2A
-  instances: [a2a-protocol.org](https://a2a-protocol.org) /
-  [github.com/a2aproject/A2A](https://github.com/a2aproject/A2A).
-- **JSON-RPC 2.0** — the envelope both protocols share and these policies parse,
-  including the `-32008` in-band error rendering on denial:
+- **Model Context Protocol (MCP):** the JSON-RPC tool-calling protocol that both
+  policies admit and gate on MCP API instances. Both declare `assetTypes: mcp`.
+  [modelcontextprotocol.io](https://modelcontextprotocol.io).
+- **JSON-RPC 2.0:** the envelope these policies parse, including the `-32008`
+  in-band error they return on denial.
   [jsonrpc.org/specification](https://www.jsonrpc.org/specification).
+
+Agent2Agent (A2A) and model-proxy instances are **not** gated. An earlier draft
+listed them, but neither had test coverage, so both were dropped in P4A review #16.
 
 ## Direct Rust dependencies
 
@@ -83,12 +87,17 @@ inventory for a binary release.
 | `serde` | 1.0.229 | both | MIT OR Apache-2.0; [serde-rs/serde](https://github.com/serde-rs/serde) |
 | `serde_json` | 1.0.151 | both | MIT OR Apache-2.0; [serde-rs/json](https://github.com/serde-rs/json) |
 | `anyhow` | 1.0.104 | both | MIT OR Apache-2.0; [dtolnay/anyhow](https://github.com/dtolnay/anyhow) |
-| `sha2` | 0.10.9 | approval-execution-binding | MIT OR Apache-2.0; [RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
-| `hmac` | 0.12.1 | approval-execution-binding | MIT OR Apache-2.0; [RustCrypto/MACs](https://github.com/RustCrypto/MACs) |
+| `sha2` | 0.10.9 | both | MIT OR Apache-2.0; [RustCrypto/hashes](https://github.com/RustCrypto/hashes) |
+| `hmac` | 0.12.1 | both | MIT OR Apache-2.0; [RustCrypto/MACs](https://github.com/RustCrypto/MACs) |
 | `chrono` | 0.4.45 | approval-execution-binding | MIT OR Apache-2.0; [chronotope/chrono](https://github.com/chronotope/chrono) |
 | `pdk-test`, `pdk-unit` (tests) | 1.10.0 | both | Salesforce `LICENSE.txt` in each crate |
 | `httpmock` (tests) | 0.6.8 | both | MIT; [alexliesenfeld/httpmock](https://github.com/alexliesenfeld/httpmock) |
 | `reqwest` (tests) | 0.11.27 | both | MIT OR Apache-2.0; [seanmonstar/reqwest](https://github.com/seanmonstar/reqwest) |
+| `tokio` (tests) | 1.53.1 | aggregate-risk-gate | MIT; [tokio-rs/tokio](https://github.com/tokio-rs/tokio) |
+| `base64` (tests) | 0.22.1 | aggregate-risk-gate | MIT OR Apache-2.0; [marshallpierce/rust-base64](https://github.com/marshallpierce/rust-base64) |
+
+In the aggregate-risk gate, `sha2` and `hmac` compute the `scopeDisclosure: digest`
+value. In approval binding, they compute the P5 attestation.
 
 The PDK also resolves internal crates such as `pdk-classy`; inspect the complete
 resolved dependency tree and its notices before distributing WASM bundles. Docker

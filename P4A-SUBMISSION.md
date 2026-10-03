@@ -1,7 +1,9 @@
 # P4A submission package — Agent Governance Policies
 
-Prepared 2026-09-24; updated 2026-09-25 (visibility blocker resolved; reviewer findings #1–#7
-resolved & merged; connected verification complete). Turnkey pack for submitting the two policies in this repo to the
+Prepared 2026-09-24. Updated 2026-09-25: the visibility blocker was resolved,
+reviewer findings #1–#7 were resolved and merged, and connected verification was
+complete. Updated 2026-10-03: aggregate-risk findings #14–#18 were resolved and
+closed, and source prerelease `v0.1.0-rc.1` was cut. Turnkey pack for submitting the two policies in this repo to the
 **P4A (Policies for Agents)** marketplace, mirroring the path the three published
 `agent-decoy-policies` siblings took. Submission itself is **UI-gated** (the P4A wizard) —
 this doc is everything a human needs to drive it; nothing here submits automatically.
@@ -22,7 +24,7 @@ unified project roots) a `.project.yaml`. Status per that list:
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
 | Lib tests | 46 pass | 140 pass |
-| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26) | In progress — P4A review #14–#18, one PR each |
+| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26) | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
 ### Repo visibility — RESOLVED (2026-09-24)
@@ -55,8 +57,9 @@ excludes all Flex identity material). No further visibility action is required t
   - **#6** Executor from **verified** `AuthenticationData` (client_id→principal); absent + P5-required
     fails closed; header is fallback only. — DONE
   - **#3** Atomic single-use via gateway data storage (`StoreMode::Absent`); replay denied; other
-    storage error fails closed; monitor does not reserve. Connected P5/P6 enforcement **verified on a
-    real Flex Gateway by Astra** (evidence in `docs/APPROVAL-P6-CONNECTED-2026-09-25.*`). Two items are
+    storage error fails closed; monitor does not reserve. Connected run on a real Flex Gateway:
+    a **qualified partial**. It proved P5 with real Client ID Enforcement and same-replica replay
+    rejection (evidence in `docs/APPROVAL-P6-CONNECTED-2026-09-25.*`). Two items are
     documented qualifications, not defects: cross-replica single-use is unproven on `local()` by design,
     and the storage-unavailable fail-closed branch is correct by inspection but not reachably testable on
     `local()` (pinned proxy-wasm SDK panics on unexpected host statuses; see
@@ -111,8 +114,9 @@ excludes all Flex identity material). No further visibility action is required t
 5. Submit; reviewer **Tommaso Bolis** runs the same review loop the three decoy policies went through.
    His findings #1–#7 on approval-execution-binding are **resolved and merged to `main`** (PR #19, plus
    publish/build fixes #23 and #26; per-finding resolution table above), and the policy has been
-   verified connected on a real gateway — so expect fewer round-trips. Close his OPEN #1–#7 with the
-   resolution note when you resubmit so he can re-review against merged `main`.
+   verified connected on a real gateway — so expect fewer round-trips. #1–#7 and #14–#18 are all
+   closed. When you resubmit, point him at the tagged `v0.1.0-rc.1` source so he can re-review
+   against merged `main`.
 
 ## Not claimed
 No P4A submission, acceptance, dashboard ID, or publication is asserted here — those come from an actual

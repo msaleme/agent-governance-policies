@@ -1,5 +1,11 @@
 # Codex / Astra handoff — connected-mode verification of `approval-execution-binding`
 
+> **Historical (closed 2026-10-03).** Every task this handoff authorized has finished.
+> The results are in the [evidence index](README.md). Reviewer findings #1–#7 and
+> #14–#18 are resolved and closed, and there are no open issues. The handling and
+> honesty rules below still apply to new runs. The working-state notes are a
+> snapshot from when it was written, and they are kept as they were.
+
 Read this first, then the task brief it points to. This is an **orientation +
 authorization** document, not evidence that anything passes.
 

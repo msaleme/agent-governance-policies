@@ -67,3 +67,20 @@ and confirmed absent; it created no gateway, API, contract, application, or regi
 - Global/multi-instance budget claims remain outside the implemented per-worker scope.
   The acceptance table must record maintainer-approved narrowing before claiming completion.
 - This evidence PR requires maintainer review and merge approval; it does not close #16.
+
+### Resolution, 2026-10-03
+
+The gates above were left as they stood on 2026-10-02. Since then:
+
+- **Packaging CI:** `ANYPOINT_GROUP_ID` was configured. The `exchange-assets` job now
+  passes for both policies.
+- **Runtime CI:** the `runtime-e2e` job runs the `#[pdk_test]` suites against a real
+  Flex Gateway 1.14.0 container on every pull request and every push to `main`.
+- **Client ID Enforcement:** passed on a connected gateway as case 2c. See
+  [AGGREGATE-RISK-CONNECTED-2026-10-01.md](AGGREGATE-RISK-CONNECTED-2026-10-01.md).
+- **Budget scope:** the documentation is narrowed to one budget per policy instance per
+  gateway worker. No global or multi-instance claim is made.
+- **#16:** merged in PR #35 and then PR #42, and closed by #42.
+
+This is still a development publish. No production Exchange asset is published from
+this repository.
