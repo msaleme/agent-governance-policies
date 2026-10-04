@@ -242,3 +242,87 @@ jobs:
           name: runtime-e2e-evidence
           if-no-files-found: error
           path: ${{ runner.temp }}/cases.jsonl
+
+  # Approval binding's #[pdk_test] suite on a real Flex Gateway, with the same
+  # disposable registration as runtime-e2e. It runs after that job, not beside
+  # it, so the one gateway identity is never used by two runners at once, and it
+  # still runs when that job fails.
+  runtime-e2e-approval:
+    needs: [exchange-availability, runtime-e2e]
+    if: ${{ !cancelled() && needs.exchange-availability.outputs.runtime == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: approval-execution-binding
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install pinned PDK tooling
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --target wasm32-wasip1
+          npm install -g anypoint-cli-v4-public@1.6.27
+          anypoint-cli-v4 plugins:install anypoint-pdk-plugin@1.9.0
+          cargo +1.89.0 install --locked cargo-anypoint@1.10.0
+      - name: Build the policy
+        env:
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
+        run: |
+          set -euo pipefail
+          trap 'git checkout -- Cargo.toml' EXIT
+          sed -i "s/REPLACE_WITH_YOUR_ANYPOINT_ORG_ID/${ANYPOINT_GROUP_ID}/" Cargo.toml
+          make build
+          sha256sum target/wasm32-wasip1/release/*.wasm
+      - name: Write the Flex registration
+        env:
+          FLEX_REGISTRATION_YAML: ${{ secrets.FLEX_REGISTRATION_YAML }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$FLEX_REGISTRATION_YAML" > tests/config/registration.yaml
+          # Flex runs as uid 65532; keep the file 600 but readable by the gateway.
+          sudo chown 65532 tests/config/registration.yaml
+      # The connected P5/P6 case is #[ignore]d: it needs a private fixture and a
+      # deployed auth chain, so only the local-mode cases run here.
+      - name: Committed pdk_test cases (tests/requests.rs)
+        env:
+          E2E_LOG: ${{ runner.temp }}/approval-e2e.log
+        run: |
+          set -euo pipefail
+          cargo +1.89.0 test --test requests --locked -- --test-threads=1 2>&1 | tee "$E2E_LOG"
+      - name: Remove the Flex registration
+        if: always()
+        run: |
+          sudo rm -f tests/config/registration.yaml
+          test ! -e tests/config/registration.yaml
+      - name: Check the test log for identifiers
+        id: scan
+        if: always()
+        env:
+          ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
+          E2E_LOG: ${{ runner.temp }}/approval-e2e.log
+        shell: python
+        run: |
+          import os, re
+          from pathlib import Path
+
+          path = Path(os.environ["E2E_LOG"])
+          if not path.exists():
+              raise SystemExit("::error::No test log was recorded")
+          text = path.read_text()
+          uuid = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+          ipv4 = re.compile(r"\b(?!127\.0\.0\.1\b)(?!0\.0\.0\.0\b)\d{1,3}(\.\d{1,3}){3}\b")
+          if os.environ["ANYPOINT_GROUP_ID"] in text or uuid.search(text) or ipv4.search(text):
+              raise SystemExit("::error::Test log contains an identifier; not uploading it")
+          print(f"{len(text.splitlines())} log lines, no identifiers")
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.scan.outcome == 'success'
+        with:
+          name: runtime-e2e-approval-log
+          if-no-files-found: error
+          path: ${{ runner.temp }}/approval-e2e.log
