@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-rc.2 — 2026-10-04
 
 Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
 
