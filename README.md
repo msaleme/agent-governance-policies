@@ -154,11 +154,12 @@ Every pull request and every push to `main` runs the
 | `policies` | For each policy: `rustfmt --check`, strict Clippy (`-D warnings`), library tests, integration-test compilation and a release WASM build, all against the committed lockfile |
 | `exchange-assets` | The full PDK packaging path (`make build`) from a clean checkout. It fails if the generated config drifts from `gcl.yaml`, and it validates the Exchange metadata with `scripts/check_exchange_metadata.py`. |
 | `runtime-e2e` | Builds the aggregate-risk gate and runs its `#[pdk_test]` suites against a **real Flex Gateway 1.14.0 container**, using a disposable local-mode identity held in a repository secret. It then scans the evidence for identifiers. |
+| `runtime-e2e-approval` | The same for Approval-to-Execution Binding: its `#[pdk_test]` suite on a real Flex Gateway 1.14.0 container, including the check that the `rpc-param` envelope is stripped before the upstream with a correct `content-length`. Both runtime jobs share a `flex-registration` concurrency group, so the one registration is never used by two runners at once, and their full test output goes only to identifier-scanned log files. |
 
 The packaging and runtime jobs need repository secrets, so pull requests from
 forks skip them.
 
-Current library test counts: **67** for Approval-to-Execution Binding and **190**
+Current library test counts: **97** for Approval-to-Execution Binding and **191**
 for the aggregate-risk gate.
 
 To run the CI's `policies` checks locally, from a policy directory:

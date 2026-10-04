@@ -30,7 +30,8 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   long queue refuses new reservations) and is charged even after its reservation is reclaimed; a
   commit whose record reads as missing within the reservation's lifetime is charged, not dropped;
   and an unwritable release stays held until reclaimed. Only the cleanup pass that marks a
-  tombstone deletes it, timed on the gateway clock. Remaining known edges are listed in the policy
+  tombstone deletes it, timed on the gateway clock. A zero-length stored value reads as absent,
+  so an empty record never wedges a scope closed. Remaining known edges are listed in the policy
   README.
   Keys are an HMAC of the scope, never the raw identity, private to the policy instance unless the
   new `ledgerNamespace` is set. Stale keys are deleted, and `maxScopes` is enforced per replica
@@ -47,7 +48,7 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   uninspectable, so a `tools/call` can't be hidden by an encoding the upstream decodes
   differently, such as `utf-7`. A body the JSON parser rejects (nesting too deep, a lone
   surrogate, a BOM) is now unpriceable instead of being charged as a single call.
-- Library tests: 190 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
+- Library tests: 191 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
   under `spend-amount` in block mode. New real-gateway cases: `case8n` asserts exactly 3 of 200
   admitted across four Envoy workers with the node ledger, and `case8nb` records whether the node
   ledger survives the startup config apply.
@@ -62,9 +63,30 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   cap, nonces of approvals already expired under P4 are swept, and if the store is still full
   the call is denied.
 - **Canonical form hardened (#52).** Integers outside ±(2^53−1), and objects whose keys sort
-  differently by UTF-8 bytes and UTF-16 code units, now fail closed. A maximum approval
-  lifetime and stripping the `rpc-param` envelope before it reaches upstream are documented as
-  not yet implemented.
+  differently by UTF-8 bytes and UTF-16 code units, now fail closed.
+- **Maximum approval lifetime (#52).** The new optional `maxApprovalLifetimeSeconds` (default
+  `0`, off; range 1–31536000) bounds an approval's remaining lifetime under P4: an approval whose
+  `not_after` is later than now + the maximum + `clockSkewSeconds`, on the gateway clock, is
+  denied `predicate=P4`. Setting it without P4 in `requiredPredicates` fails at startup. It
+  checks `not_after` rather than adding an `iat` claim, so the `mcp-v1` payload and the ABV
+  corpus are unchanged. `not_after` is authenticated only when P5 is required.
+- **`rpc-param` envelope removed before upstream (#52).** With `approvalSource: rpc-param`, the
+  top-level `approvalRpcField` member is now cut out of every forwarded body (an allowed call, or
+  a monitor-mode forward), byte-for-byte with one adjoining comma; the rest of the body is not
+  re-serialized. The result is re-parsed and must equal the original minus that member, or block
+  mode denies the call as malformed. `content-length` is set to the new length, because PDK 1.10's
+  `set_body` does not update it. The new `stripApprovalEnvelope` (default `true`) turns this off.
+  Header mode is unchanged.
+- **CI** runs the approval-binding `#[pdk_test]` suite on a real Flex Gateway 1.14.0 container
+  (new `runtime-e2e-approval` job). It asserts that the upstream receives the exact stripped
+  bytes and the rewritten `content-length`. Both runtime jobs share one `flex-registration`
+  concurrency group, and their full test output goes only to scanned log files.
+- **Breaking: `clockSkewSeconds` is bounded to 0–3600.** Before, a negative value was treated as
+  `0` and there was no upper limit, so a very large skew overflowed the P4 deadline and silently
+  disabled expiry and the lifetime bound; it could also wrap a P6 nonce's stored expiry into the
+  past, so the cap sweep could delete a live nonce. Out-of-range values are now rejected at
+  startup, P4 fails closed if the deadline can't be computed, and a nonce expiry that can't be
+  represented is never swept.
 - **Charset and unparseable bodies fail closed.** A body with a `charset` other than
   `utf-8` is treated as malformed (denied in block mode, flagged in monitor mode). Before,
   `charset=utf-7` could carry a `tools/call` the policy read as an unknown method and
@@ -72,7 +94,7 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
 - The P6 cap sweep runs only when the per-worker reservation count reaches the cap, so the
   normal path makes the same single atomic store call as before. The cap is approximate and
   the sweep's key listing is not yet verified on a real gateway.
-- Library tests: 67 (was 46).
+- Library tests: 97 (was 46).
 
 ## 0.1.0-rc.1 — 2026-10-03
 

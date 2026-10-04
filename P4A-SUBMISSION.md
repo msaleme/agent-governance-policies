@@ -24,8 +24,8 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 67 pass | 190 pass |
-| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 item 1 fixed; #52 items 2–3 documented; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 fixed (node-wide ledger, the new default `ledgerBackend: node`) and #49 A fixed (a refusal at the scope cap is O(1)) |
+| Lib tests | 97 pass | 191 pass |
+| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 items 1–3 (canonical form, maximum approval lifetime, `rpc-param` envelope removal) fixed; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 fixed (node-wide ledger, the new default `ledgerBackend: node`) and #49 A fixed (a refusal at the scope cap is O(1)) |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
 ### Repo visibility — RESOLVED (2026-09-24)
@@ -45,8 +45,10 @@ excludes all Flex identity material). No further visibility action is required t
   one the accompanying approval actually approved — five ABV v0.1 predicates checked at the gateway."*
 - **Config surface:** approvalSource(header|rpc-param) / approvalHeader / approvalRpcField /
   executorHeader / requiredPredicates(P1,P2,P4,P5; P6 opt-in, single use **per gateway replica, until restart** — **no P3**) / attesterKeys(key ≥32 bytes) /
-  clockSkewSeconds / expectedAudience / expectedTenant / expectedEnvironment (all required when P5 is
-  required) / mode(block|monitor) / onDeny(rpc-error -32008|empty-403) / resultHeader.
+  clockSkewSeconds (0–3600) / maxApprovalLifetimeSeconds (optional, 0 = off; needs P4) /
+  stripApprovalEnvelope (rpc-param only, default true) / expectedAudience / expectedTenant /
+  expectedEnvironment (all required when P5 is required) / mode(block|monitor) /
+  onDeny(rpc-error -32008|empty-403) / resultHeader.
 - **Reviewer findings #1–#7 (Tommaso Bolis) — resolution:**
   - **#7** MCP `tools/call` profile: only `tools/call` binds; every other method is forwarded
     out-of-scope in both modes; unparseable → fail closed. — DONE
@@ -80,8 +82,11 @@ excludes all Flex identity material). No further visibility action is required t
   `local()` store is per replica: an approval authorizes at most one execution **per gateway replica,
   until restart** (#51), so run P6 flows on one replica. A POST without a valid `content-length` is
   denied as framing. Canonical form rejects integers beyond ±(2^53−1) and keys whose UTF-8 and UTF-16
-  orders differ (#52). Not yet: a maximum approval lifetime, and stripping the `rpc-param` envelope
-  before it reaches upstream (both documented). No `.on_response` handler.
+  orders differ (#52). A maximum approval lifetime (`maxApprovalLifetimeSeconds`) is available
+  under P4 but off by default; it checks `not_after` against the gateway clock (there is no `iat`),
+  and `not_after` is authenticated only when P5 is required. In `rpc-param` mode, the approval
+  envelope is stripped from forwarded single-object bodies, with `content-length` rewritten; batch
+  and malformed bodies are never forwarded with a rewrite. `clockSkewSeconds` is capped at one hour. No `.on_response` handler.
 
 ### 2. Cross-Session Aggregate-Risk Gate
 - **Project path:** `/aggregate-risk-gate` (point the wizard at `/tree/main/aggregate-risk-gate`)
