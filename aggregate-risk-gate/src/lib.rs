@@ -180,8 +180,12 @@ impl<'a> RawBody<'a> {
 /// Buffering a body only to discover afterward that it was oversized,
 /// compressed, or a non-JSON media type would defeat the purpose of gating in
 /// the first place. A missing/invalid Content-Length, a declared length over
-/// `MAX_INSPECT_BYTES`, a non-JSON Content-Type, or any Content-Encoding
-/// (this build never decompresses) all fail this gate. See README.md's
+/// `MAX_INSPECT_BYTES`, a non-JSON Content-Type, a `charset` parameter other
+/// than UTF-8, or any Content-Encoding (this build never decompresses) all
+/// fail this gate. The charset check matters because this policy parses the
+/// body as UTF-8 while an upstream may decode it with the declared charset:
+/// under `charset=utf-7`, `"tools+AC8-call"` reads here as an unlisted method
+/// but decodes upstream to `tools/call`. See README.md's
 /// "Inspection boundary" section for the SSE/streaming/compressed/non-UTF-8
 /// exclusions this enforces.
 fn request_is_inspectable(handler: &(impl HeadersHandler + ?Sized)) -> bool {
@@ -191,17 +195,38 @@ fn request_is_inspectable(handler: &(impl HeadersHandler + ?Sized)) -> bool {
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|len| len <= MAX_INSPECT_BYTES);
     let json = handler.header("content-type").is_some_and(|value| {
-        let media = value
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        media == "application/json"
-            || (media.starts_with("application/") && media.ends_with("+json"))
+        let mut parts = value.split(';');
+        let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        let json_media = media == "application/json"
+            || (media.starts_with("application/") && media.ends_with("+json"));
+        json_media && parts.all(utf8_or_not_charset)
     });
     let uncompressed = handler.header("content-encoding").is_none();
     length_ok && json && uncompressed
+}
+
+/// True unless `param` is a `charset` parameter naming anything but UTF-8.
+/// The name and value are case-insensitive, surrounding whitespace is ignored
+/// and the value may be quoted. A malformed `charset` parameter (no `=`) is
+/// not UTF-8.
+fn utf8_or_not_charset(param: &str) -> bool {
+    let param = param.trim();
+    let (name, value) = match param.split_once('=') {
+        Some((name, value)) => (name.trim(), Some(value.trim())),
+        None => (param, None),
+    };
+    if !name.eq_ignore_ascii_case("charset") {
+        return true;
+    }
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value)
+        .trim();
+    value.eq_ignore_ascii_case("utf-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -805,8 +830,11 @@ fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
         RawBody::Present(bytes) => bytes,
     };
     let Ok(root) = serde_json::from_slice::<Value>(body) else {
-        // Not JSON: one call this policy cannot classify, so it is governed.
-        return price(gate, &[&Value::Null]);
+        // Not JSON to this parser (malformed, a BOM, a lone surrogate, nesting
+        // past serde's 128-level limit). Another parser upstream may still
+        // read it, possibly as a batch of any size, so it cannot be priced as
+        // one call. Fail closed.
+        return ContributionOutcome::Unpriceable;
     };
     // A duplicate member (e.g. two `method`s) means this policy and the
     // upstream could classify the same bytes differently. Fail closed.
@@ -3302,14 +3330,166 @@ mod test {
                 body
             );
         }
-        assert!(matches!(
-            compute_contribution(&gate, RawBody::Present(b"not json")),
-            ContributionOutcome::Known(800)
-        ));
+        // A body this parser rejects may still parse upstream, possibly as a
+        // batch, so it is never priced as one call: it fails closed.
+        let mut lone_surrogate =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"x":""#.to_vec();
+        lone_surrogate.extend_from_slice(br#"\ud800"}}"#);
+        let mut bom = b"\xEF\xBB\xBF".to_vec();
+        bom.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#);
+        for bytes in [b"not json".to_vec(), lone_surrogate, bom] {
+            assert!(
+                matches!(
+                    compute_contribution(&gate, RawBody::Present(&bytes)),
+                    ContributionOutcome::Unpriceable
+                ),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
         assert!(matches!(
             compute_contribution(&gate, RawBody::Uninspectable),
             ContributionOutcome::Unpriceable
         ));
+    }
+
+    /// A batch whose item nests past serde's 128-level limit fails to parse
+    /// here, but a parser without that limit could run every item. It must
+    /// fail closed, not be charged as a single call.
+    #[test]
+    fn a_batch_nested_past_the_parser_limit_fails_closed() {
+        let deep = format!("{}0{}", "[".repeat(200), "]".repeat(200));
+        let item = |id: u64| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"x":{}}}}}"#,
+                id, deep
+            )
+        };
+        let body = format!("[{},{},{}]", item(1), item(2), item(3));
+        assert!(serde_json::from_str::<Value>(&body).is_err());
+
+        let gate = gate_with(json!({}));
+        assert!(matches!(
+            compute_contribution(&gate, RawBody::Present(body.as_bytes())),
+            ContributionOutcome::Unpriceable
+        ));
+
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let response = tester.request(raw_request(&body, Some("broker-7")));
+        assert!(backend.next().is_none(), "must never reach upstream");
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("reason=unpriceable"), "{}", header);
+    }
+
+    fn charset_request(content_type: &str, body: &str) -> UnitHttpRequest {
+        UnitHttpRequest::post()
+            .with_header("content-type", content_type)
+            .with_header("content-length", body.len().to_string())
+            .with_header("x-agent-id", "broker-7")
+            .with_body(body.as_bytes().to_vec())
+    }
+
+    /// Under UTF-7, `tools+AC8-call` decodes to `tools/call`. Read as UTF-8 it
+    /// is an unlisted method, so a body in any charset but UTF-8 must not be
+    /// classified at all: it is uninspectable and fails closed.
+    const UTF7_TOOLS_CALL: &str =
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools+AC8-call","params":{"name":"place_order"}}"#;
+
+    #[test]
+    fn a_non_utf8_charset_is_uninspectable_and_denied_in_block_mode() {
+        for content_type in [
+            "application/json; charset=utf-7",
+            "application/json;charset=UTF-7",
+            "application/json; charset=\"utf-7\"",
+            "application/json; charset=utf-16",
+            "application/json; charset=iso-8859-1",
+            "application/json; charset=",
+            "application/json; charset",
+            "application/json; charset=utf-8; charset=utf-7",
+            "application/vnd.api+json; charset=utf-7",
+        ] {
+            let backend = Rc::new(TraceBackend::new(ok_backend));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            let response = tester.request(charset_request(content_type, UTF7_TOOLS_CALL));
+            assert!(
+                backend.next().is_none(),
+                "{} must never reach upstream",
+                content_type
+            );
+            assert_eq!(response.status_code(), 403, "{}", content_type);
+            let header = response.header("x-aggregate-risk-gate").unwrap();
+            assert!(
+                header.contains("reason=unpriceable"),
+                "{}: {}",
+                content_type,
+                header
+            );
+            assert_ne!(header, PASS, "{}", content_type);
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_charset_is_flagged_unpriceable_in_monitor_mode() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"mode": "monitor"})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let response = tester.request(charset_request(
+            "application/json; charset=utf-7",
+            UTF7_TOOLS_CALL,
+        ));
+        assert!(backend.next().is_some(), "monitor mode forwards");
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(
+            header.starts_with("monitor;") && header.contains("reason=unpriceable"),
+            "{}",
+            header
+        );
+    }
+
+    #[test]
+    fn a_utf8_or_absent_charset_is_still_inspected() {
+        let tools_call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
+        let tools_list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/json; charset=UTF-8",
+            "application/json;charset = \"Utf-8\" ",
+            "application/json; profile=x; charset=utf-8",
+            "application/vnd.api+json; charset=utf-8",
+        ] {
+            let backend = Rc::new(TraceBackend::new(ok_backend));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            let admitted = tester.request(charset_request(content_type, tools_call));
+            assert!(backend.next().is_some(), "{}", content_type);
+            let header = admitted.header("x-aggregate-risk-gate").unwrap();
+            assert!(
+                header.starts_with("allowed;") && header.contains("contribution=800"),
+                "{}: {}",
+                content_type,
+                header
+            );
+            let passed = tester.request(charset_request(content_type, tools_list));
+            assert!(backend.next().is_some(), "{}", content_type);
+            assert_eq!(
+                passed.header("x-aggregate-risk-gate"),
+                Some(PASS),
+                "{}",
+                content_type
+            );
+        }
     }
 
     #[test]

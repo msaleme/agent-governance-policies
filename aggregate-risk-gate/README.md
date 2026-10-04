@@ -118,7 +118,7 @@ identity is read, so it passes even without an identity.
 
 Matching is exact and case-sensitive: `Tools/Call` is not `tools/call`. A message that cannot be
 classified stays governed and fails closed in `block` mode. That covers a body over the inspection
-limit, a non-JSON body, a batch item that is not an object, an item without `"jsonrpc": "2.0"`, a
+limit, a declared `charset` other than UTF-8, a body this policy cannot parse as JSON, a batch item that is not an object, an item without `"jsonrpc": "2.0"`, a
 non-string `method`, and a body with a duplicate `method` (or any other duplicate) member, where
 this policy and the upstream could disagree about which method is the real one. A governed method
 sent as a notification is still governed.
@@ -159,11 +159,20 @@ at the HEADER phase, before this policy ever buffers the body:
 - **Content type** — `Content-Type` must be `application/json` or an `application/*+json` media
   type. This excludes **SSE/streaming** responses and requests (`text/event-stream` and similar),
   and any other non-JSON media type.
+- **Charset** — the `Content-Type` must carry no `charset` parameter, or `charset=utf-8`
+  (case-insensitive, optionally quoted). Any other charset, or a malformed `charset` parameter,
+  excludes the body. This policy reads the body as UTF-8, but an upstream MCP server may decode it
+  with the declared charset. Under `charset=utf-7`, `"method":"tools+AC8-call"` reads here as an
+  unlisted method while the upstream decodes it to `tools/call`; excluding the body keeps that
+  call governed and fail-closed instead of letting it pass as ungoverned.
 - **Compression** — any `Content-Encoding` at all excludes the body; this policy never
   decompresses, so a compressed body's real JSON content is opaque to it.
 - **Encoding** — a body that is not valid UTF-8 fails JSON parsing (JSON is a UTF-8-only format),
   so a **non-UTF-8** body is excluded the same way an oversized one is, even though this specific
-  case cannot be caught at the header phase.
+  case cannot be caught at the header phase. The same holds for any body this policy's JSON parser
+  rejects, such as a leading byte-order mark, a lone UTF-16 surrogate escape, or nesting deeper
+  than 128 levels: another parser upstream may still accept it, possibly as a batch of many
+  calls, so it is never priced as a single call.
 
 A body excluded on any of these grounds is never buffered or read, so its method is unknown; it is
 treated as governed and unpriceable —
@@ -426,7 +435,7 @@ The earlier `ledgerEndpoint` placeholder for it has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 153 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 157 tests, none of which touch the network or
 Docker:
 
 - **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 51 tests): correctness of
@@ -455,7 +464,7 @@ Docker:
   periods are aligned to the epoch, not first use; an in-flight reservation carries across a
   boundary and settles in the new period; a clock stepping backwards never resets a total;
   without a window nothing resets; and a scope from an earlier period can be evicted.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (59 tests,
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (63 tests,
   from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
@@ -501,7 +510,12 @@ Docker:
     ungoverned traffic creates no scope and changes no ledger counter; mixed batches charge only
     their governed items, and a denied mixed batch returns `-32008` for every request id; a
     duplicate `method` member fails closed; matching is case-sensitive; and an item that cannot be
-    classified stays governed.
+    classified stays governed. A body this parser rejects (not JSON, a BOM, a lone surrogate, or a
+    batch nested past 128 levels) fails closed rather than being charged as one call.
+  - **Charset** — `charset=utf-7` carrying `"tools+AC8-call"` (UTF-7 for `tools/call`), and any
+    other non-UTF-8 or malformed charset, is uninspectable: denied in `block` mode and flagged
+    `reason=unpriceable` in `monitor` mode. No charset, or `utf-8` in any case or quoting, is
+    inspected as before.
   - **Window** — with `windowMs: 60000` a spent budget is still denied at 59 s on the gateway
     clock (`tester.sleep`) and available again at 60 s; with `worker-lifetime` it is still denied
     400 days later.

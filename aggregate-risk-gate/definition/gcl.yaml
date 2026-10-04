@@ -211,7 +211,8 @@ spec:
         exhausted budget never blocks initialize, notifications/initialized,
         ping, tools/list, notifications/cancelled, or session teardown. A
         message the policy cannot classify (a body over the inspection limit,
-        non-JSON, a non-object item, a missing "jsonrpc": "2.0", a non-string
+        a Content-Type charset other than utf-8, a body this policy cannot
+        parse as JSON, a non-object item, a missing "jsonrpc": "2.0", a non-string
         method, or a duplicate "method" member) stays governed and fails
         closed in block mode. In a mixed batch only the governed items are
         priced; if the batch is denied, every request id in it gets a -32008
