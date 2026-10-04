@@ -88,13 +88,21 @@ exactly like a `POST` (so a `tools/call` body cannot dodge the binding by changi
 
 Before any body is buffered, the policy checks the request's declared framing at the header phase:
 a `content-type` that isn't `application/json` (or an `application/*+json` variant) — which
-excludes SSE/streaming media types such as `text/event-stream` — or the presence of any
-`content-encoding` header (a compressed body, whose decoded size the declared `content-length`
+excludes SSE/streaming media types such as `text/event-stream` — a `charset` parameter other than
+`utf-8`, or the presence of any `content-encoding` header (a compressed body, whose decoded size the declared `content-length`
 cannot bound) is treated the same as malformed framing below: `monitor` mode logs and always
 forwards the request uninspected; `block` mode denies before ever buffering it. This mirrors the
 sibling Decoy Tool Sentinel's admission gate and is the reason SSE/streaming, compressed, and
 non-UTF-8 bodies are excluded from inspection — this policy cannot safely buffer or parse them as
 JSON at all.
+
+**Charset.** The policy parses the body as UTF-8, so it inspects a body only when `content-type`
+has no `charset` parameter or `charset=utf-8` (case-insensitive, whitespace-trimmed, optionally
+quoted). Any other value — `utf-7`, `utf-16`, `iso-8859-1`, the `utf8` alias, an empty value, or a
+second conflicting `charset` — is refused as malformed (`block` denies, `monitor` flags and
+forwards). This closes a bypass: an upstream that decodes by charset, as the MCP TypeScript SDK
+does, reads `"tools+AC8-call"` under `charset=utf-7` as `tools/call`, while a UTF-8 parse would see
+an unknown, out-of-scope method and forward it unapproved.
 
 **Framing (content-length).** The policy buffers a body only when it declares a valid
 `content-length` no greater than **64 KiB**, and the body received must match it exactly. A `POST`
@@ -108,7 +116,9 @@ a running 64 KiB cap is a follow-up, not this build.
 
 Once a body clears both gates, the policy evaluates it only if it parses as a single (non-batch)
 JSON-RPC 2.0 object. A `POST` with no body at all, a JSON-RPC **batch**, or fails to parse as a single JSON-RPC object at all (missing/invalid `jsonrpc`, missing
-`method`, or — for `tools/call` — missing `params.name`) is treated as **malformed**: `monitor`
+`method`, or — for `tools/call` — missing `params.name`), or one the JSON parser rejects outright
+(nesting deeper than 128, a lone surrogate escape, a leading byte-order mark, invalid UTF-8) is
+treated as **malformed** — never as an out-of-scope method: `monitor`
 mode logs the verdict and always forwards; `block` mode denies. Batches are explicitly out of scope
 for approval binding, not a future predicate — an approval record binds to one executed action, not
 to a collection of them; a batch is therefore rejected atomically (the whole array denied together)
@@ -119,7 +129,8 @@ otherwise-plausible batch can never slip through as one of several forwarded cal
 (from `approvalHeader` or, for `approvalSource: rpc-param`, the `approvalRpcField` sibling member of
 the JSON-RPC body), the executor identity header (`executorHeader`), and the JSON-RPC body itself
 (`jsonrpc`/`id`/`method`/`params`, and for `tools/call`, `params.name`/`params.arguments`), plus the
-HTTP method and the `content-type`/`content-encoding`/`content-length` framing headers. It never
+HTTP method and the `content-type` (media type and `charset`)/`content-encoding`/`content-length`
+framing headers. It never
 inspects other headers, the query string, or the request path.
 
 Denial rendering follows the request's own framing, not just `onDeny`:
@@ -341,7 +352,7 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **58 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **67 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
@@ -350,7 +361,10 @@ notification JSON-RPC framing, monitor-vs-block behavior, the rpc-param approval
 `tools/call` methods forwarded as out-of-scope** (never blocked), **bodyless `GET` (SSE)/`DELETE`
 (session)/`OPTIONS`/`HEAD` forwarded out-of-scope in block and monitor mode** while a bodyless or
 lowercase `post` and a non-`POST` carrying a `tools/call` body stay bound, **framing refusals**
-(no/short/oversized `content-length` stamped `denied;framing=content-length`), **`$ref`-shaped arguments rejected
+(no/short/oversized `content-length` stamped `denied;framing=content-length`), **charset
+admission** (a UTF-7 `tools+AC8-call` body and every non-`utf-8` charset denied in block and
+flagged in monitor; `utf-8` spellings allowed), **unparseable bodies** (lone surrogate, BOM, nesting
+> 128) denied as malformed rather than forwarded out-of-scope, **`$ref`-shaped arguments rejected
 under P2** (top-level, nested, `$ref`+extra keys) while a `$ref` string *value* is allowed,
 **versioned canonical-JSON digests** (a float or non-integer number, an integer outside
 ±(2^53 − 1), and a UTF-8/UTF-16 key-order disagreement all fail closed; `null` vs `{}` vs

@@ -15,6 +15,8 @@
 //!   * Only HTTP POST is bound; bodyless GET/DELETE/OPTIONS/HEAD transport
 //!     requests forward out-of-scope, and a POST without a valid declared
 //!     content-length is a framing denial (finding #50).
+//!   * Only an absent or `utf-8` charset is inspectable; any other charset and
+//!     any body serde rejects fail closed, never out-of-scope.
 //!   * Integers beyond ±(2^53 − 1) and UTF-8/UTF-16 key-order disagreements
 //!     fail closed in canonicalization (finding #52).
 //!
@@ -1075,6 +1077,138 @@ fn expired_nonces_are_swept_at_capacity() {
         Some("denied;predicate=P4")
     );
     assert!(backend.next().is_none());
+}
+
+// ===========================================================================
+// N. Charset bypass — only an absent or UTF-8 charset is inspectable
+// ===========================================================================
+
+fn typed_request(content_type: &str, envelope: &Value, body_text: &str) -> UnitHttpRequest {
+    UnitHttpRequest::post()
+        .with_header("content-type", content_type)
+        .with_header("content-length", body_text.len().to_string())
+        .with_header("x-approval", envelope.to_string())
+        .with_header("client_id", EXECUTOR)
+        .with_body(body_text.to_string())
+        .with_authentication_data(auth_of(EXECUTOR))
+}
+
+/// UTF-7 for `tools/call`: `/` is `+AC8-`. Parsed as UTF-8 this is an unknown,
+/// out-of-scope method; an upstream decoding by charset reads `tools/call`.
+const UTF7_TOOLS_CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools+AC8-call","params":{"name":"deploy.apply","arguments":{}}}"#;
+
+#[test]
+fn utf7_charset_tools_call_is_denied_not_forwarded_out_of_scope() {
+    let (backend, mut tester) = harness!(block_config());
+    let response = tester.request(typed_request(
+        "application/json; charset=utf-7",
+        &json!({}),
+        UTF7_TOOLS_CALL,
+    ));
+    assert_eq!(response.status_code(), 403);
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;predicate=malformed")
+    );
+    assert!(
+        backend.next().is_none(),
+        "a non-UTF-8 body must never reach upstream unapproved"
+    );
+}
+
+#[test]
+fn utf7_charset_is_flagged_in_monitor_mode() {
+    let (backend, mut tester) = harness!(monitor_config());
+    let response = tester.request(typed_request(
+        "application/json; charset=UTF-7",
+        &json!({}),
+        UTF7_TOOLS_CALL,
+    ));
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("monitor mode forwards");
+    assert_eq!(
+        forwarded.header("x-approval-binding"),
+        Some("monitor;predicate=malformed")
+    );
+}
+
+#[test]
+fn any_non_utf8_charset_fails_closed() {
+    let (backend, mut tester) = harness!(block_config());
+    let body = jsonrpc_call(1, "deploy.apply", json!({})).to_string();
+    for content_type in [
+        "application/json; charset=utf-16",
+        "application/json; charset=iso-8859-1",
+        "application/json; charset=utf8",
+        "application/json; charset=\"utf-7\"",
+        "application/json; charset=",
+        "application/json; charset=utf-8; charset=utf-7",
+        "application/vnd.api+json; charset=us-ascii",
+    ] {
+        let response = tester.request(typed_request(content_type, &json!({}), &body));
+        assert_eq!(
+            response.header("x-approval-binding"),
+            Some("denied;predicate=malformed"),
+            "{}",
+            content_type
+        );
+        assert!(backend.next().is_none(), "{}", content_type);
+    }
+}
+
+#[test]
+fn utf8_charset_spellings_are_inspected_and_allowed() {
+    let args = json!({"replicas": 3});
+    let body = jsonrpc_call(1, "deploy.apply", args.clone()).to_string();
+    for (i, content_type) in [
+        "application/json",
+        "application/json; charset=utf-8",
+        "application/json;charset=UTF-8",
+        "application/json; charset = \"Utf-8\" ",
+        "Application/JSON; Charset=utf-8; profile=x",
+    ]
+    .iter()
+    .enumerate()
+    {
+        // Fresh harness per spelling: the test-build P6 cap is 3.
+        let (backend, mut tester) = harness!(block_config());
+        let envelope = sound_approval("deploy.apply", &args, &format!("n-cs-{i}"), &far_future());
+        let response = tester.request(typed_request(content_type, &envelope, &body));
+        assert_eq!(response.body(), OK_BODY, "{}", content_type);
+        assert!(backend.next().is_some(), "{}", content_type);
+    }
+}
+
+#[test]
+fn bodies_serde_cannot_parse_fail_closed_not_out_of_scope() {
+    // None of these may be read as an out-of-scope method and forwarded.
+    let (backend, mut tester) = harness!(block_config());
+    let deep = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"x","arguments":{{"a":{}1{}}}}}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    let cases = [
+        (
+            "lone surrogate",
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools\ud800/call","params":{}}"#.to_string(),
+        ),
+        (
+            "leading BOM",
+            format!("\u{feff}{}", jsonrpc_call(1, "deploy.apply", json!({}))),
+        ),
+        ("nesting > 128", deep),
+    ];
+    for (label, body) in cases {
+        let response = tester.request(typed_request("application/json", &json!({}), &body));
+        assert_eq!(
+            response.header("x-approval-binding"),
+            Some("denied;predicate=malformed"),
+            "{}",
+            label
+        );
+        assert!(backend.next().is_none(), "{}", label);
+    }
 }
 
 /// In-memory `DataStorage` that counts `get_keys` calls, so the tests can

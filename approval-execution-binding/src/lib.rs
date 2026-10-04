@@ -1102,6 +1102,33 @@ async fn reserve_nonce<S: DataStorage>(
     }
 }
 
+/// True if `value` is a JSON media type (`application/json` or
+/// `application/*+json`) whose body this policy reads exactly as upstream does:
+/// no `charset` parameter, or `charset=utf-8` (case-insensitive, trimmed,
+/// optionally quoted). Any other charset fails closed — an upstream that decodes
+/// by charset (the MCP TS SDK does) could read `"tools+AC8-call"` under
+/// `charset=utf-7` as `tools/call` while this policy, parsing UTF-8, would see
+/// an out-of-scope method.
+fn content_type_is_utf8_json(value: &str) -> bool {
+    let mut parts = value.split(';');
+    let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let is_json = media == "application/json"
+        || (media.starts_with("application/") && media.ends_with("+json"));
+    is_json
+        && parts.all(|param| match param.split_once('=') {
+            Some((name, charset)) if name.trim().eq_ignore_ascii_case("charset") => {
+                let charset = charset.trim();
+                let charset = charset
+                    .strip_prefix('"')
+                    .and_then(|inner| inner.strip_suffix('"'))
+                    .unwrap_or(charset)
+                    .trim();
+                charset.eq_ignore_ascii_case("utf-8")
+            }
+            _ => true,
+        })
+}
+
 /// Header-phase framing refusal (#50): a POST this policy cannot admit for
 /// inspection because its body is not bounded by a valid declared
 /// `content-length` (chunked or HTTP/2 without one, oversized, or a body that
@@ -1196,20 +1223,13 @@ async fn request_filter<S: DataStorage>(
     // is not what the declared content-length bounds). Checked before the body
     // is ever buffered, mirroring the sibling Decoy Tool Sentinel's admission
     // gate — see README "Inspection boundary" for the documented exclusions.
-    let content_type_is_json = handler.header("content-type").is_some_and(|value| {
-        let media = value
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        media == "application/json"
-            || (media.starts_with("application/") && media.ends_with("+json"))
-    });
+    let content_type_is_json = handler
+        .header("content-type")
+        .is_some_and(|value| content_type_is_utf8_json(&value));
     let is_encoded = handler.header("content-encoding").is_some();
     if !content_type_is_json || is_encoded {
         let reason =
-            "request body cannot be safely inspected (non-JSON content-type, SSE/streaming, or content-encoding present)";
+            "request body cannot be safely inspected (non-JSON content-type, non-UTF-8 charset, SSE/streaming, or content-encoding present)";
         log_verdict("deny", None, reason);
         return if binding.block {
             Flow::Break(empty_denial(
