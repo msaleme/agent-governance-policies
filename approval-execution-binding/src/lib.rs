@@ -79,6 +79,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashSet};
 
 use crate::generated::config::Config;
@@ -105,9 +106,10 @@ const PAYLOAD_VERSION: &str = "mcp-v1";
 /// DataStorage store name for the atomic single-use (P6) nonce reservations.
 const NONCE_STORE_NAME: &str = "approval-nonces";
 
-/// Cap on reserved P6 nonces held in local storage (#51). At the cap, entries
-/// whose approval has provably expired under P4 are swept; if the store is still
-/// full, the reservation fails closed (P6 deny) rather than growing without
+/// Approximate cap on reserved P6 nonces held in local storage (#51). Each
+/// worker counts its reservations; when its count reaches the cap it sweeps
+/// entries whose approval has provably expired under P4, and if the store is
+/// still full the reservation fails closed (P6 deny) rather than growing without
 /// bound. Kept small under `cfg(test)` so the unit suite exercises the cap.
 #[cfg(not(test))]
 const MAX_RESERVED_NONCES: usize = 10_000;
@@ -1047,42 +1049,54 @@ fn nonce_expiry(binding: &Binding, not_after: Option<&str>) -> i64 {
         .unwrap_or(NONCE_NEVER_EXPIRES)
 }
 
-/// Reserves `nonce` with `StoreMode::Absent` (the atomic single-use check),
-/// keeping the store at or below `MAX_RESERVED_NONCES`: at the cap, nonces whose
-/// stored expiry is strictly in the past are deleted first; if the store is
-/// still full the reservation is refused (fail closed). The cap is approximate
-/// under concurrency — two workers may each pass the count check at cap − 1.
+/// Reserves `nonce` with `StoreMode::Absent` (the atomic single-use check).
+///
+/// The normal path is that single `store` call — the op the P6 path was proven
+/// on against a connected gateway. `since_sweep` is this worker's count of
+/// reservations since its last sweep; only when it reaches `MAX_RESERVED_NONCES`
+/// is the store listed (`get_keys`), nonces whose stored expiry is strictly in
+/// the past deleted, and the counter reset to the remaining count. If the store
+/// is still full the reservation is refused (fail closed); a storage error
+/// during the sweep is `Unavailable` (fail closed).
+///
+/// The bound is approximate: the counter is per worker and resets when the VM
+/// is rebuilt, while the local store is shared, so between sweeps the store can
+/// exceed the cap by up to the cap per worker.
 async fn reserve_nonce<S: DataStorage>(
     store: &S,
+    since_sweep: &Cell<usize>,
     nonce: &str,
     expiry: i64,
 ) -> Result<(), ReserveRefusal> {
-    let keys = store
-        .get_keys()
-        .await
-        .map_err(|_| ReserveRefusal::Unavailable)?;
-    if keys.len() >= MAX_RESERVED_NONCES {
-        let now = chrono::Utc::now().timestamp();
-        for key in &keys {
-            if let Ok(Some((stored_expiry, _))) = store.get::<i64>(key).await {
-                if now > stored_expiry {
-                    store
-                        .delete(key)
-                        .await
-                        .map_err(|_| ReserveRefusal::Unavailable)?;
-                }
-            }
-        }
-        let remaining = store
+    if since_sweep.get() >= MAX_RESERVED_NONCES {
+        let keys = store
             .get_keys()
             .await
             .map_err(|_| ReserveRefusal::Unavailable)?;
-        if remaining.len() >= MAX_RESERVED_NONCES {
+        let now = chrono::Utc::now().timestamp();
+        let mut remaining = 0usize;
+        for key in &keys {
+            match store.get::<i64>(key).await {
+                Ok(Some((stored_expiry, _))) if now > stored_expiry => store
+                    .delete(key)
+                    .await
+                    .map_err(|_| ReserveRefusal::Unavailable)?,
+                // Absent: removed concurrently, nothing to count.
+                Ok(None) => {}
+                // Unexpired, or unreadable: kept, so it still counts.
+                _ => remaining += 1,
+            }
+        }
+        since_sweep.set(remaining);
+        if remaining >= MAX_RESERVED_NONCES {
             return Err(ReserveRefusal::AtCapacity);
         }
     }
     match store.store(nonce, &StoreMode::Absent, &expiry).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            since_sweep.set(since_sweep.get() + 1);
+            Ok(())
+        }
         Err(DataStorageError::CasMismatch) => Err(ReserveRefusal::Replay),
         Err(_) => Err(ReserveRefusal::Unavailable),
     }
@@ -1116,6 +1130,7 @@ async fn request_filter<S: DataStorage>(
     binding: &Binding,
     violations: &PolicyViolations,
     store: &S,
+    since_sweep: &Cell<usize>,
 ) -> Flow<()> {
     let headers_state = request_state.into_headers_state().await;
     let handler = headers_state.handler();
@@ -1293,7 +1308,9 @@ async fn request_filter<S: DataStorage>(
             // restart (#51).
             if binding.block && binding.required.contains(Predicate::P6) {
                 if let Some(nonce) = reserved_nonce {
-                    if let Err(refusal) = reserve_nonce(store, &nonce, nonce_expiry).await {
+                    if let Err(refusal) =
+                        reserve_nonce(store, since_sweep, &nonce, nonce_expiry).await
+                    {
                         // A replay, a full store, or a storage error all fail
                         // closed: we cannot prove single use, so we do not forward.
                         let reason = match refusal {
@@ -1368,8 +1385,10 @@ async fn configure(
     );
 
     let store = store_builder.local(NONCE_STORE_NAME);
+    // Per-worker reservations since the last sweep (see `reserve_nonce`).
+    let since_sweep = Cell::new(0usize);
     let filter = on_request(|rs, auth: Authentication| {
-        request_filter(rs, auth, &binding, &violations, &store)
+        request_filter(rs, auth, &binding, &violations, &store, &since_sweep)
     });
     launcher.launch(filter).await?;
     Ok(())

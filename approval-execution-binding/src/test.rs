@@ -1077,6 +1077,199 @@ fn expired_nonces_are_swept_at_capacity() {
     assert!(backend.next().is_none());
 }
 
+/// In-memory `DataStorage` that counts `get_keys` calls, so the tests can
+/// assert the normal P6 path never lists the store (only the sweep does).
+#[derive(Default)]
+struct CountingStore {
+    items: std::cell::RefCell<BTreeMap<String, Value>>,
+    get_keys_calls: Cell<usize>,
+    fail_get_keys: bool,
+}
+
+impl DataStorage for CountingStore {
+    async fn get_keys(&self) -> Result<Vec<String>, DataStorageError> {
+        self.get_keys_calls.set(self.get_keys_calls.get() + 1);
+        if self.fail_get_keys {
+            return Err(DataStorageError::Timeout);
+        }
+        Ok(self.items.borrow().keys().cloned().collect())
+    }
+
+    async fn store<T: serde::Serialize>(
+        &self,
+        key: &str,
+        mode: &StoreMode,
+        item: &T,
+    ) -> Result<(), DataStorageError> {
+        let mut items = self.items.borrow_mut();
+        if matches!(mode, StoreMode::Absent) && items.contains_key(key) {
+            return Err(DataStorageError::CasMismatch);
+        }
+        items.insert(key.to_string(), serde_json::to_value(item).unwrap());
+        Ok(())
+    }
+
+    async fn get<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<(T, String)>, DataStorageError> {
+        Ok(self.items.borrow().get(key).map(|value| {
+            (
+                serde_json::from_value(value.clone()).unwrap(),
+                "0".to_string(),
+            )
+        }))
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), DataStorageError> {
+        self.items.borrow_mut().remove(key);
+        Ok(())
+    }
+
+    async fn delete_all(&self) -> Result<(), DataStorageError> {
+        self.items.borrow_mut().clear();
+        Ok(())
+    }
+}
+
+/// Drives a future whose awaits all resolve immediately (`CountingStore`).
+fn ready<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(output) => output,
+        std::task::Poll::Pending => panic!("CountingStore futures never pend"),
+    }
+}
+
+fn reserve(
+    store: &CountingStore,
+    since_sweep: &Cell<usize>,
+    nonce: &str,
+    expiry: i64,
+) -> &'static str {
+    match ready(super::reserve_nonce(store, since_sweep, nonce, expiry)) {
+        Ok(()) => "ok",
+        Err(ReserveRefusal::Replay) => "replay",
+        Err(ReserveRefusal::AtCapacity) => "at-capacity",
+        Err(ReserveRefusal::Unavailable) => "unavailable",
+    }
+}
+
+#[test]
+fn reservations_below_the_cap_never_list_keys() {
+    let store = CountingStore::default();
+    let since_sweep = Cell::new(0);
+    assert_eq!(
+        reserve(&store, &since_sweep, "n-0", NONCE_NEVER_EXPIRES),
+        "ok"
+    );
+    assert_eq!(
+        reserve(&store, &since_sweep, "n-0", NONCE_NEVER_EXPIRES),
+        "replay"
+    );
+    for i in 1..super::MAX_RESERVED_NONCES {
+        assert_eq!(
+            reserve(&store, &since_sweep, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
+            "ok"
+        );
+    }
+    assert_eq!(
+        store.get_keys_calls.get(),
+        0,
+        "the normal path is the store(Absent) call alone"
+    );
+    assert_eq!(
+        since_sweep.get(),
+        super::MAX_RESERVED_NONCES,
+        "a replay does not count as a reservation"
+    );
+}
+
+#[test]
+fn sweep_runs_only_at_the_cap_and_reclaims_expired_nonces() {
+    let store = CountingStore::default();
+    let since_sweep = Cell::new(0);
+    let past = chrono::Utc::now().timestamp() - 10;
+    // One unexpired nonce, the rest already past their P4 deadline.
+    assert_eq!(
+        reserve(&store, &since_sweep, "keep", NONCE_NEVER_EXPIRES),
+        "ok"
+    );
+    for i in 1..super::MAX_RESERVED_NONCES {
+        assert_eq!(
+            reserve(&store, &since_sweep, &format!("old-{i}"), past),
+            "ok"
+        );
+    }
+    assert_eq!(store.get_keys_calls.get(), 0);
+
+    assert_eq!(
+        reserve(&store, &since_sweep, "fresh", NONCE_NEVER_EXPIRES),
+        "ok"
+    );
+    assert_eq!(
+        store.get_keys_calls.get(),
+        1,
+        "the cap triggers exactly one sweep"
+    );
+    let keys: Vec<String> = store.items.borrow().keys().cloned().collect();
+    assert_eq!(keys, vec!["fresh".to_string(), "keep".to_string()]);
+    assert_eq!(
+        since_sweep.get(),
+        2,
+        "the counter restarts from what remains"
+    );
+}
+
+#[test]
+fn sweep_that_frees_nothing_refuses_at_capacity() {
+    let store = CountingStore::default();
+    let since_sweep = Cell::new(0);
+    for i in 0..super::MAX_RESERVED_NONCES {
+        assert_eq!(
+            reserve(&store, &since_sweep, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
+            "ok"
+        );
+    }
+    assert_eq!(
+        reserve(&store, &since_sweep, "over", NONCE_NEVER_EXPIRES),
+        "at-capacity"
+    );
+    assert_eq!(store.get_keys_calls.get(), 1);
+    assert!(
+        !store.items.borrow().contains_key("over"),
+        "a refused nonce is not stored"
+    );
+    // Still full: every further attempt sweeps again and still refuses.
+    assert_eq!(
+        reserve(&store, &since_sweep, "over-2", NONCE_NEVER_EXPIRES),
+        "at-capacity"
+    );
+    assert_eq!(store.get_keys_calls.get(), 2);
+}
+
+#[test]
+fn sweep_storage_error_fails_closed() {
+    let store = CountingStore {
+        fail_get_keys: true,
+        ..CountingStore::default()
+    };
+    let since_sweep = Cell::new(0);
+    for i in 0..super::MAX_RESERVED_NONCES {
+        assert_eq!(
+            reserve(&store, &since_sweep, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
+            "ok",
+            "a failing get_keys is never reached below the cap"
+        );
+    }
+    assert_eq!(
+        reserve(&store, &since_sweep, "over", NONCE_NEVER_EXPIRES),
+        "unavailable"
+    );
+    assert!(!store.items.borrow().contains_key("over"));
+}
+
 // ===========================================================================
 // K. Config validation (belt-and-suspenders; GCL schema also enforces these)
 // ===========================================================================

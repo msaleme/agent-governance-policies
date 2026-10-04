@@ -280,17 +280,22 @@ Further honest limitations, disclosed rather than hidden:
   restart as reopening unexpired approvals. The follow-up for a global guarantee is
   `remote()` storage with a TTL ≥ the maximum approval lifetime + `clockSkewSeconds`, keys
   namespaced by issuer — it is not in this build (#51).
-- **Reserved P6 nonces are bounded by a cap, not a TTL (#51).** `local()` has no TTL, so the policy
-  bounds the store itself: each reservation records the nonce's expiry, and once **10,000** nonces
-  are held, every nonce whose approval has expired under P4 (`now > not_after + clockSkewSeconds`) is
-  deleted before the new one is stored. Forgetting such a nonce cannot reopen a replay, because
-  replaying it is still a P4 denial. If the store is still full after that sweep, the reservation
-  **fails closed** (a P6 denial). Two consequences to plan for: (1) **without P4 in
-  `requiredPredicates`, no reserved nonce ever expires**, so a P6-only deployment stops admitting new
-  single-use approvals after 10,000 of them on a replica until restart — require P4 with P6;
-  (2) an approval with a far-future `not_after` holds its slot until then (see the next item). The cap
-  is approximate under concurrency (two workers can each pass the count check at 9,999), and at the
-  cap each reservation scans the store, so sustained traffic at the cap costs more per call.
+- **Reserved P6 nonces are bounded by an approximate cap, not a TTL (#51).** `local()` has no TTL,
+  so the policy bounds the store itself. Each reservation records the nonce's expiry, and the normal
+  path is a single atomic `store(nonce, Absent, …)` — the same operation the P6 path was proven on.
+  Each worker counts its reservations; when its count reaches **10,000**, it lists the store, deletes
+  every nonce whose approval has expired under P4 (`now > not_after + clockSkewSeconds`), and resets
+  its count to what remains. Forgetting such a nonce cannot reopen a replay, because replaying it is
+  still a P4 denial. If the store is still full after that sweep, the reservation **fails closed** (a
+  P6 denial); a storage error during the sweep also fails closed. Plan for these limits:
+  (1) **the bound is approximate** — the count is per worker and resets when the worker's VM is
+  rebuilt, while the store is shared by the replica's workers, so between sweeps the store can exceed
+  10,000 by up to 10,000 per worker; (2) **the sweep's key listing (`get_keys`) is not yet verified on
+  a real gateway** — it runs only at the cap, and if it errors there, P6 reservations at the cap fail
+  closed; (3) **without P4 in `requiredPredicates`, no reserved nonce ever expires**, so once a sweep
+  finds the store full a P6-only deployment stops admitting new single-use approvals on that replica
+  until restart — require P4 with P6; (4) an approval with a far-future `not_after` holds its slot
+  until then (see the next item).
 - **No upper bound on approval lifetime (#52).** P4 checks only `now <= not_after + clockSkewSeconds`.
   An attested `not_after` years in the future is accepted, and unless P6 is required such an
   approval can be reused for its whole lifetime. Bounding it needs an issued-at claim inside the
@@ -353,8 +358,9 @@ under P2** (top-level, nested, `$ref`+extra keys) while a `$ref` string *value* 
 protected claim, when mutated, flips to deny; kid rotation), **the executor read from verified
 `AuthenticationData`** (an injected verified subject wins over a spoofed header; absent-and-P5-
 required fails closed), **atomic single-use via data storage** (first allow, replay denied under P6,
-monitor mode does not reserve; the nonce cap fails closed when full and sweeps P4-expired nonces,
-exercised with the cap set to 3 under `cfg(test)`), PDK policy-violation registration on both block-mode denials and
+monitor mode does not reserve; below the cap a reservation is one `store` call and never lists keys,
+at the cap a sweep deletes P4-expired nonces and a still-full store fails closed, exercised with the
+cap set to 3 under `cfg(test)`), PDK policy-violation registration on both block-mode denials and
 monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial) denial
 of a batch containing an unauthorized call, the content-type/content-encoding header-phase admission
 gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking, in both the

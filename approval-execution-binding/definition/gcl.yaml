@@ -87,8 +87,9 @@ spec:
         atomically via local gateway data storage in block mode only — a replay
         on another replica or after a restart is not caught, so deploy a single
         replica for flows that need P6, and require P4 with P6 (reserved nonces
-        are capped at 10,000 per replica; only P4-expired ones are reclaimed, and
-        a full store fails closed). P6 is a profile choice, not a universal rule —
+        have an approximate per-worker cap of 10,000; at the cap only P4-expired
+        ones are reclaimed, and a full store fails closed; the sweep's key listing
+        is not yet verified on a real gateway). P6 is a profile choice, not a universal rule —
         reusable approvals are legitimate in some flows — so it defaults out of the
         required set; opt in only when the customer's flow is single-use. An
         empty list is rejected at startup: a binding that requires nothing is
