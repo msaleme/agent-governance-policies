@@ -52,7 +52,8 @@ spec:
       description: >-
         Top-level JSON-RPC request-body member carrying the approval envelope
         (same shape as approvalHeader's value) when approvalSource=rpc-param.
-        Chosen to avoid colliding with jsonrpc/id/method/params.
+        Chosen to avoid colliding with jsonrpc/id/method/params. Removed from the
+        forwarded body unless stripApprovalEnvelope is false.
     executorHeader:
       type: string
       default: client_id
@@ -130,6 +131,31 @@ spec:
         own wall-clock time at the instant of the request — never a
         caller-supplied timestamp, since a caller-supplied execution instant
         would let the executing party grade its own freshness check.
+    maxApprovalLifetimeSeconds:
+      type: integer
+      default: 0
+      description: >-
+        Optional upper bound on an approval's REMAINING lifetime, enforced under
+        P4. 0 (the default) turns the bound off. When set (1 to 31536000), an
+        approval whose not_after is later than now + maxApprovalLifetimeSeconds +
+        clockSkewSeconds (gateway clock) is denied under P4, so an approval
+        minted with a not_after years away cannot be reused indefinitely; it
+        also bounds how long a P6 nonce is held. Setting it without P4 in
+        requiredPredicates is rejected at startup. not_after is authenticated
+        only when P5 is required (it is in the mcp-v1 payload); without P5 the
+        bound applies to a caller-supplied value.
+    stripApprovalEnvelope:
+      type: boolean
+      default: true
+      description: >-
+        When approvalSource=rpc-param, remove the approvalRpcField member from
+        the request body before it is forwarded upstream (an allowed call, or a
+        monitor-mode forward), so the MCP server never receives the approval or
+        its attestation MACs and a strict JSON-RPC server does not see an
+        unknown top-level member. The member is cut out byte-for-byte (the rest
+        of the body is not re-serialized) and content-length is set to the new
+        length. Ignored when approvalSource=header. Set false only if the
+        upstream must see the envelope.
     expectedAudience:
       type: string
       default: ""

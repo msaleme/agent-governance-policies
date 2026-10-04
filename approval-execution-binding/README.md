@@ -158,6 +158,8 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. (There is no P3.) |
 | `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
 | `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. |
+| `maxApprovalLifetimeSeconds` | integer | `0` (off) | Upper bound on an approval's **remaining** lifetime, checked under P4 against the gateway clock: an approval with `not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds` is denied `predicate=P4`. `1`–`31536000` when set; anything else, or setting it without P4 in `requiredPredicates`, is rejected at startup. See [Approval lifetime bound](#approval-lifetime-bound). |
+| `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new length. Ignored for `approvalSource: header`. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
 | `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
 | `expectedTenant` | string | `""` | The tenant this gateway serves, bound as `tenant`. **Required (non-empty) whenever P5 is required.** |
 | `expectedEnvironment` | string | `""` | The environment this gateway serves, bound as `env`. **Required (non-empty) whenever P5 is required.** |
@@ -231,6 +233,7 @@ every digest this policy accepts is one a conforming JCS implementation would al
       - kid: approver.example
         key: "<shared-secret-at-least-32-bytes>"
     clockSkewSeconds: 60
+    maxApprovalLifetimeSeconds: 900
     expectedAudience: mcp-gateway-prod
     expectedTenant: acme
     expectedEnvironment: prod
@@ -238,6 +241,61 @@ every digest this policy accepts is one a conforming JCS implementation would al
     onDeny: rpc-error
     resultHeader: x-approval-binding
 ```
+
+### Approval lifetime bound
+
+`maxApprovalLifetimeSeconds` (#52) caps how far in the future an approval's `not_after` may be,
+measured from the gateway's clock when the call arrives:
+
+```text
+deny under P4  if  not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds
+```
+
+The check is part of P4, so it needs P4 in `requiredPredicates`; a config that sets it without P4
+fails at startup. A `not_after` exactly at the limit is allowed. The bound also limits how long a P6
+nonce is held, since a nonce is kept until `not_after + clockSkewSeconds`.
+
+**Is `not_after` authenticated?** Only when P5 is required. `not_after` is one of the fields of the
+signed `mcp-v1` payload (see above), so under P5 a caller can't change it without breaking the MAC.
+Without P5 it is a value the caller supplies, and the bound is only as trustworthy as the caller.
+
+**Why it bounds the remaining lifetime instead of checking an `iat` claim.** The review suggested
+an issued-at (`iat`/`not_before`) claim in the signed payload, so the gateway could check
+`not_after - iat`. That would change the `mcp-v1` payload, which means a new payload version, a
+change for every attester, and a change to the ABV corpus vectors. Bounding `not_after` against the
+gateway's own clock needs none of that and enforces the same thing at execution time: no approval
+accepted now can stay valid for longer than the bound. What it doesn't do is reject an approval
+that was issued long ago with a long lifetime and is now inside its last
+`maxApprovalLifetimeSeconds`. An `iat` check would catch that, and it remains possible as a future
+payload version.
+
+### rpc-param envelope removal
+
+With `approvalSource: rpc-param` and `stripApprovalEnvelope: true` (the default), the policy removes
+the top-level `approvalRpcField` member from the body before forwarding it (#52), so the MCP server
+never receives the approval or its attestation MACs, and a strict JSON-RPC server doesn't see an
+unknown top-level member. This applies to every forwarded `tools/call`: an allowed call in either
+mode, and a monitor-mode would-deny. An out-of-scope method, a denied call and `approvalSource:
+header` are left as they are.
+
+- **Byte-exact.** The member is cut out of the original bytes together with one adjoining comma.
+  Nothing else is re-serialized, so the upstream receives exactly the argument bytes P2 checked,
+  including their whitespace, member order and escapes. Only the top-level member is removed; a
+  nested member with the same name is part of the arguments and stays. A key spelled with JSON
+  escapes counts as the same member.
+- **Checked before forwarding.** The strict parse has already rejected duplicate members at any
+  depth, so at most one member can match. The stripped body is parsed again and must equal the
+  original minus that member. If it doesn't, block mode denies the call as `malformed` and monitor
+  mode forwards it unchanged and logs why. The removal runs before the P6 reservation, so a failure
+  never uses up a nonce.
+- **`content-length` is rewritten.** PDK 1.10's `BodyHandler::set_body` writes only the body buffer
+  (`pdk-classy` `hl/headers_body.rs`); nothing in the PDK or `proxy-wasm` 0.2.5 adjusts
+  `content-length`. So the policy sets `content-length` to the new length itself. The request
+  headers haven't been sent upstream yet at that point, because the filter is still holding the
+  request to read its body. The `#[pdk_test]`
+  `rpc_param_envelope_is_stripped_before_the_real_upstream` checks this on a real Flex Gateway
+  1.14.0: the upstream mock accepts only the exact stripped bytes with the new `content-length`.
+  It runs in CI (`runtime-e2e`).
 
 On a denial the log carries a structured event, e.g.
 `{"event":"approval_execution_binding","action":"deny","predicate":"P1","reason":"approved action 'deploy.apply', executed 'deploy.destroy'"}`
@@ -307,17 +365,16 @@ Further honest limitations, disclosed rather than hidden:
   finds the store full a P6-only deployment stops admitting new single-use approvals on that replica
   until restart — require P4 with P6; (4) an approval with a far-future `not_after` holds its slot
   until then (see the next item).
-- **No upper bound on approval lifetime (#52).** P4 checks only `now <= not_after + clockSkewSeconds`.
-  An attested `not_after` years in the future is accepted, and unless P6 is required such an
-  approval can be reused for its whole lifetime. Bounding it needs an issued-at claim inside the
-  signed `mcp-v1` payload (a payload-version change) and a `maxApprovalLifetimeSeconds` setting; that
-  is a known limitation of this build, not implemented. Keep approval lifetimes short at the issuer.
-- **With `approvalSource: rpc-param`, the envelope is forwarded upstream (#52).** The policy does not
-  rewrite the request body, so the top-level `approvalRpcField` member (including the attestation
-  MACs) reaches the MCP server along with the call. A strict JSON-RPC server may reject the unknown
-  member, and the upstream tool can read the attestation. Use `approvalSource: header` (and strip the
-  header upstream if needed) when either matters. Removing the member would need a body rewrite and a
-  recomputed `content-length`; it is not in this build.
+- **The approval lifetime bound is off by default and checks `not_after`, not an issue time (#52).**
+  With `maxApprovalLifetimeSeconds` unset, P4 checks only `now <= not_after + clockSkewSeconds`, so
+  an attested `not_after` years away is accepted and, unless P6 is required, reusable until then.
+  Set the bound when that matters. It limits the remaining lifetime, not the total, and `not_after`
+  is authenticated only under P5 (see [Approval lifetime bound](#approval-lifetime-bound)).
+- **The rpc-param envelope is removed only from bodies this policy forwards (#52).** With
+  `stripApprovalEnvelope: false`, or on an out-of-scope method, the `approvalRpcField` member reaches
+  the MCP server. Removal applies only to a single JSON-RPC object that passed the strict parse, so a
+  batch or malformed body is never rewritten (it's denied in block mode and forwarded unchanged in
+  monitor mode).
 - **No `.on_response()` handler, by design.** Unlike the sibling MCP Honeytoken Tripwire, this
   filter registers only an `on_request` handler. PDK's `DualFilter` re-runs a configured response
   handler even over a request filter's own `Flow::Break` early reply, and a response handler that
@@ -325,9 +382,10 @@ Further honest limitations, disclosed rather than hidden:
   uninspectable body and withholds it — which is why, empirically, Tripwire's in-band JSON-RPC
   denial bodies come back empty under `pdk_unit`. Registering no response handler here means this
   policy's own early-reply denials are sent as constructed, with nothing downstream re-inspecting
-  them. This policy never rewrites a response body — it only forwards a request unchanged or
-  denies it before it reaches the upstream tool, so the response-body-rewriting boundary that
-  applies to Tripwire does not apply here.
+  them. This policy never rewrites a response body. It forwards a request unchanged, forwards it
+  with only the `rpc-param` envelope removed (see above), or denies it before it reaches the
+  upstream tool, so the response-body-rewriting boundary that applies to Tripwire does not apply
+  here.
 - **`onDeny: rpc-error` denials return HTTP 200,** by design: the JSON-RPC `-32008` error is
   delivered in-band, matching real JSON-RPC semantics where errors are payload-level, not
   transport-level. A caller (or a test) that only checks the HTTP status code cannot distinguish an
@@ -352,7 +410,7 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **67 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **91 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
@@ -374,7 +432,13 @@ protected claim, when mutated, flips to deny; kid rotation), **the executor read
 required fails closed), **atomic single-use via data storage** (first allow, replay denied under P6,
 monitor mode does not reserve; below the cap a reservation is one `store` call and never lists keys,
 at the cap a sweep deletes P4-expired nonces and a still-full store fails closed, exercised with the
-cap set to 3 under `cfg(test)`), PDK policy-violation registration on both block-mode denials and
+cap set to 3 under `cfg(test)`), **the approval lifetime bound** (allowed exactly at `now +
+maxApprovalLifetimeSeconds + clockSkewSeconds`, denied one second or one millisecond past it, off
+when unset, never relaxes expiry; range and requires-P4 validated at startup), **rpc-param envelope
+removal** (first, middle, last and only member; whitespace and escapes kept byte-exact; an escaped
+key matched; a nested same-name member kept; duplicates fail closed; forwarded body and
+`content-length` checked on allow and on monitor would-deny; header mode and `stripApprovalEnvelope:
+false` untouched), PDK policy-violation registration on both block-mode denials and
 monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial) denial
 of a batch containing an unauthorized call, the content-type/content-encoding header-phase admission
 gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking, in both the

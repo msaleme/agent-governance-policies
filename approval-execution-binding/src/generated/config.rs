@@ -26,6 +26,8 @@ pub struct Config {
     pub expected_environment: Option<String>,
     #[serde(alias = "expectedTenant")]
     pub expected_tenant: Option<String>,
+    #[serde(alias = "maxApprovalLifetimeSeconds")]
+    pub max_approval_lifetime_seconds: Option<i64>,
     #[serde(alias = "mode")]
     pub mode: String,
     #[serde(alias = "onDeny")]
@@ -34,6 +36,8 @@ pub struct Config {
     pub required_predicates: Vec<String>,
     #[serde(alias = "resultHeader")]
     pub result_header: String,
+    #[serde(alias = "stripApprovalEnvelope")]
+    pub strip_approval_envelope: Option<bool>,
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {

@@ -84,7 +84,7 @@ fn monitor_config() -> String {
 }
 
 fn parse_config(json: Value) -> Result<Config> {
-    serde_json::from_value(json).map_err(|err| anyhow!("{err}"))
+    serde_json::from_value(json).map_err(|err| anyhow!("{}", err))
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,4 +1567,327 @@ fn abv_corpus_is_self_consistent_at_function_level() {
         "expected 11 approval-claim MACs in the corpus"
     );
     assert_eq!(digest_checks, 3, "expected 3 ref-free digest vectors");
+}
+
+// ===========================================================================
+// M. #52 — maximum approval lifetime (P4)
+// ===========================================================================
+
+fn approval_with_not_after(not_after: &str) -> ApprovalRecord {
+    serde_json::from_value(json!({
+        "scope": {"action": "deploy.apply", "arguments_digest": "d"},
+        "not_after": not_after
+    }))
+    .expect("approval record")
+}
+
+fn at(raw: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .expect("rfc3339")
+        .with_timezone(&chrono::Utc)
+}
+
+#[test]
+fn max_lifetime_allows_not_after_exactly_at_the_bound() {
+    // now + 3600 lifetime + 60 skew = 13:01:00; not_after equal to it is allowed.
+    let approval = approval_with_not_after("2026-10-04T13:01:00Z");
+    assert!(check_freshness_at(&approval, 60, Some(3600), at("2026-10-04T12:00:00Z")).is_ok());
+}
+
+#[test]
+fn max_lifetime_denies_not_after_one_second_past_the_bound() {
+    let approval = approval_with_not_after("2026-10-04T13:01:01Z");
+    let err = check_freshness_at(&approval, 60, Some(3600), at("2026-10-04T12:00:00Z"))
+        .expect_err("one second past the bound must be denied");
+    assert!(err.contains("maximum lifetime"), "{}", err);
+}
+
+#[test]
+fn max_lifetime_denies_sub_second_overshoot() {
+    let approval = approval_with_not_after("2026-10-04T13:01:00.001Z");
+    assert!(check_freshness_at(&approval, 60, Some(3600), at("2026-10-04T12:00:00Z")).is_err());
+}
+
+#[test]
+fn max_lifetime_off_accepts_far_future_not_after() {
+    let approval = approval_with_not_after("2036-10-04T12:00:00Z");
+    assert!(check_freshness_at(&approval, 60, None, at("2026-10-04T12:00:00Z")).is_ok());
+}
+
+#[test]
+fn max_lifetime_does_not_relax_expiry() {
+    // The lifetime bound only adds a ceiling; an expired approval stays expired.
+    let approval = approval_with_not_after("2026-10-04T11:58:59Z");
+    let err = check_freshness_at(&approval, 60, Some(3600), at("2026-10-04T12:00:00Z"))
+        .expect_err("expired approval");
+    assert!(err.contains("expired"), "{}", err);
+}
+
+#[test]
+fn far_future_approval_is_denied_for_p4_when_lifetime_is_bounded() {
+    let (backend, mut tester) = harness!(config_with(json!({
+        "requiredPredicates": ["P1", "P2", "P4", "P5"],
+        "maxApprovalLifetimeSeconds": 300
+    })));
+    let args = json!({"replicas": 3});
+    // far_future() is one hour out: past the 300 s + 60 s skew ceiling.
+    let envelope = sound_approval("deploy.apply", &args, "n-lifetime", &far_future());
+    let body = jsonrpc_call(1, "deploy.apply", args);
+    let response = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;predicate=P4")
+    );
+    assert!(backend.next().is_none());
+}
+
+#[test]
+fn approval_within_lifetime_is_allowed() {
+    let (backend, mut tester) = harness!(config_with(json!({
+        "requiredPredicates": ["P1", "P2", "P4", "P5"],
+        "maxApprovalLifetimeSeconds": 7200
+    })));
+    let args = json!({"replicas": 3});
+    let envelope = sound_approval("deploy.apply", &args, "n-within", &far_future());
+    let body = jsonrpc_call(1, "deploy.apply", args);
+    let response = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("within-lifetime approval forwards");
+    assert_eq!(forwarded.header("x-approval-binding"), Some("allowed"));
+}
+
+#[test]
+fn max_lifetime_without_p4_is_rejected() {
+    let config = parse_config(base_config_json(json!({
+        "requiredPredicates": ["P1"], "maxApprovalLifetimeSeconds": 300
+    })))
+    .unwrap();
+    match Binding::from_config(&config) {
+        Ok(_) => panic!("maxApprovalLifetimeSeconds without P4 must be rejected"),
+        Err(err) => assert!(err.to_string().contains("P4"), "{}", err),
+    }
+}
+
+#[test]
+fn max_lifetime_range_is_validated() {
+    for bad in [-1, MAX_APPROVAL_LIFETIME_LIMIT_SECONDS + 1] {
+        let config = parse_config(base_config_json(json!({
+            "requiredPredicates": ["P1", "P4"], "maxApprovalLifetimeSeconds": bad
+        })))
+        .unwrap();
+        assert!(
+            Binding::from_config(&config).is_err(),
+            "{} must be rejected",
+            bad
+        );
+    }
+    for (good, expected) in [
+        (0, None),
+        (1, Some(1)),
+        (
+            MAX_APPROVAL_LIFETIME_LIMIT_SECONDS,
+            Some(MAX_APPROVAL_LIFETIME_LIMIT_SECONDS),
+        ),
+    ] {
+        let config = parse_config(base_config_json(json!({
+            "requiredPredicates": ["P1", "P4"], "maxApprovalLifetimeSeconds": good
+        })))
+        .unwrap();
+        let binding = Binding::from_config(&config).expect("in range");
+        assert_eq!(binding.max_approval_lifetime_seconds, expected);
+    }
+    // Absent means off, and 0 is accepted without P4.
+    let config = parse_config(base_config_json(json!({"maxApprovalLifetimeSeconds": 0}))).unwrap();
+    assert_eq!(
+        Binding::from_config(&config)
+            .unwrap()
+            .max_approval_lifetime_seconds,
+        None
+    );
+    let config = parse_config(base_config_json(json!({}))).unwrap();
+    assert_eq!(
+        Binding::from_config(&config)
+            .unwrap()
+            .max_approval_lifetime_seconds,
+        None
+    );
+}
+
+// ===========================================================================
+// N. #52 — rpc-param envelope removed before forwarding
+// ===========================================================================
+
+fn strip(body: &str) -> Option<String> {
+    strip_top_level_member(body.as_bytes(), "approvalBinding")
+        .expect("strip must succeed")
+        .map(|bytes| String::from_utf8(bytes).expect("utf-8"))
+}
+
+#[test]
+fn strip_removes_first_member_with_its_comma() {
+    assert_eq!(
+        strip(r#"{"approvalBinding":{"a":[1,"}"]},"jsonrpc":"2.0","id":1}"#).as_deref(),
+        Some(r#"{"jsonrpc":"2.0","id":1}"#)
+    );
+}
+
+#[test]
+fn strip_removes_middle_member_with_its_comma() {
+    assert_eq!(
+        strip(r#"{"jsonrpc":"2.0","approvalBinding":{"x":"\"{"},"id":1}"#).as_deref(),
+        Some(r#"{"jsonrpc":"2.0","id":1}"#)
+    );
+}
+
+#[test]
+fn strip_removes_last_member_with_the_preceding_comma() {
+    assert_eq!(
+        strip(r#"{"jsonrpc":"2.0","id":1,"approvalBinding":{}}"#).as_deref(),
+        Some(r#"{"jsonrpc":"2.0","id":1}"#)
+    );
+}
+
+#[test]
+fn strip_removes_the_only_member() {
+    assert_eq!(strip(r#"{"approvalBinding":null}"#).as_deref(), Some("{}"));
+    assert_eq!(
+        strip(" { \"approvalBinding\" : 1 } ").as_deref(),
+        Some(" {  } ")
+    );
+}
+
+#[test]
+fn strip_handles_whitespace_around_members() {
+    let body = "{\n  \"jsonrpc\" : \"2.0\" ,\n  \"approvalBinding\" : { \"k\" : [ 1 , 2 ] } ,\n  \"id\" : 1\n}";
+    assert_eq!(
+        strip(body).as_deref(),
+        Some("{\n  \"jsonrpc\" : \"2.0\" ,\n  \"id\" : 1\n}")
+    );
+    let last = "{ \"id\" : 1 ,\t\"approvalBinding\" : true \n}";
+    assert_eq!(strip(last).as_deref(), Some("{ \"id\" : 1 \n}"));
+}
+
+#[test]
+fn strip_matches_an_escaped_key() {
+    assert_eq!(
+        strip(r#"{"id":1,"approval\u0042inding":{"n":1}}"#).as_deref(),
+        Some(r#"{"id":1}"#)
+    );
+}
+
+#[test]
+fn strip_keeps_the_rest_byte_exact() {
+    // Non-canonical spellings (exponent, escapes, key order) survive untouched,
+    // so upstream receives exactly the argument bytes P2 checked.
+    let body = r#"{"params":{"arguments":{"b":"\u00e9","a":1e2}},"approvalBinding":{},"method":"tools/call"}"#;
+    assert_eq!(
+        strip(body).as_deref(),
+        Some(r#"{"params":{"arguments":{"b":"\u00e9","a":1e2}},"method":"tools/call"}"#)
+    );
+}
+
+#[test]
+fn strip_ignores_nested_members_of_the_same_name() {
+    assert_eq!(
+        strip(r#"{"params":{"approvalBinding":1},"id":1}"#),
+        None,
+        "only the top-level member is the envelope"
+    );
+}
+
+#[test]
+fn strip_returns_none_when_the_member_is_absent() {
+    assert_eq!(strip(r#"{"jsonrpc":"2.0","id":1}"#), None);
+    assert_eq!(strip("{}"), None);
+}
+
+#[test]
+fn strip_refuses_a_non_object_body() {
+    assert!(strip_top_level_member(b"[1]", "approvalBinding").is_err());
+}
+
+#[test]
+fn duplicate_envelope_members_fail_closed_before_strip() {
+    // parse_strict_json rejects a duplicate member, so at most one can match.
+    let body = br#"{"approvalBinding":{},"approvalBinding":{},"id":1}"#;
+    assert!(strip_top_level_member(body, "approvalBinding").is_err());
+}
+
+fn rpc_param_request(body_text: &str) -> UnitHttpRequest {
+    UnitHttpRequest::post()
+        .with_header("content-type", "application/json")
+        .with_header("content-length", body_text.len().to_string())
+        .with_header("client_id", EXECUTOR)
+        .with_body(body_text.to_string())
+        .with_authentication_data(auth_of(EXECUTOR))
+}
+
+fn rpc_param_body(envelope: &Value, args: &Value) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","approvalBinding":{envelope},"id":1,"method":"tools/call","params":{{"name":"deploy.apply","arguments":{args}}}}}"#
+    )
+}
+
+#[test]
+fn allowed_rpc_param_call_forwards_without_the_envelope() {
+    let (backend, mut tester) = harness!(config_with(json!({"approvalSource": "rpc-param"})));
+    let args = json!({"replicas": 3});
+    let envelope = sound_approval("deploy.apply", &args, "n-strip", &far_future());
+    let body = rpc_param_body(&envelope, &args);
+    let response = tester.request(rpc_param_request(&body));
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("allowed call forwards");
+    assert_eq!(forwarded.header("x-approval-binding"), Some("allowed"));
+    let expected = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"deploy.apply","arguments":{args}}}}}"#
+    );
+    assert_eq!(forwarded.body(), expected.as_bytes());
+    assert_eq!(
+        forwarded.header("content-length"),
+        Some(expected.len().to_string().as_str())
+    );
+}
+
+#[test]
+fn monitor_forward_of_a_would_deny_also_strips_the_envelope() {
+    let (backend, mut tester) = harness!(config_with(json!({
+        "approvalSource": "rpc-param", "mode": "monitor"
+    })));
+    let args = json!({"replicas": 3});
+    let envelope = sound_approval("deploy.apply", &args, "n-strip-mon", &far_future());
+    let body = rpc_param_body(&envelope, &json!({"replicas": 9}));
+    tester.request(rpc_param_request(&body));
+    let forwarded = backend.next().expect("monitor forwards");
+    assert_eq!(
+        forwarded.header("x-approval-binding"),
+        Some("would-deny;predicate=P2")
+    );
+    let forwarded_body: Value = serde_json::from_slice(forwarded.body()).unwrap();
+    assert!(forwarded_body.get("approvalBinding").is_none());
+}
+
+#[test]
+fn strip_can_be_disabled() {
+    let (backend, mut tester) = harness!(config_with(json!({
+        "approvalSource": "rpc-param", "stripApprovalEnvelope": false
+    })));
+    let args = json!({"replicas": 3});
+    let envelope = sound_approval("deploy.apply", &args, "n-keep", &far_future());
+    let body = rpc_param_body(&envelope, &args);
+    tester.request(rpc_param_request(&body));
+    let forwarded = backend.next().expect("allowed call forwards");
+    assert_eq!(forwarded.body(), body.as_bytes());
+}
+
+#[test]
+fn header_mode_body_is_forwarded_unchanged() {
+    // approvalSource=header: a top-level member that happens to share the
+    // rpc-field name is not an envelope and is not touched.
+    let (backend, mut tester) = harness!(block_config());
+    let args = json!({"replicas": 3});
+    let envelope = sound_approval("deploy.apply", &args, "n-hdr", &far_future());
+    let body = rpc_param_body(&json!({"unrelated": true}), &args);
+    tester.request(raw_request(&envelope, EXECUTOR, &body));
+    let forwarded = backend.next().expect("allowed call forwards");
+    assert_eq!(forwarded.body(), body.as_bytes());
 }

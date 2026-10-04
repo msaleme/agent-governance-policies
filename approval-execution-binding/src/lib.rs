@@ -125,6 +125,10 @@ const NONCE_NEVER_EXPIRES: i64 = i64::MAX;
 /// exactly (2^53 − 1). RFC 8785 serializes numbers as doubles.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
+/// Upper limit for `maxApprovalLifetimeSeconds` (one year). A larger bound is
+/// not a meaningful bound, and the limit keeps the deadline arithmetic in range.
+const MAX_APPROVAL_LIFETIME_LIMIT_SECONDS: i64 = 31_536_000;
+
 // ---------------------------------------------------------------------------
 // Predicates
 // ---------------------------------------------------------------------------
@@ -364,8 +368,29 @@ fn check_action_and_arguments(
 /// Real wall-clock freshness: valid while `now <= not_after + clockSkewSeconds`,
 /// where `now` is this gateway's own clock — never a caller-supplied instant,
 /// since a caller-supplied execution time would let the executing party grade
-/// its own freshness check.
-fn check_freshness(approval: &ApprovalRecord, clock_skew_seconds: i64) -> Result<(), String> {
+/// its own freshness check. With `maxApprovalLifetimeSeconds` set, the approval
+/// must also not outlive the bound: `not_after <= now + max_lifetime + skew`.
+fn check_freshness(
+    approval: &ApprovalRecord,
+    clock_skew_seconds: i64,
+    max_lifetime_seconds: Option<i64>,
+) -> Result<(), String> {
+    check_freshness_at(
+        approval,
+        clock_skew_seconds,
+        max_lifetime_seconds,
+        chrono::Utc::now(),
+    )
+}
+
+/// `check_freshness` at an explicit gateway instant, so the boundaries are
+/// testable without racing the clock.
+fn check_freshness_at(
+    approval: &ApprovalRecord,
+    clock_skew_seconds: i64,
+    max_lifetime_seconds: Option<i64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
     let not_after_raw = approval
         .not_after
         .as_deref()
@@ -373,15 +398,27 @@ fn check_freshness(approval: &ApprovalRecord, clock_skew_seconds: i64) -> Result
     let not_after = chrono::DateTime::parse_from_rfc3339(not_after_raw)
         .map_err(|err| format!("malformed not_after '{not_after_raw}': {err}"))?
         .with_timezone(&chrono::Utc);
-    let now = chrono::Utc::now();
-    let deadline = not_after + chrono::Duration::seconds(clock_skew_seconds.max(0));
-    if now > deadline {
-        Err(format!(
+    let skew =
+        chrono::Duration::try_seconds(clock_skew_seconds.max(0)).unwrap_or(chrono::Duration::MAX);
+    // An out-of-range deadline saturates: a skew that large means "no limit".
+    let deadline = not_after.checked_add_signed(skew);
+    if deadline.is_some_and(|deadline| now > deadline) {
+        return Err(format!(
             "executed at {now} after approval expired {not_after} (+{clock_skew_seconds}s skew)"
-        ))
-    } else {
-        Ok(())
+        ));
     }
+    if let Some(max_lifetime) = max_lifetime_seconds {
+        let latest = chrono::Duration::try_seconds(max_lifetime)
+            .and_then(|lifetime| now.checked_add_signed(lifetime))
+            .and_then(|latest| latest.checked_add_signed(skew));
+        if latest.is_some_and(|latest| not_after > latest) {
+            return Err(format!(
+                "approval not_after {not_after} exceeds the maximum lifetime \
+                 ({max_lifetime}s +{clock_skew_seconds}s skew from {now})"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +730,147 @@ fn parse_single_jsonrpc(body: &[u8]) -> Result<ParsedRequest, String> {
 }
 
 // ---------------------------------------------------------------------------
+// rpc-param envelope removal (#52)
+// ---------------------------------------------------------------------------
+
+fn skip_json_whitespace(body: &[u8], mut at: usize) -> usize {
+    while at < body.len() && matches!(body[at], b' ' | b'\t' | b'\n' | b'\r') {
+        at += 1;
+    }
+    at
+}
+
+/// Returns the index just past the JSON string starting at `body[at] == '"'`.
+fn skip_json_string(body: &[u8], at: usize) -> Result<usize, String> {
+    if body.get(at) != Some(&b'"') {
+        return Err("expected a JSON string".to_string());
+    }
+    let mut i = at + 1;
+    while i < body.len() {
+        match body[i] {
+            b'\\' => i += 2,
+            b'"' => return Ok(i + 1),
+            _ => i += 1,
+        }
+    }
+    Err("unterminated JSON string".to_string())
+}
+
+/// Returns the index just past the JSON value starting at `body[at]`.
+fn skip_json_value(body: &[u8], at: usize) -> Result<usize, String> {
+    match body.get(at) {
+        Some(b'"') => skip_json_string(body, at),
+        Some(b'{') | Some(b'[') => {
+            let mut depth = 0usize;
+            let mut i = at;
+            while i < body.len() {
+                match body[i] {
+                    b'"' => {
+                        i = skip_json_string(body, i)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Ok(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            Err("unterminated JSON container".to_string())
+        }
+        Some(_) => {
+            let mut i = at;
+            while i < body.len()
+                && !matches!(body[i], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+            {
+                i += 1;
+            }
+            if i == at {
+                Err("expected a JSON value".to_string())
+            } else {
+                Ok(i)
+            }
+        }
+        None => Err("expected a JSON value".to_string()),
+    }
+}
+
+/// Removes the top-level member named `field` from a JSON object body by
+/// cutting its bytes out, comma included; every other byte is kept as sent, so
+/// the forwarded arguments are exactly the bytes P2 checked. Keys are compared
+/// after JSON unescaping, so an escaped spelling of `field` is the same member.
+/// Returns `Ok(None)` when the member is absent. `body` must already have passed
+/// `parse_strict_json` (no duplicate members, so at most one match); the result
+/// is re-parsed and checked to equal the original minus `field`, and any
+/// mismatch is an `Err` for the caller to fail closed on.
+fn strip_top_level_member(body: &[u8], field: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut at = skip_json_whitespace(body, 0);
+    if body.get(at) != Some(&b'{') {
+        return Err("request body is not a JSON object".to_string());
+    }
+    at = skip_json_whitespace(body, at + 1);
+    // (key start, value end) of each member, in order.
+    let mut members: Vec<(usize, usize)> = Vec::new();
+    let mut target = None;
+    if body.get(at) != Some(&b'}') {
+        loop {
+            let key_start = at;
+            let key_end = skip_json_string(body, key_start)?;
+            let key: String = serde_json::from_slice(&body[key_start..key_end])
+                .map_err(|err| format!("invalid member key: {err}"))?;
+            at = skip_json_whitespace(body, key_end);
+            if body.get(at) != Some(&b':') {
+                return Err("expected ':' after member key".to_string());
+            }
+            at = skip_json_whitespace(body, at + 1);
+            let value_end = skip_json_value(body, at)?;
+            if key == field {
+                target = Some(members.len());
+            }
+            members.push((key_start, value_end));
+            at = skip_json_whitespace(body, value_end);
+            match body.get(at) {
+                Some(b',') => at = skip_json_whitespace(body, at + 1),
+                Some(b'}') => break,
+                _ => return Err("expected ',' or '}' after member value".to_string()),
+            }
+        }
+    }
+    let Some(index) = target else {
+        return Ok(None);
+    };
+    let (key_start, value_end) = members[index];
+    // Not last: cut from this key up to the next key (through the comma).
+    // Last of several: cut from the end of the previous value through this one.
+    // Only member: cut the member itself.
+    let (cut_start, cut_end) = if let Some(&(next_start, _)) = members.get(index + 1) {
+        (key_start, next_start)
+    } else if index > 0 {
+        (members[index - 1].1, value_end)
+    } else {
+        (key_start, value_end)
+    };
+    let mut stripped = Vec::with_capacity(body.len() - (cut_end - cut_start));
+    stripped.extend_from_slice(&body[..cut_start]);
+    stripped.extend_from_slice(&body[cut_end..]);
+
+    let mut expected = parse_strict_json(body)?;
+    if let Some(object) = expected.as_object_mut() {
+        object.remove(field);
+    }
+    if parse_strict_json(&stripped)? != expected {
+        return Err(
+            "stripped body does not re-parse to the original minus the envelope".to_string(),
+        );
+    }
+    Ok(Some(stripped))
+}
+
+// ---------------------------------------------------------------------------
 // Config surface
 // ---------------------------------------------------------------------------
 
@@ -713,6 +891,10 @@ struct Binding {
     expected_tenant: String,
     expected_environment: String,
     clock_skew_seconds: i64,
+    /// `None` when `maxApprovalLifetimeSeconds` is absent or 0 (off).
+    max_approval_lifetime_seconds: Option<i64>,
+    /// Remove the `rpc-param` envelope from forwarded bodies (#52).
+    strip_approval_envelope: bool,
     block: bool,
     deny_with_rpc_error: bool,
     result_header: String,
@@ -792,6 +974,25 @@ impl Binding {
             }
         }
 
+        // #52: an optional bound on the approval's remaining lifetime. It is a P4
+        // check, so it needs P4; 0 or absent turns it off.
+        let max_approval_lifetime_seconds = match config.max_approval_lifetime_seconds {
+            None | Some(0) => None,
+            Some(seconds) if (1..=MAX_APPROVAL_LIFETIME_LIMIT_SECONDS).contains(&seconds) => {
+                if !required.contains(Predicate::P4) {
+                    return Err(anyhow!(
+                        "maxApprovalLifetimeSeconds is enforced under P4; add P4 to requiredPredicates or set it to 0"
+                    ));
+                }
+                Some(seconds)
+            }
+            Some(other) => {
+                return Err(anyhow!(
+                    "maxApprovalLifetimeSeconds must be 0 (off) or 1..={MAX_APPROVAL_LIFETIME_LIMIT_SECONDS}, got {other}"
+                ))
+            }
+        };
+
         let mode = config.mode.to_ascii_lowercase();
         let block = match mode.as_str() {
             "block" => true,
@@ -816,6 +1017,8 @@ impl Binding {
             expected_tenant: config.expected_tenant.clone().unwrap_or_default(),
             expected_environment: config.expected_environment.clone().unwrap_or_default(),
             clock_skew_seconds: config.clock_skew_seconds,
+            max_approval_lifetime_seconds,
+            strip_approval_envelope: config.strip_approval_envelope.unwrap_or(true),
             block,
             deny_with_rpc_error,
             result_header: config.result_header.clone(),
@@ -948,7 +1151,11 @@ fn evaluate(
     }
 
     if binding.required.contains(Predicate::P4) {
-        if let Err(reason) = check_freshness(&envelope.approval, binding.clock_skew_seconds) {
+        if let Err(reason) = check_freshness(
+            &envelope.approval,
+            binding.clock_skew_seconds,
+            binding.max_approval_lifetime_seconds,
+        ) {
             return Verdict::Deny {
                 predicate: Some(Predicate::P4),
                 reason,
@@ -1127,6 +1334,18 @@ fn content_type_is_utf8_json(value: &str) -> bool {
             }
             _ => true,
         })
+}
+
+/// Replaces the body forwarded upstream and sets `content-length` to match.
+/// PDK 1.10's `set_body` writes the body buffer only and leaves headers alone,
+/// and the request still carries the client's original `content-length`, so the
+/// header is rewritten here; the headers have not been sent yet in this state.
+fn replace_forwarded_body(handler: &dyn HeadersBodyHandler, body: &[u8]) -> Result<(), String> {
+    handler
+        .set_body(body)
+        .map_err(|err| format!("set_body failed: {err:?}"))?;
+    handler.set_header("content-length", &body.len().to_string());
+    Ok(())
 }
 
 /// Header-phase framing refusal (#50): a POST this policy cannot admit for
@@ -1318,6 +1537,32 @@ async fn request_filter<S: DataStorage>(
             .and_then(|env| env.approval.not_after.as_deref()),
     );
     let verdict = evaluate(binding, &call, envelope, &executor, executor_verified);
+
+    // #52: an rpc-param envelope is cut out of any body that is forwarded (an
+    // allowed call, or a monitor-mode forward) before the P6 reservation, so a
+    // failure here never burns a nonce. The splice fails closed in block mode;
+    // monitor mode forwards the body unchanged and logs why.
+    let forwards = !binding.block || matches!(verdict, Verdict::Allow);
+    if forwards
+        && binding.approval_source == ApprovalSource::RpcParam
+        && binding.strip_approval_envelope
+    {
+        let rewritten =
+            strip_top_level_member(&body, &binding.approval_rpc_field).and_then(|stripped| {
+                match stripped {
+                    Some(stripped) => replace_forwarded_body(handler, &stripped),
+                    None => Ok(()),
+                }
+            });
+        if let Err(reason) = rewritten {
+            let reason = format!("cannot remove the rpc-param approval envelope: {reason}");
+            log_verdict("deny", None, &reason);
+            if binding.block {
+                violations.generate_policy_violation();
+                return Flow::Break(render_denial(binding, call.id.clone(), "malformed"));
+            }
+        }
+    }
 
     match verdict {
         Verdict::Allow => {
