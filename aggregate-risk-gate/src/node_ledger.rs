@@ -43,6 +43,11 @@
 // Live state is never evicted. The same scan runs every `GC_INTERVAL_MS` so
 // stale keys are deleted even below the cap.
 //
+// Every touch, including one whose call is then refused or settles
+// `NotActive`, saves its roll and reclaim (by CAS) whenever they changed the
+// record, exactly as the worker ledger does under its lock, so tombstones are
+// dropped at the same moments on both backends.
+//
 // Reservation ids carry a random 64-bit per-worker prefix and a counter, so a
 // reservation made on worker A can be settled by id on worker B (the response
 // may run on either), and the #17 rules hold unchanged: settle at most once,
@@ -326,6 +331,9 @@ impl NodeLedger {
         retries: u32,
         f: &mut impl FnMut(&mut ScopeState) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
+        // A refusal whose roll/reclaim could not be saved (CAS conflict):
+        // the call is still refused for that reason if retries run out.
+        let mut refused = None;
         for _ in 0..retries {
             let (mut state, cas, new) = match self.read(key).map_err(unavailable)? {
                 // The sweep that wrote it is deleting this key: read again,
@@ -335,9 +343,30 @@ impl NodeLedger {
                 Read::New(cas, period) => (ScopeState::at_period(period), cas, true),
                 Read::Live(state, cas) => (state, Some(cas), false),
             };
-            state.roll(period(self.window, now));
+            let rolled = state.roll_to(period(self.window, now));
             let reclaimed = state.reclaim(now, self.ttl);
-            let result = f(&mut state)?;
+            let result = match f(&mut state) {
+                Ok(result) => result,
+                // Refused, but the touch still counts: like the worker
+                // ledger, save the roll and reclaim (which may drop an old
+                // tombstone, so a later settlement of it is `NotActive`).
+                Err(refusal) => {
+                    if new || (!rolled && reclaimed == (0, 0)) {
+                        return Err(refusal);
+                    }
+                    match self.put_record(key, cas.as_deref(), &Record::Scope(state)) {
+                        Ok(()) => {
+                            count_reclaim(&mut self.stats.borrow_mut(), reclaimed);
+                            return Err(refusal);
+                        }
+                        Err(StoreError::CasMismatch) => {
+                            refused = Some(refusal);
+                            continue;
+                        }
+                        Err(StoreError::Failed) => return Err(refusal),
+                    }
+                }
+            };
             if new {
                 self.acquire_slot(now)?;
             }
@@ -356,7 +385,7 @@ impl NodeLedger {
                 }
             }
         }
-        Err(Refusal::Contention)
+        Err(refused.unwrap_or(Refusal::Contention))
     }
 
     /// Takes one of `maxScopes` slots for a new scope record. At the cap this
@@ -566,12 +595,14 @@ impl NodeLedger {
                 // Untracked (never created, or swept while idle).
                 Read::New(..) | Read::Doomed => return Ok(None),
             };
-            state.roll(period(self.window, now));
+            let rolled = state.roll_to(period(self.window, now));
             let outcome = state.settle(reservation.id, commit);
-            if outcome == Settlement::NotActive {
+            let reclaimed = state.reclaim(now, self.ttl);
+            // Nothing changed: no write. Otherwise the roll and reclaim are
+            // saved even for `NotActive`, as the worker ledger does.
+            if outcome == Settlement::NotActive && !rolled && reclaimed == (0, 0) {
                 return Ok(Some(outcome));
             }
-            let reclaimed = state.reclaim(now, self.ttl);
             let idle = state.is_idle();
             match self.put_record(&key, Some(&cas), &Record::Scope(state)) {
                 Ok(()) => {
@@ -1238,6 +1269,39 @@ mod test {
         // Left that long, a sweep CASes it back to Vacant and it is re-used.
         assert!(a.reserve("s", 1, 100, RECOVER_MS).is_ok());
         assert_eq!(a.snapshot("s").reserved, 1);
+    }
+
+    /// The connected case 5c sequence (TTL 1000 ms, slow call 3500 ms, touch
+    /// at 2300 ms, budget 1600, weight 800) on both backends: the refused
+    /// touch past two TTLs drops the slow call's tombstone, so its response
+    /// settles `NotActive` and D sees would-be-total 2400.
+    #[test]
+    fn a_refused_touch_drops_the_tombstone_exactly_like_the_worker_ledger() {
+        use crate::ledger::{Denial, Ledger};
+        let store = FakeStore::default();
+        let node = NodeLedger::new(Box::new(store.clone()), b"k".to_vec(), 100, 1000, None, 1);
+        let worker = Ledger::with_limits(100, 1000, None);
+        let backends: [(&str, &dyn LedgerStore); 2] = [("node", &node), ("worker", &worker)];
+        for (name, ledger) in backends {
+            let a = ledger.reserve("s", 800, 1600, 0).unwrap();
+            for _ in 0..2 {
+                let fast = ledger.reserve("s", 800, 1600, 1200).unwrap();
+                assert_eq!(
+                    ledger.commit(&fast, 1200),
+                    Settlement::Committed,
+                    "{}",
+                    name
+                );
+            }
+            assert!(ledger.reserve("s", 800, 1600, 2300).is_err(), "{}", name);
+            assert_eq!(ledger.commit(&a, 3500), Settlement::NotActive, "{}", name);
+            match ledger.reserve("s", 800, 1600, 3500) {
+                Err(Refusal::OverBudget(Denial { would_be_total, .. })) => {
+                    assert_eq!(would_be_total, 2400, "{}", name)
+                }
+                other => panic!("{}: {:?}", name, other),
+            }
+        }
     }
 
     #[test]

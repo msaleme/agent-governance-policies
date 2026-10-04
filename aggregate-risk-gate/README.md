@@ -330,7 +330,8 @@ these states, and the response stamps which one as `settlement=`:
 | `late-released` | Failure response after reclaim, while the tombstone is still held | Nothing; the amount was already freed |
 | `not-active` | The reservation was already settled, or its tombstone was dropped | Nothing |
 
-Reclaim is lazy. It runs, under the same lock as admission, whenever a call touches the scope, and
+Reclaim is lazy. It runs, under the same lock as admission (on the node backend, inside the same
+compare-and-swap), whenever a call touches the scope, even a call that is then refused, and
 across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is
 reclaimed by the first such pass at or after its expiry, which frees its budget and leaves a
 tombstone so a slow response can still settle late. The tombstone is kept for at least one more
@@ -509,7 +510,7 @@ placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 191 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 192 tests, none of which touch the network or
 Docker:
 
 - **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 53 tests): correctness of
@@ -540,7 +541,7 @@ Docker:
   without a window nothing resets; and a scope from an earlier period can be evicted.
   Two cover the cost of the cap (#49 A): 1,000 refusals against 100,000 live scopes examine no
   scope at all, and the idle index follows every settlement.
-- **`src/node_ledger.rs` — the node-wide ledger** (23 tests, over an in-memory test store that can
+- **`src/node_ledger.rs` — the node-wide ledger** (24 tests, over an in-memory test store that can
   force CAS conflicts and storage errors): two workers racing on every write admit exactly 3 of the
   reference calls, and interleaved workers admit exactly what fits; persistent CAS mismatch is
   `Contention` and a storage error `Unavailable`, both reserving nothing; a reservation made on
@@ -552,7 +553,8 @@ Docker:
   deleted by a writer, a cleanup whose delete fails restores the tombstone, tombstones age on the
   store clock rather than a stale request time, and a swept scope keeps its window period; a
   commit whose record reads as missing is still charged, and a queued commit is charged even after
-  its tombstone is dropped; an empty stored value reads as absent and never wedges a scope;
+  its tombstone is dropped; a refused call past two timeouts drops a tombstone exactly as on the
+  worker ledger (connected case 5c, replayed on both backends); an empty stored value reads as absent and never wedges a scope;
   and an unwritable commit is queued, an unwritable release stays held, and a long commit queue
   refuses new reservations.
 - **`src/lib.rs` — the PDK filter** (115 tests), mostly exercised end to end through the

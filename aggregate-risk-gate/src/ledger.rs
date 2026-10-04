@@ -150,9 +150,17 @@ impl ScopeState {
     /// Starts a new window period: committed exposure from an earlier period
     /// no longer counts. Reservations are untouched.
     pub(crate) fn roll(&mut self, period: u64) {
+        self.roll_to(period);
+    }
+
+    /// `roll`, returning whether a new period started.
+    pub(crate) fn roll_to(&mut self, period: u64) -> bool {
         if period > self.period {
             self.period = period;
             self.committed = 0;
+            true
+        } else {
+            false
         }
     }
 

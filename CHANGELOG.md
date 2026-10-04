@@ -31,7 +31,8 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   commit whose record reads as missing within the reservation's lifetime is charged, not dropped;
   and an unwritable release stays held until reclaimed. Only the cleanup pass that marks a
   tombstone deletes it, timed on the gateway clock. A zero-length stored value reads as absent,
-  so an empty record never wedges a scope closed. Remaining known edges are listed in the policy
+  so an empty record never wedges a scope closed. A refused call still saves its reclaim, so a
+  touch past two timeouts drops a tombstone on the node backend exactly as on the worker one. Remaining known edges are listed in the policy
   README.
   Keys are an HMAC of the scope, never the raw identity, private to the policy instance unless the
   new `ledgerNamespace` is set. Stale keys are deleted, and `maxScopes` is enforced per replica
@@ -48,7 +49,7 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   uninspectable, so a `tools/call` can't be hidden by an encoding the upstream decodes
   differently, such as `utf-7`. A body the JSON parser rejects (nesting too deep, a lone
   surrogate, a BOM) is now unpriceable instead of being charged as a single call.
-- Library tests: 191 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
+- Library tests: 192 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
   under `spend-amount` in block mode. New real-gateway cases: `case8n` asserts exactly 3 of 200
   admitted across four Envoy workers with the node ledger, and `case8nb` records whether the node
   ledger survives the startup config apply.
