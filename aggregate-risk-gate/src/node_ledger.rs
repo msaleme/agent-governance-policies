@@ -7,7 +7,9 @@
 //
 // Each worker is its own single-threaded VM; the shared data is process-wide and
 // offers get, a compare-and-swap set (`StoreMode::Cas`), a create-only set
-// (`StoreMode::Absent`) and an unconditional delete. Every ledger write here is
+// (`StoreMode::Absent`) and an unconditional delete. On Flex the delete is a
+// real removal (verified by reading the PDK 1.10 source: `remove_shared_data_key`);
+// a zero-length value, which only PDK's wasm stub writes, reads as absent. Every ledger write here is
 // a CAS (or Absent) against the version this worker just read, inside a bounded
 // retry loop with no sleep:
 //
@@ -767,6 +769,18 @@ impl LedgerStore for NodeLedger {
     }
 }
 
+/// A zero-length value reads as no value. PDK local storage's `get` returns
+/// an empty value as present, while its `StoreMode::Absent` treats an empty
+/// value as absent and creates over it (CAS against that value's version),
+/// so reading it as missing makes the ledger's next write an `Absent` create
+/// that succeeds, instead of a decode error that would leave the scope
+/// refused as unavailable for good. Flex's delete is a real removal
+/// (`remove_shared_data_key`); only PDK's wasm stub deletes by writing an
+/// empty value, but either way an empty record never wedges a scope.
+pub fn non_empty(read: Option<(Vec<u8>, String)>) -> Option<(Vec<u8>, String)> {
+    read.filter(|(value, _)| !value.is_empty())
+}
+
 /// `KvStore` over PDK local shared data, through the synchronous
 /// `blocking()` handle (the ledger runs inside one filter callback).
 pub struct PdkStore {
@@ -780,6 +794,7 @@ impl KvStore for PdkStore {
         self.storage
             .blocking()
             .get::<Vec<u8>>(key)
+            .map(non_empty)
             .map_err(|_| StoreError::Failed)
     }
 
@@ -834,7 +849,7 @@ pub fn random_prefix() -> u64 {
 /// read and its CAS.
 #[cfg(test)]
 pub mod fake {
-    use super::{KvStore, Put, StoreError};
+    use super::{non_empty, KvStore, Put, StoreError};
     use std::cell::RefCell;
     use std::collections::{HashMap, VecDeque};
     use std::rc::Rc;
@@ -912,10 +927,13 @@ pub mod fake {
                 inner.hidden_gets -= 1;
                 return Ok(None);
             }
-            Ok(inner
-                .map
-                .get(key)
-                .map(|(value, cas)| (value.clone(), cas.to_string())))
+            // Through the same filter as `PdkStore`.
+            Ok(non_empty(
+                inner
+                    .map
+                    .get(key)
+                    .map(|(value, cas)| (value.clone(), cas.to_string())),
+            ))
         }
 
         fn put(&self, key: &str, mode: Put<'_>, value: &[u8]) -> Result<(), StoreError> {
@@ -929,10 +947,16 @@ pub mod fake {
                 inner.forced_mismatches -= 1;
                 return Err(StoreError::CasMismatch);
             }
-            let current = inner.map.get(key).map(|(_, cas)| *cas);
+            // Like PDK local storage, `Absent` treats an empty value as
+            // absent and creates over it.
+            let current = inner
+                .map
+                .get(key)
+                .map(|(value, cas)| (value.is_empty(), *cas));
             match (mode, current) {
-                (Put::Absent, Some(_)) => return Err(StoreError::CasMismatch),
-                (Put::Cas(cas), Some(current)) if cas != current.to_string() => {
+                (Put::Absent, Some((false, _))) => return Err(StoreError::CasMismatch),
+                (Put::Absent, Some((true, _))) => {}
+                (Put::Cas(cas), Some((_, current))) if cas != current.to_string() => {
                     return Err(StoreError::CasMismatch)
                 }
                 // Like Envoy, a CAS on a missing key creates it.
@@ -1214,6 +1238,35 @@ mod test {
         // Left that long, a sweep CASes it back to Vacant and it is re-used.
         assert!(a.reserve("s", 1, 100, RECOVER_MS).is_ok());
         assert_eq!(a.snapshot("s").reserved, 1);
+    }
+
+    #[test]
+    fn an_empty_value_reads_as_absent_and_never_wedges_a_scope() {
+        assert_eq!(non_empty(Some((Vec::new(), "7".to_string()))), None);
+        assert!(non_empty(Some((b"1".to_vec(), "7".to_string()))).is_some());
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        // Empty values under the scope, slot-count and sweep keys, as PDK's
+        // wasm stub leaves after a delete.
+        for key in [a.key("s"), COUNT_KEY.to_string(), SWEEP_KEY.to_string()] {
+            store.put(&key, Put::Absent, &[]).unwrap();
+        }
+        let r = a.reserve("s", 800, 3000, 0).unwrap();
+        assert_eq!(a.commit(&r, 1), Settlement::Committed);
+        assert_eq!(a.snapshot("s").committed, 800);
+        assert_eq!(
+            a.read_count().unwrap().0,
+            1,
+            "slot taken over the empty count"
+        );
+        // A real value is never created over.
+        assert_eq!(
+            store.put(&a.key("s"), Put::Absent, b"x"),
+            Err(StoreError::CasMismatch)
+        );
+        // A collection runs over the empty sweep record too.
+        a.record("s", 0, GC_INTERVAL_MS).unwrap();
+        assert!(a.read_sweep().unwrap().1.is_some());
     }
 
     #[test]
