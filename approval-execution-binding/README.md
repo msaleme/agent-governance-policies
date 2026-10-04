@@ -36,8 +36,12 @@ predicates and denies the call if any **required** predicate fails.
 because that is the method that *executes a tool*, which is what an approval constrains. Every other
 JSON-RPC method (`tools/list`, `initialize`, `ping`, notifications, anything unrecognized) is
 **out of scope**: it is forwarded upstream untouched, with the result header stamped `out-of-scope`
-in both monitor and block mode. The policy never blocks a non-`tools/call` method. A request that
-cannot be parsed at all still fails closed in block mode (see the inspection boundary below).
+in both monitor and block mode. The policy never blocks an identified non-`tools/call` method. At
+the HTTP layer, only `POST` can carry a Streamable-HTTP `tools/call`, so a bodyless `GET` (the
+server→client SSE stream), `DELETE` (session teardown with `Mcp-Session-Id`), `OPTIONS` or `HEAD` is
+also forwarded untouched and stamped `out-of-scope` in both modes. A POST that cannot be inspected
+— or parsed at all — still fails closed in block mode, because it could be a `tools/call` (see the
+inspection boundary below).
 
 Predicate semantics and canonical form follow the
 [**Approval Binding Vectors (ABV) v0.1**](https://github.com/msaleme/approval-binding-vectors)
@@ -57,10 +61,10 @@ controls and negative vectors. This implementation vendors the ABV vectors
 | ID | Predicate | The failure it excludes |
 |---|---|---|
 | **P1** | Action | Approved tool A, executed tool B. |
-| **P2** | Arguments | Approved A with args X, executed A with args Y. Arguments are compared by canonical (RFC 8785 JCS) digest; a reference-shaped argument (an object carrying a `$ref` key at any depth) is **rejected under P2**, not dereferenced — the approved and executed argument bytes must match directly. |
+| **P2** | Arguments | Approved A with args X, executed A with args Y. Arguments are compared by canonical digest — the fail-closed subset where the ABV reference form and RFC 8785 JCS agree (see [Canonical form](#canonical-form)); a reference-shaped argument (an object carrying a `$ref` key at any depth) is **rejected under P2**, not dereferenced — the approved and executed argument bytes must match directly. |
 | **P4** | Freshness | Approval correctly scoped and granted, but expired before execution — checked against this gateway's own wall clock, never a caller-supplied timestamp. |
 | **P5** | Separate attester | A record whose only witness that it was approved is the party now executing it. The P5 HMAC covers a **versioned, domain-separated `mcp-v1` payload** (see below), and the executor identity it is checked against is read from the **verified authentication data**, never a caller-asserted header. |
-| **P6** | Single use *(opt-in)* | One approval, replayed for a second execution. Enforced **atomically via gateway data storage** in block mode. Reusable approvals are legitimate in some flows, so P6 defaults out of `requiredPredicates`. |
+| **P6** | Single use *(opt-in)* | One approval, replayed for a second execution. Enforced atomically via **local** gateway data storage in block mode, so single use holds **per gateway replica, until restart** — deploy a single replica for flows that need P6 (see [P6 boundary](#p6-single-use-boundary)). Reusable approvals are legitimate in some flows, so P6 defaults out of `requiredPredicates`. |
 
 > **P3 (dereference) was removed.** An earlier draft carried a sixth predicate that verified the
 > bytes behind a `$ref`-shaped argument via a caller-supplied `dereferenced` digest map. That put
@@ -76,22 +80,45 @@ itself; it does not establish that the attester was *entitled* to approve the ac
 
 ### Inspection boundary
 
+**HTTP method first (#50).** A request whose method is not `POST` (compared case-insensitively)
+and that carries no body is forwarded untouched, stamped `out-of-scope`, in both modes — on MCP
+Streamable HTTP that is the `GET` SSE stream, the `DELETE` session teardown, and `OPTIONS`/`HEAD`.
+A missing method is treated as `POST`, and a non-`POST` that *does* carry a body is inspected
+exactly like a `POST` (so a `tools/call` body cannot dodge the binding by changing its verb).
+
 Before any body is buffered, the policy checks the request's declared framing at the header phase:
 a `content-type` that isn't `application/json` (or an `application/*+json` variant) — which
-excludes SSE/streaming media types such as `text/event-stream` — or the presence of any
-`content-encoding` header (a compressed body, whose decoded size the declared `content-length`
+excludes SSE/streaming media types such as `text/event-stream` — a `charset` parameter other than
+`utf-8`, or the presence of any `content-encoding` header (a compressed body, whose decoded size the declared `content-length`
 cannot bound) is treated the same as malformed framing below: `monitor` mode logs and always
 forwards the request uninspected; `block` mode denies before ever buffering it. This mirrors the
 sibling Decoy Tool Sentinel's admission gate and is the reason SSE/streaming, compressed, and
 non-UTF-8 bodies are excluded from inspection — this policy cannot safely buffer or parse them as
 JSON at all.
 
-Once a body clears that header-phase gate, the policy evaluates it only if it parses as a single
-(non-batch) JSON-RPC 2.0 object with a valid, declared `content-length` no greater than **64 KiB**,
-and the actual body received matches that declared length exactly. A body that is missing
-entirely, declares no length or an oversized one, arrives with a length mismatch, is a JSON-RPC
-**batch**, or fails to parse as a single JSON-RPC object at all (missing/invalid `jsonrpc`, missing
-`method`, or — for `tools/call` — missing `params.name`) is treated as **malformed**: `monitor`
+**Charset.** The policy parses the body as UTF-8, so it inspects a body only when `content-type`
+has no `charset` parameter or `charset=utf-8` (case-insensitive, whitespace-trimmed, optionally
+quoted). Any other value — `utf-7`, `utf-16`, `iso-8859-1`, the `utf8` alias, an empty value, or a
+second conflicting `charset` — is refused as malformed (`block` denies, `monitor` flags and
+forwards). This closes a bypass: an upstream that decodes by charset, as the MCP TypeScript SDK
+does, reads `"tools+AC8-call"` under `charset=utf-7` as `tools/call`, while a UTF-8 parse would see
+an unknown, out-of-scope method and forward it unapproved.
+
+**Framing (content-length).** The policy buffers a body only when it declares a valid
+`content-length` no greater than **64 KiB**, and the body received must match it exactly. A `POST`
+that declares no length — chunked transfer, or HTTP/2, where the header is optional — or an
+oversized or mismatched one is **not buffered** and is treated as a **framing** refusal: `block`
+mode denies it with an empty `403` stamped `denied;framing=content-length`; `monitor` mode forwards
+it stamped `monitor;framing=content-length`. It is denied because it *could* be a `tools/call`, not
+because it was identified as one; clients that need this policy in block mode must send a
+`content-length` (HTTP/1.1 non-chunked bodies always do). Buffering an undeclared-length body under
+a running 64 KiB cap is a follow-up, not this build.
+
+Once a body clears both gates, the policy evaluates it only if it parses as a single (non-batch)
+JSON-RPC 2.0 object. A `POST` with no body at all, a JSON-RPC **batch**, or fails to parse as a single JSON-RPC object at all (missing/invalid `jsonrpc`, missing
+`method`, or — for `tools/call` — missing `params.name`), or one the JSON parser rejects outright
+(nesting deeper than 128, a lone surrogate escape, a leading byte-order mark, invalid UTF-8) is
+treated as **malformed** — never as an out-of-scope method: `monitor`
 mode logs the verdict and always forwards; `block` mode denies. Batches are explicitly out of scope
 for approval binding, not a future predicate — an approval record binds to one executed action, not
 to a collection of them; a batch is therefore rejected atomically (the whole array denied together)
@@ -101,8 +128,10 @@ otherwise-plausible batch can never slip through as one of several forwarded cal
 **What this policy reads — and nothing else.** Inspection is limited to: the approval envelope
 (from `approvalHeader` or, for `approvalSource: rpc-param`, the `approvalRpcField` sibling member of
 the JSON-RPC body), the executor identity header (`executorHeader`), and the JSON-RPC body itself
-(`jsonrpc`/`id`/`method`/`params`, and for `tools/call`, `params.name`/`params.arguments`). It never
-inspects arbitrary headers, the query string, or the request path.
+(`jsonrpc`/`id`/`method`/`params`, and for `tools/call`, `params.name`/`params.arguments`), plus the
+HTTP method and the `content-type` (media type and `charset`)/`content-encoding`/`content-length`
+framing headers. It never
+inspects other headers, the query string, or the request path.
 
 Denial rendering follows the request's own framing, not just `onDeny`:
 - A JSON-RPC **notification** (no `id`) always gets an empty HTTP `202` — JSON-RPC forbids a
@@ -128,13 +157,15 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `executorHeader` | string | `client_id` | **Fallback** header naming the executor. The executor identity is taken FIRST from the **verified** authentication data (`client_id`, then `principal`) established by an upstream authentication policy; this header is used only when no verified subject is present, and when P5 is required and no verified subject exists the call **fails closed** rather than trusting the header. Used only for P5. |
 | `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. (There is no P3.) |
 | `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
-| `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. |
+| `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. `0`–`3600`; anything else is rejected at startup (**breaking**: a negative value used to be treated as `0`, and there was no upper limit). |
+| `maxApprovalLifetimeSeconds` | integer | `0` (off) | Upper bound on an approval's **remaining** lifetime, checked under P4 against the gateway clock: an approval with `not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds` is denied `predicate=P4`. `1`–`31536000` when set; anything else, or setting it without P4 in `requiredPredicates`, is rejected at startup. See [Approval lifetime bound](#approval-lifetime-bound). |
+| `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new length. Ignored for `approvalSource: header`. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
 | `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
 | `expectedTenant` | string | `""` | The tenant this gateway serves, bound as `tenant`. **Required (non-empty) whenever P5 is required.** |
 | `expectedEnvironment` | string | `""` | The environment this gateway serves, bound as `env`. **Required (non-empty) whenever P5 is required.** |
 | `mode` | `monitor`\|`block` | `monitor` | Evaluate and log only, vs. actually deny on a failed required predicate. |
-| `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a block-mode denial is rendered. A request that can't be confidently parsed as a single, non-batch JSON-RPC call with an echoable id always falls back to `empty-403` regardless of this setting — echoing an untrustworthy id risks exposing a protected value. A notification (no id) always gets an empty HTTP 202. |
-| `resultHeader` | string | `x-approval-binding` | Header stamped with the verdict (`allowed`, `would-deny;predicate=P2`, `denied;predicate=P5`) — never the approval or argument values themselves. |
+| `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a block-mode denial is rendered. A request that can't be confidently parsed as a single, non-batch JSON-RPC call with an echoable id always falls back to `empty-403` regardless of this setting — echoing an untrustworthy id risks exposing a protected value. This includes a `POST` refused for framing (no valid declared `content-length` ≤ 64 KiB), stamped `denied;framing=content-length`. A notification (no id) always gets an empty HTTP 202. Never applies to a bodyless non-`POST` request (`GET` SSE stream, `DELETE` session, `OPTIONS`, `HEAD`), which is forwarded `out-of-scope` and never denied. |
+| `resultHeader` | string | `x-approval-binding` | Header stamped with the verdict (`allowed`, `out-of-scope`, `would-deny;predicate=P2`, `denied;predicate=P5`, `denied;predicate=malformed`, `denied;framing=content-length`, the `monitor;…` forms of the last two, and `monitor;envelope=unstripped` or a `;envelope=unstripped` suffix when monitor mode forwards an rpc-param body whose envelope could not be removed) — never the approval or argument values themselves. |
 
 The approval envelope shape (header or rpc-param, identical either way):
 ```json
@@ -151,7 +182,7 @@ The approval envelope shape (header or rpc-param, identical either way):
 ```
 
 **The P5 `mac` is an HMAC-SHA256 over a versioned, domain-separated `mcp-v1` payload** — not over
-the raw scope. The payload is the canonical (RFC 8785 JCS) JSON of:
+the raw scope. The payload is the canonical JSON (see [Canonical form](#canonical-form)) of:
 ```json
 {
   "v": "mcp-v1",
@@ -171,6 +202,24 @@ gateway, tenant, or environment from being replayed against another; binding `su
 P5 a *separate*-attester check (the attesting authority must differ from the executor). Mutating any
 of these protected claims after the MAC is computed causes P5 to fail.
 
+### Canonical form
+
+Digests (P2) and the P5 payload are computed over a **fail-closed subset** of RFC 8785 JCS: object
+members sorted by key, compact separators, and only objects, arrays, strings, booleans, `null` and
+integers. That output is byte-identical to the ABV reference checker's Python
+`json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. Where that reference
+form and JCS would disagree, the value is **rejected** rather than emitted in one of the two forms
+(#52):
+- **non-integer numbers** — JCS's ECMA-262 number formatting is not implemented;
+- **integers outside ±(2^53 − 1)** — JCS serializes numbers as IEEE-754 doubles, so
+  `9007199254740993` would become `9007199254740992` there;
+- **objects whose key order differs between UTF-8 byte order (Python, this code) and UTF-16 code-unit
+  order (JCS)** — only possible when keys mix supplementary-plane characters (e.g. emoji) with
+  U+E000–U+FFFF.
+
+A rejected value fails closed: under P2 the call is denied (`arguments not canonicalizable`). So
+every digest this policy accepts is one a conforming JCS implementation would also produce.
+
 ```yaml
 - policyRef:
     name: approval-execution-binding-v1-0-impl
@@ -184,6 +233,7 @@ of these protected claims after the MAC is computed causes P5 to fail.
       - kid: approver.example
         key: "<shared-secret-at-least-32-bytes>"
     clockSkewSeconds: 60
+    maxApprovalLifetimeSeconds: 900
     expectedAudience: mcp-gateway-prod
     expectedTenant: acme
     expectedEnvironment: prod
@@ -191,6 +241,63 @@ of these protected claims after the MAC is computed causes P5 to fail.
     onDeny: rpc-error
     resultHeader: x-approval-binding
 ```
+
+### Approval lifetime bound
+
+`maxApprovalLifetimeSeconds` (#52) caps how far in the future an approval's `not_after` may be,
+measured from the gateway's clock when the call arrives:
+
+```text
+deny under P4  if  not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds
+```
+
+The check is part of P4, so it needs P4 in `requiredPredicates`; a config that sets it without P4
+fails at startup. A `not_after` exactly at the limit is allowed. The bound also limits how long a P6
+nonce is held, since a nonce is kept until `not_after + clockSkewSeconds`.
+
+**Is `not_after` authenticated?** Only when P5 is required. `not_after` is one of the fields of the
+signed `mcp-v1` payload (see above), so under P5 a caller can't change it without breaking the MAC.
+Without P5 it is a value the caller supplies, and the bound is only as trustworthy as the caller.
+
+**Why it bounds the remaining lifetime instead of checking an `iat` claim.** The review suggested
+an issued-at (`iat`/`not_before`) claim in the signed payload, so the gateway could check
+`not_after - iat`. That would change the `mcp-v1` payload, which means a new payload version, a
+change for every attester, and a change to the ABV corpus vectors. Bounding `not_after` against the
+gateway's own clock needs none of that and enforces the same thing at execution time: no approval
+accepted now can stay valid for longer than the bound. What it doesn't do is reject an approval
+that was issued long ago with a long lifetime and is now inside its last
+`maxApprovalLifetimeSeconds`. An `iat` check would catch that, and it remains possible as a future
+payload version.
+
+### rpc-param envelope removal
+
+With `approvalSource: rpc-param` and `stripApprovalEnvelope: true` (the default), the policy removes
+the top-level `approvalRpcField` member from the body before forwarding it (#52), so the MCP server
+never receives the approval or its attestation MACs, and a strict JSON-RPC server doesn't see an
+unknown top-level member. This applies to every forwarded `tools/call`: an allowed call in either
+mode, and a monitor-mode would-deny. An out-of-scope method, a denied call and `approvalSource:
+header` are left as they are.
+
+- **Byte-exact.** The member is cut out of the original bytes together with one adjoining comma.
+  Nothing else is re-serialized, so the upstream receives exactly the argument bytes P2 checked,
+  including their whitespace, member order and escapes. Only the top-level member is removed; a
+  nested member with the same name is part of the arguments and stays. A key spelled with JSON
+  escapes counts as the same member.
+- **Checked before forwarding.** The strict parse has already rejected duplicate members at any
+  depth, so at most one member can match. The stripped body is parsed again and must equal the
+  original minus that member. If it doesn't, block mode denies the call as `malformed`. Monitor
+  mode forwards it unchanged, records a policy violation, logs why, and stamps
+  `monitor;envelope=unstripped` (or adds `;envelope=unstripped` to a would-deny) instead of
+  `allowed`. The removal runs before the P6 reservation, so a failure
+  never uses up a nonce.
+- **`content-length` is rewritten.** PDK 1.10's `BodyHandler::set_body` writes only the body buffer
+  (`pdk-classy` `hl/headers_body.rs`); nothing in the PDK or `proxy-wasm` 0.2.5 adjusts
+  `content-length`. So the policy sets `content-length` to the new length itself. The request
+  headers haven't been sent upstream yet at that point, because the filter is still holding the
+  request to read its body. The `#[pdk_test]`
+  `rpc_param_envelope_is_stripped_before_the_real_upstream` checks this on a real Flex Gateway
+  1.14.0: the upstream mock accepts only the exact stripped bytes with the new `content-length`.
+  It runs in CI (`runtime-e2e-approval`).
 
 On a denial the log carries a structured event, e.g.
 `{"event":"approval_execution_binding","action":"deny","predicate":"P1","reason":"approved action 'deploy.apply', executed 'deploy.destroy'"}`
@@ -203,7 +310,8 @@ identifiers — never the argument payload, approval-token values, or attestatio
 `PolicyViolations::generate_policy_violation()`, mirroring the sibling Decoy Tool Sentinel, so
 Anypoint Monitoring/SIEM records the hit even when `monitor` mode still forwards the request. A
 structural/framing rejection that never reaches predicate evaluation at all (no body, wrong
-content-type, oversized/mismatched `content-length`, unparseable JSON-RPC envelope) does not
+content-type, framing refusals for a missing/oversized/mismatched `content-length`, unparseable
+JSON-RPC envelope) does not
 register a violation — there is no evaluated verdict to report — but is still logged via the
 structured warning above and, in `block` mode, still denied.
 
@@ -221,7 +329,8 @@ Further honest limitations, disclosed rather than hidden:
   attestation service is out of scope for this build. Selecting it fails policy startup with a
   clear error rather than silently no-op-ing, so a misconfiguration can't be mistaken for an armed
   binding.
-- **P6 uses gateway data storage `local()`, which is per-replica and has no TTL control.** P6
+- <a id="p6-single-use-boundary"></a>**P6 single use is per gateway replica, until restart.** P6 uses
+  gateway data storage `local()`, which is per-replica and has no TTL control. P6
   reserves the nonce atomically via the gateway's data-storage API (`store(&nonce,
   &StoreMode::Absent, ...)`): the first reservation succeeds and the call is allowed; a second
   reservation of the same nonce returns a CAS mismatch and the call is denied under P6; any other
@@ -238,6 +347,36 @@ Further honest limitations, disclosed rather than hidden:
   because the pinned proxy-wasm SDK panics on unexpected host statuses. See
   [`APPROVAL-P6-CONNECTED-2026-09-25`](../docs/APPROVAL-P6-CONNECTED-2026-09-25.md) and
   [`APPROVAL-STORAGE-UNAVAILABLE-2026-09-25`](../docs/APPROVAL-STORAGE-UNAVAILABLE-2026-09-25.md).
+  **Recommendation: deploy a single gateway replica for flows that require P6**, and treat a
+  restart as reopening unexpired approvals. The follow-up for a global guarantee is
+  `remote()` storage with a TTL ≥ the maximum approval lifetime + `clockSkewSeconds`, keys
+  namespaced by issuer — it is not in this build (#51).
+- **Reserved P6 nonces are bounded by an approximate cap, not a TTL (#51).** `local()` has no TTL,
+  so the policy bounds the store itself. Each reservation records the nonce's expiry, and the normal
+  path is a single atomic `store(nonce, Absent, …)` — the same operation the P6 path was proven on.
+  Each worker counts its reservations; when its count reaches **10,000**, it lists the store, deletes
+  every nonce whose approval has expired under P4 (`now > not_after + clockSkewSeconds`), and resets
+  its count to what remains. Forgetting such a nonce cannot reopen a replay, because replaying it is
+  still a P4 denial. If the store is still full after that sweep, the reservation **fails closed** (a
+  P6 denial); a storage error during the sweep also fails closed. Plan for these limits:
+  (1) **the bound is approximate** — the count is per worker and resets when the worker's VM is
+  rebuilt, while the store is shared by the replica's workers, so between sweeps the store can exceed
+  10,000 by up to 10,000 per worker; (2) **the sweep's key listing (`get_keys`) is not yet verified on
+  a real gateway** — it runs only at the cap, and if it errors there, P6 reservations at the cap fail
+  closed; (3) **without P4 in `requiredPredicates`, no reserved nonce ever expires**, so once a sweep
+  finds the store full a P6-only deployment stops admitting new single-use approvals on that replica
+  until restart — require P4 with P6; (4) an approval with a far-future `not_after` holds its slot
+  until then (see the next item).
+- **The approval lifetime bound is off by default and checks `not_after`, not an issue time (#52).**
+  With `maxApprovalLifetimeSeconds` unset, P4 checks only `now <= not_after + clockSkewSeconds`, so
+  an attested `not_after` years away is accepted and, unless P6 is required, reusable until then.
+  Set the bound when that matters. It limits the remaining lifetime, not the total, and `not_after`
+  is authenticated only under P5 (see [Approval lifetime bound](#approval-lifetime-bound)).
+- **The rpc-param envelope is removed only from bodies this policy forwards (#52).** With
+  `stripApprovalEnvelope: false`, or on an out-of-scope method, the `approvalRpcField` member reaches
+  the MCP server. Removal applies only to a single JSON-RPC object that passed the strict parse, so a
+  batch or malformed body is never rewritten (it's denied in block mode and forwarded unchanged in
+  monitor mode).
 - **No `.on_response()` handler, by design.** Unlike the sibling MCP Honeytoken Tripwire, this
   filter registers only an `on_request` handler. PDK's `DualFilter` re-runs a configured response
   handler even over a request filter's own `Flow::Break` early reply, and a response handler that
@@ -245,9 +384,10 @@ Further honest limitations, disclosed rather than hidden:
   uninspectable body and withholds it — which is why, empirically, Tripwire's in-band JSON-RPC
   denial bodies come back empty under `pdk_unit`. Registering no response handler here means this
   policy's own early-reply denials are sent as constructed, with nothing downstream re-inspecting
-  them. This policy never rewrites a response body — it only forwards a request unchanged or
-  denies it before it reaches the upstream tool, so the response-body-rewriting boundary that
-  applies to Tripwire does not apply here.
+  them. This policy never rewrites a response body. It forwards a request unchanged, forwards it
+  with only the `rpc-param` envelope removed (see above), or denies it before it reaches the
+  upstream tool, so the response-body-rewriting boundary that applies to Tripwire does not apply
+  here.
 - **`onDeny: rpc-error` denials return HTTP 200,** by design: the JSON-RPC `-32008` error is
   delivered in-band, matching real JSON-RPC semantics where errors are payload-level, not
   transport-level. A caller (or a test) that only checks the HTTP status code cannot distinguish an
@@ -272,20 +412,38 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **46 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **97 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
 rejection**, **`expectedAudience` required when P5 is required**), malformed/oversized/batch/
 notification JSON-RPC framing, monitor-vs-block behavior, the rpc-param approval source, **non-
-`tools/call` methods forwarded as out-of-scope** (never blocked), **`$ref`-shaped arguments rejected
+`tools/call` methods forwarded as out-of-scope** (never blocked), **bodyless `GET` (SSE)/`DELETE`
+(session)/`OPTIONS`/`HEAD` forwarded out-of-scope in block and monitor mode** while a bodyless or
+lowercase `post` and a non-`POST` carrying a `tools/call` body stay bound, **framing refusals**
+(no/short/oversized `content-length` stamped `denied;framing=content-length`), **charset
+admission** (a UTF-7 `tools+AC8-call` body and every non-`utf-8` charset denied in block and
+flagged in monitor; `utf-8` spellings allowed), **unparseable bodies** (lone surrogate, BOM, nesting
+> 128) denied as malformed rather than forwarded out-of-scope, **`$ref`-shaped arguments rejected
 under P2** (top-level, nested, `$ref`+extra keys) while a `$ref` string *value* is allowed,
-**versioned canonical-JSON digests** (a float or non-integer number fails closed; `null` vs `{}` vs
+**versioned canonical-JSON digests** (a float or non-integer number, an integer outside
+±(2^53 − 1), and a UTF-8/UTF-16 key-order disagreement all fail closed; `null` vs `{}` vs
 `[]` vs a scalar all produce distinct digests), **P5 authenticated over the `mcp-v1` payload** (each
 protected claim, when mutated, flips to deny; kid rotation), **the executor read from verified
 `AuthenticationData`** (an injected verified subject wins over a spoofed header; absent-and-P5-
 required fails closed), **atomic single-use via data storage** (first allow, replay denied under P6,
-monitor mode does not reserve), PDK policy-violation registration on both block-mode denials and
+monitor mode does not reserve; below the cap a reservation is one `store` call and never lists keys,
+at the cap a sweep deletes P4-expired nonces and a still-full store fails closed, exercised with the
+cap set to 3 under `cfg(test)`), **the approval lifetime bound** (allowed exactly at `now +
+maxApprovalLifetimeSeconds + clockSkewSeconds`, denied one second or one millisecond past it, off
+when unset, never relaxes expiry; range and requires-P4 validated at startup), **rpc-param envelope
+removal** (first, middle, last and only member; whitespace and escapes kept byte-exact; an escaped
+key matched; a nested same-name member kept; duplicates fail closed; forwarded body and
+`content-length` checked on allow and on monitor would-deny; header mode and `stripApprovalEnvelope:
+false` untouched; a monitor-mode strip failure never stamped `allowed`), **bounded clock skew**
+(`clockSkewSeconds` outside `0`–`3600` rejected at startup, an out-of-range skew fails P4 closed
+rather than disabling it, and a nonce expiry that can't be represented is never swept instead of
+wrapping into the past), PDK policy-violation registration on both block-mode denials and
 monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial) denial
 of a batch containing an unauthorized call, the content-type/content-encoding header-phase admission
 gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking, in both the
@@ -293,7 +451,8 @@ JSON-RPC body and the approval header), a numeric-overflow literal that fails cl
 without panicking, the ambiguous-duplicate-`id` containment rule, and a corpus self-consistency check
 that deserializes every `tests/fixtures/abv/*.json` vector. `tests/requests.rs`
 adds a small Docker/`pdk_test` end-to-end suite (sound-approval-reaches-upstream,
-action-mismatch-denied-and-never-reaches-upstream) — deliberately smaller than Tripwire's
+action-mismatch-denied-and-never-reaches-upstream, and the #50 transport pass-through: `GET` SSE and
+`DELETE` session reach upstream stamped `out-of-scope` while an unapproved `tools/call` is denied) — deliberately smaller than Tripwire's
 integration suite, since this policy's threat model ("is this record proof of this execution") is
 already covered exhaustively by the unit tests; it adds only what an in-process harness cannot
 exercise. Behaviour that needs a connected gateway was checked on a real Flex Gateway: P5 with
