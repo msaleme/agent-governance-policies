@@ -26,6 +26,10 @@ anyhow = "1.0"
 # HMAC-SHA256 digest of the scope key for client-visible headers (issue #14).
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
+# The encoding PDK local storage reads values with: named only to tell a raw
+# empty host value (`Error::Eof`) from other read errors. Pinned to the
+# version pdk-data-storage-lib already resolves, so no new code is pulled in.
+serde_fixint = { package = "pdk-serde-fixint", version = "=1.11.0" }
 
 [dev-dependencies]
 pdk-test = { version = "=1.10.0" }

@@ -107,7 +107,9 @@ spec:
         budget; a call whose update keeps losing to concurrent writers, or
         that hits a storage error, fails closed in block mode with
         reason=ledger-contention or reason=ledger-unavailable (monitor mode
-        forwards and flags it). Not shared across replicas; reset when the
+        forwards and flags it). With either backend, a scope with 512
+        reservations still in flight refuses more with reason=scope-saturated
+        until some settle or time out. Not shared across replicas; reset when the
         gateway process restarts. "worker" keeps one in-memory ledger per
         Envoy worker (N workers can admit up to N times aggregateBudget). A
         cluster-wide ledger is not implemented, and "cluster" is rejected.
@@ -120,7 +122,10 @@ spec:
         the same gateway share one ledger. Empty (default) keeps the ledger
         private to this policy instance. Instances sharing a namespace must
         use the same scopeDigestKey, maxScopes, reservationTimeoutMs, window
-        and windowMs; changing scopeDigestKey starts every scope from zero.
+        and windowMs. Changing scopeDigestKey, window or windowMs starts a
+        fresh ledger: every scope starts from zero, and the old ledger's
+        records stay in shared data (unreachable, holding no slots) until
+        the gateway restarts.
     reservationTimeoutMs:
       type: integer
       default: 60000
@@ -154,10 +159,15 @@ spec:
         "@characteristics":
           - "security:sensitive"
       description: >-
-        Secret key for the "digest" scopeDisclosure (HMAC-SHA256). With a key,
-        a client cannot confirm a guessed identity from its digest. When empty,
-        an unkeyed SHA-256 is used, which hides the value but lets anyone who
-        can guess an identity confirm it.
+        Secret key for the "digest" scopeDisclosure (HMAC-SHA256), and with
+        ledgerBackend "node" the key for the shared-data ledger keys. Set it.
+        With a key, a client cannot confirm a guessed identity from its digest,
+        and nothing that can list the replica's shared data can map a ledger
+        key back to an identity. When empty (the default, kept so the default
+        configuration starts; the policy logs a warning at startup with the
+        node backend), an unkeyed SHA-256 / HMAC is used, which hides the
+        value but lets anyone who can guess an identity confirm it. Changing
+        it starts every scope from zero (a fresh budget for every identity).
     aggregateBudget:
       type: integer
       default: 3000
@@ -338,7 +348,7 @@ spec:
         or "monitor;scope=...;contribution=...;total=.../..."; on a block-mode
         denial, e.g. "denied;scope=agent:broker-7;would-be-total=3200;
         budget=3000;unit=points" (or "reason=missing-identity",
-        "reason=invalid-identity", "reason=scope-capacity",
+        "reason=invalid-identity", "reason=scope-capacity", "reason=scope-saturated",
         "reason=ledger-contention", "reason=ledger-unavailable",
         "reason=unpriceable", or "reason=out-of-range" for the non-budget deny
         reasons); on an ungoverned message (see governedMethods),

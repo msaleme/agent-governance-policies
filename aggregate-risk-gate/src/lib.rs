@@ -968,6 +968,7 @@ enum DenyReason {
     MissingIdentity,
     InvalidIdentity,
     ScopeCapacity,
+    ScopeSaturated,
     LedgerContention,
     LedgerUnavailable,
     Unpriceable,
@@ -982,6 +983,7 @@ impl DenyReason {
             DenyReason::MissingIdentity => "missing-identity",
             DenyReason::InvalidIdentity => "invalid-identity",
             DenyReason::ScopeCapacity => "scope-capacity",
+            DenyReason::ScopeSaturated => "scope-saturated",
             DenyReason::LedgerContention => "ledger-contention",
             DenyReason::LedgerUnavailable => "ledger-unavailable",
             DenyReason::Unpriceable => "unpriceable",
@@ -1013,6 +1015,9 @@ impl DenyReason {
             DenyReason::ScopeCapacity => format!(
                 "aggregate risk gate: no capacity to track a new scope \"{scope}\""
             ),
+            DenyReason::ScopeSaturated => format!(
+                "aggregate risk gate: too many reservations in flight for scope \"{scope}\""
+            ),
             DenyReason::LedgerContention => format!(
                 "aggregate risk gate: the shared ledger stayed contended for scope \"{scope}\""
             ),
@@ -1039,6 +1044,7 @@ fn refusal_label(refusal: &Refusal) -> &'static str {
     match refusal {
         Refusal::OverBudget(_) => "budget-exceeded",
         Refusal::AtCapacity => DenyReason::ScopeCapacity.label(),
+        Refusal::Saturated => DenyReason::ScopeSaturated.label(),
         Refusal::Contention => DenyReason::LedgerContention.label(),
         Refusal::Unavailable => DenyReason::LedgerUnavailable.label(),
     }
@@ -1113,6 +1119,7 @@ fn admit(
                 let reason = match refusal {
                     Refusal::OverBudget(denial) => DenyReason::BudgetExceeded(denial),
                     Refusal::AtCapacity => DenyReason::ScopeCapacity,
+                    Refusal::Saturated => DenyReason::ScopeSaturated,
                     Refusal::Contention => DenyReason::LedgerContention,
                     Refusal::Unavailable => DenyReason::LedgerUnavailable,
                 };
@@ -1377,6 +1384,15 @@ async fn configure(
         logger::warn!(
             "Aggregate Risk Gate: governedMethods includes initialize or a notifications/* \
              method; an exhausted budget will then block the MCP handshake or cancellation"
+        );
+    }
+    if config.ledger_backend == "node" && config.scope_digest_key.is_empty() {
+        // Not refused: it is the default configuration, which must start.
+        logger::warn!(
+            "Aggregate Risk Gate: ledgerBackend is node and scopeDigestKey is empty, so \
+             node ledger keys are an unkeyed HMAC of each identity; any filter on this \
+             replica that can list shared-data keys can confirm a guessed identity. \
+             Set scopeDigestKey to a secret."
         );
     }
     logger::info!(
@@ -3829,6 +3845,57 @@ mod test {
                 if stamp == "monitor;scope=agent:b7;reason=ledger-unavailable"),
             "{:?}",
             flow
+        );
+    }
+
+    #[test]
+    fn a_saturated_scope_fails_closed_in_block_mode_and_is_flagged_in_monitor_mode() {
+        // P4A review M1: a scope record holds at most MAX_HELD in-flight
+        // reservations; past that a call is refused, never grown into.
+        for mode in ["block", "monitor"] {
+            let (gate, _store) = node_gate(json!({
+                "mode": mode, "fixedWeight": 1, "aggregateBudget": 1_000_000
+            }));
+            let body = tools_call();
+            for _ in 0..crate::ledger::MAX_HELD {
+                let flow = decide(
+                    scope_of("b7"),
+                    0,
+                    &gate,
+                    RawBody::Present(&body),
+                    &violations(),
+                );
+                assert!(
+                    matches!(flow, Flow::Continue(Ticket::Reserved(..))),
+                    "{}",
+                    mode
+                );
+            }
+            let flow = decide(
+                scope_of("b7"),
+                0,
+                &gate,
+                RawBody::Present(&body),
+                &violations(),
+            );
+            if mode == "block" {
+                assert!(matches!(flow, Flow::Break(_)));
+            } else {
+                assert!(
+                    matches!(flow, Flow::Continue(Ticket::None(ref stamp))
+                        if stamp == "monitor;scope=agent:b7;reason=scope-saturated"),
+                    "{:?}",
+                    flow
+                );
+            }
+            assert_eq!(
+                gate.ledger.snapshot("agent:b7").reserved,
+                crate::ledger::MAX_HELD as u64
+            );
+        }
+        assert_eq!(
+            DenyReason::ScopeSaturated.stamp("agent:b7", "points"),
+            "denied;scope=agent:b7;reason=scope-saturated"
         );
     }
 

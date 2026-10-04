@@ -207,9 +207,9 @@ batch have no request id to answer and are not echoed.
 | `maxScopes` | integer, `1`–`1000000` | `10000` | Most scopes the ledger tracks at once (per worker for `worker`, per replica for `node`). At the cap a new scope may take the place of an idle scope (nothing committed or reserved). If none is idle the call is denied in `block` mode with `reason=scope-capacity`, or forwarded in `monitor` mode with that reason stamped. Live totals are never evicted. A refusal at the cap costs constant work, however many scopes are live (see Identity below). |
 | `reservationTimeoutMs` | integer, `1000`–`86400000` | `60000` | How long a reservation may stay unsettled before it is reclaimed and its budget freed. Set it above the longest upstream timeout. See Reservation lifecycle below. |
 | `scopeDisclosure` | `digest`\|`none`\|`raw` | `digest` | How the scope appears in `resultHeader` and denial messages. `digest` — `<budgetScope>:hmac-<16 hex>` (HMAC-SHA256 under `scopeDigestKey`, first 8 bytes), or `sha256-…` when no key is set. `none` — just `<budgetScope>`. `raw` — the canonical identity itself; only for trusted, internal consumers. |
-| `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest`. Without a key the digest is a plain SHA-256, which anyone holding a candidate identity can recompute. Set a key when identities are guessable. |
+| `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest` and, with `ledgerBackend: node`, for the shared-data ledger keys. Without a key the digest is a plain SHA-256 and the ledger keys an unkeyed HMAC, which anyone holding a candidate identity can recompute; the empty default is kept so the default configuration starts, and a warning is logged at startup. Set it from a secret. Changing it gives every identity a fresh budget (see Known edges). |
 | `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
-| `window` | `fixed-period`\|`worker-lifetime` | `fixed-period` | How long committed exposure counts. `fixed-period` resets every scope's committed total at each `windowMs` boundary, counted from the Unix epoch, so 24-hour windows start at 00:00 UTC. `worker-lifetime` never resets. See Accounting window below. The old value `rolling-24h` never rolled and is now rejected at configure time. |
+| `window` | `fixed-period`\|`worker-lifetime` | `fixed-period` | How long committed exposure counts. `fixed-period` resets every scope's committed total at each `windowMs` boundary, counted from the Unix epoch, so 24-hour windows start at 00:00 UTC. `worker-lifetime` never resets. See Accounting window below. With the node backend, changing `window` or `windowMs` starts a fresh ledger. The old value `rolling-24h` never rolled and is now rejected at configure time. |
 | `windowMs` | integer, `60000`–`31622400000` | `86400000` | Window length in ms for `fixed-period` (1 minute to 366 days). Ignored for `worker-lifetime`. |
 | `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Scope of the guarantee below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every governed item, never priced as a single call. |
 | `fixedWeight` | integer, `0`–`9007199254740991` | `1` | Per-call contribution when `contribution=fixed-weight`. |
@@ -219,7 +219,7 @@ batch have no request id to answer and are not echoed.
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. In both modes a reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
-| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `ledger-contention`, `ledger-unavailable`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
+| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `scope-saturated`, `ledger-contention`, `ledger-unavailable`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
 
 ```yaml
 - policyRef:
@@ -386,7 +386,12 @@ backwards never resets a total, because periods only move forward. A scope whose
 is from an earlier period counts as idle for `maxScopes` eviction.
 
 With `window: worker-lifetime` committed exposure accumulates until the ledger is reset: a worker
-restart for `ledgerBackend: worker`, a gateway process restart for `node`.
+restart for `ledgerBackend: worker`, a gateway process restart for `node`. A scope with committed
+exposure is then never idle, so it holds its `maxScopes` slot for as long as the ledger lives.
+
+Changing `windowMs` remaps every timestamp to a new period number. The node backend keys its
+records under a fingerprint that includes `window` and `windowMs`, so a change starts a fresh
+ledger rather than reinterpreting old periods.
 
 ## Units
 
@@ -427,10 +432,17 @@ read-then-write fallback and no unconditional overwrite. Concretely:
 - **Contention and storage errors fail closed.** When the retries run out, `block` mode denies with
   `reason=ledger-contention`; a storage error denies with `reason=ledger-unavailable`. `monitor`
   mode forwards either and stamps the reason. Nothing is reserved in either case.
-- **Settlement is safe by direction.** A commit that cannot be written is queued on the worker and
-  retried on its next calls, stamped `settlement=deferred`, and is charged even if its reservation
-  has meanwhile been reclaimed; while 256 or more commits are queued, new reservations are refused
-  as contended. A commit whose record reads as missing while the reservation could still be on it
+- **Settlement is safe by direction.** A commit that cannot be written to its scope record is
+  written instead to a per-reservation *commit marker* (a separate shared-data key, created with
+  compare-and-swap), queued on the worker and retried on its next calls, stamped
+  `settlement=deferred`. No worker takes a reservation off a record without first claiming its
+  marker by compare-and-swap, so a worker that reclaims the reservation at its deadline, or drops
+  its tombstone, charges a marked commit instead of discarding it. A commit made before the
+  tombstone window closes therefore counts in the total at every moment, even if the committing
+  worker never handles another call or its VM restarts and loses the queue. A commit that could not
+  be marked either (the tombstone was already dropped, or the store failed) stays only in the
+  queue, which charges it even if its reservation has meanwhile been reclaimed; while 256 or more
+  such commits are queued, new reservations are refused as contended. A commit whose record reads as missing while the reservation could still be on it
   (PDK reports a host read error as "no value") is charged as a late commit rather than dropped. A
   release that cannot be written leaves the reservation held until it is reclaimed: an over-count
   that frees itself after `reservationTimeoutMs`.
@@ -442,17 +454,31 @@ read-then-write fallback and no unconditional overwrite. Concretely:
   absent and is created over, so an empty record can never wedge a scope closed.
 - **Keys carry no identity.** A record is stored under an HMAC-SHA256 of the scope (under
   `scopeDigestKey`), never the raw identity. Records are private to the policy instance unless
-  `ledgerNamespace` is set.
+  `ledgerNamespace` is set. **Set `scopeDigestKey`.** It defaults to empty so the default
+  configuration starts, and then the HMAC is unkeyed: anything that can list the replica's shared
+  data can confirm a guessed identity from its key. The policy logs a warning at startup for the
+  node backend with an empty key.
+- **A scope record is bounded.** A scope holds at most 512 reservations in flight plus tombstones
+  (about 50 KB of record). Past that, a call is refused with `reason=scope-saturated` (`block`
+  fails closed, `monitor` forwards and flags), until reservations settle or time out. The worker
+  backend applies the same cap per scope. A zero contribution reserves nothing and adds no entry.
 - **A gateway process restart resets it.** The shared data is in process memory, not durable, so a
   restart or redeploy starts every scope again at zero, even mid-window. Whether a config apply
   that rebuilds the listener (which resets the worker ledger) keeps the node ledger is **not yet
   verified on a real gateway**: the shared data lives outside the wasm VMs, so it should survive,
   and `case8nb` in `tests/connected_e2e.rs` records what a real Flex 1.14.0 gateway does.
 - **Known edges.**
-  - The commit queue lives in the worker's VM. It is retried only when that worker next handles a
-    governed call (there is no timer), and it is lost if the VM is restarted. While a commit
-    waits, other workers keep admitting against a total that still holds it as reserved until it
-    is reclaimed after `reservationTimeoutMs`.
+  - The commit queue lives in the worker's VM and is retried only when that worker next handles a
+    governed call. A PDK timer could drain it, but it is just as per-VM (lost on restart) and
+    async, so the commit marker is what keeps a queued commit counted. The retries are immediate:
+    PDK has no synchronous sleep to back off with inside a filter callback.
+  - A marked commit that another worker charges at the reservation's deadline is charged to the
+    period that deadline falls in. A commit whose write reported a failure that had in fact landed
+    is charged twice. Both over-count. A committing worker stalled for longer than
+    `reservationTimeoutMs` between its marker check and its marker write, past a cleanup pass,
+    could leave a marker that nothing charges; each step is a back-to-back host call.
+  - Each reservation that times out leaves a small marker key, deleted by cleanup once
+    `2 × reservationTimeoutMs + 30 s` have passed and no record holds the reservation.
   - A duplicate commit of an already-settled reservation whose first read hits a host storage
     error is charged again as a late commit. This over-counts and never under-counts. The filter
     settles each reservation once, so it does not send duplicates itself.
@@ -463,11 +489,20 @@ read-then-write fallback and no unconditional overwrite. Concretely:
     marking a tombstone and deleting it could delete a record re-created meanwhile. Each wasm VM is
     single-threaded and these are back-to-back host calls, so both are very unlikely.
   - Instances that share a `ledgerNamespace` must use the same `scopeDigestKey`,
-    `reservationTimeoutMs`, window and `maxScopes`. Nothing checks this, and rotating the key
-    orphans the old records until cleanup removes them.
+    `reservationTimeoutMs`, window and `maxScopes`. Nothing checks this.
+  - **Reconfiguring.** Every key sits under a fingerprint of `scopeDigestKey`, `window` and
+    `windowMs`, so changing any of them starts a fresh ledger: every identity gets a fresh budget
+    at once (rotating the key is a budget reset), and the slot count starts at zero, so old
+    records cannot keep `maxScopes` full. The old records are not deleted (another instance in a
+    shared namespace may still use them); they sit in shared data until the gateway restarts,
+    bounded by the old `maxScopes`.
+  - With `window: worker-lifetime` a scope that has committed anything is never idle, so it keeps
+    its slot until a restart: `maxScopes` is then a cap on distinct identities for the life of the
+    ledger, and once it is reached new identities are refused with `reason=scope-capacity`. Use
+    `fixed-period` (an earlier period counts as idle) when identities churn.
   - A storage status other than success or a CAS conflict panics inside PDK, which fails the call.
   - One hot scope serialises every worker on one record, and a record grows with its in-flight
-    reservations. A cleanup pass scans the whole namespace inside the call that runs it, at most
+    reservations, up to the 512-entry cap. A cleanup pass scans the whole namespace inside the call that runs it, at most
     once a second per replica.
 
 **`ledgerBackend: worker`.** One in-process ledger per Envoy worker, backed by a mutex-serialized
@@ -510,10 +545,10 @@ placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 192 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 205 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 53 tests): correctness of
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 55 tests): correctness of
   `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
@@ -541,7 +576,7 @@ Docker:
   without a window nothing resets; and a scope from an earlier period can be evicted.
   Two cover the cost of the cap (#49 A): 1,000 refusals against 100,000 live scopes examine no
   scope at all, and the idle index follows every settlement.
-- **`src/node_ledger.rs` — the node-wide ledger** (24 tests, over an in-memory test store that can
+- **`src/node_ledger.rs` — the node-wide ledger** (34 tests, over an in-memory test store that can
   force CAS conflicts and storage errors): two workers racing on every write admit exactly 3 of the
   reference calls, and interleaved workers admit exactly what fits; persistent CAS mismatch is
   `Contention` and a storage error `Unavailable`, both reserving nothing; a reservation made on
@@ -556,8 +591,14 @@ Docker:
   its tombstone is dropped; a refused call past two timeouts drops a tombstone exactly as on the
   worker ledger (connected case 5c, replayed on both backends); an empty stored value reads as absent and never wedges a scope;
   and an unwritable commit is queued, an unwritable release stays held, and a long commit queue
-  refuses new reservations.
-- **`src/lib.rs` — the PDK filter** (115 tests), mostly exercised end to end through the
+  refuses new reservations. Commit markers: a deferred commit whose worker never runs again is
+  charged by the worker that reclaims it (the M2 interleaving), including when the marker is
+  written between that worker's read and its claim, or while a tombstone is being dropped; a
+  commit drained by its own worker is charged once; markers are not written once nothing could
+  charge them, and are collected after the tombstone window. A raw empty host value (fixint `Eof`)
+  reads as absent; a zero contribution holds nothing; a scope refuses past 512 held entries; and a
+  new digest key or window starts a fresh ledger with fresh slots.
+- **`src/lib.rs` — the PDK filter** (116 tests), mostly exercised end to end through the
   `pdk-unit` harness, which runs the node backend over the real `LocalDataStorage` adapter: per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the

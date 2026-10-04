@@ -63,6 +63,18 @@ use std::sync::Mutex;
 /// 64 bits a counter that is never reused.
 pub type ReservationId = u128;
 
+/// The most reservations one scope holds at once, in flight plus tombstones
+/// (P4A review M1). A reservation that is never settled (the client resets the
+/// stream before the response hook runs) stays on its scope's record for up
+/// to `2 × ttl`, and the node backend decodes and re-encodes the whole record
+/// on every write, so without a cap a stream of abandoned calls could grow
+/// one record without bound. At the cap a new non-zero reservation is refused
+/// as `Saturated` (`reason=scope-saturated`): block mode fails closed, monitor
+/// mode forwards and flags it. 512 entries keep a record under about 50 KB of
+/// JSON; a scope with more calls in flight at once on one replica (or one
+/// worker) than that is refused until some settle or expire.
+pub const MAX_HELD: usize = 512;
+
 /// One in-flight reservation's ledger record.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Held {
@@ -95,10 +107,6 @@ pub(crate) struct ScopeState {
 }
 
 impl ScopeState {
-    /// An idle scope has nothing committed, nothing in flight and no pending
-    /// tombstone, so it holds no enforcement state: dropping it and re-creating
-    /// it later at zero is indistinguishable from keeping it. Only idle scopes
-    /// are ever evicted.
     /// An empty state that starts in window `period`.
     pub(crate) fn at_period(period: u64) -> Self {
         ScopeState {
@@ -111,8 +119,40 @@ impl ScopeState {
         self.period
     }
 
+    /// An idle scope has nothing committed, nothing in flight and no pending
+    /// tombstone, so it holds no enforcement state: dropping it and re-creating
+    /// it later at zero is indistinguishable from keeping it. Only idle scopes
+    /// are ever evicted.
     pub(crate) fn is_idle(&self) -> bool {
         self.committed == 0 && self.active.is_empty() && self.reclaimed.is_empty()
+    }
+
+    /// Whether the scope already holds `MAX_HELD` reservations and tombstones.
+    pub(crate) fn saturated(&self) -> bool {
+        self.active.len() + self.reclaimed.len() >= MAX_HELD
+    }
+
+    /// Whether reservation `id` is still on this state, in flight or as a
+    /// tombstone.
+    pub(crate) fn holds(&self, id: ReservationId) -> bool {
+        self.active.contains_key(&id) || self.reclaimed.contains_key(&id)
+    }
+
+    /// The entries a `reclaim` at `now` would change, as `(id, expires_at,
+    /// tombstone)`: an active reservation past its deadline (`false`), or a
+    /// tombstone due to be dropped (`true`).
+    pub(crate) fn due(&self, now: u64, ttl: u64) -> Vec<(ReservationId, u64, bool)> {
+        let expiring = self
+            .active
+            .iter()
+            .filter(|(_, held)| now >= held.expires_at)
+            .map(|(id, held)| (*id, held.expires_at, false));
+        let dropping = self
+            .reclaimed
+            .iter()
+            .filter(|(_, held)| now >= held.expires_at.saturating_add(ttl))
+            .map(|(id, held)| (*id, held.expires_at, true));
+        expiring.chain(dropping).collect()
     }
 
     pub(crate) fn total(&self) -> u64 {
@@ -203,7 +243,9 @@ impl ScopeState {
         Ok(())
     }
 
-    /// Adds a new active reservation `id` and returns it.
+    /// Adds a new active reservation `id` and returns it. A zero
+    /// contribution reserves nothing, so it adds no entry (and is never
+    /// refused as `Saturated`): its reservation settles as a no-op.
     pub(crate) fn hold(
         &mut self,
         id: ReservationId,
@@ -211,24 +253,29 @@ impl ScopeState {
         contribution: u64,
         now: u64,
         ttl: u64,
-    ) -> Reservation {
+    ) -> Result<Reservation, Refusal> {
         let expires_at = now.saturating_add(ttl);
-        self.reserved = self.reserved.saturating_add(contribution);
-        self.active.insert(
-            id,
-            Held {
-                contribution,
-                expires_at,
-            },
-        );
-        Reservation {
+        if contribution > 0 {
+            if self.saturated() {
+                return Err(Refusal::Saturated);
+            }
+            self.reserved = self.reserved.saturating_add(contribution);
+            self.active.insert(
+                id,
+                Held {
+                    contribution,
+                    expires_at,
+                },
+            );
+        }
+        Ok(Reservation {
             id,
             scope: scope.to_string(),
             contribution,
             created_at: now,
             expires_at,
             total: self.total(),
-        }
+        })
     }
 
     /// Settles reservation `id` on this state: settlement first, so a
@@ -265,6 +312,8 @@ impl ScopeState {
 /// `force_reserve`. Settle it with `commit` or `release`. Both are idempotent:
 /// only the first settlement of an `id` changes the ledger. If neither is
 /// called by `expires_at`, the next ledger operation on the scope reclaims it.
+/// A reservation of zero holds nothing: its commit and release report
+/// `Committed` and `Released` without touching the ledger.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reservation {
     pub id: ReservationId,
@@ -381,6 +430,9 @@ pub enum Refusal {
     /// Node backend: the shared store returned an error or a record it could
     /// not read. Nothing was reserved.
     Unavailable,
+    /// The scope already holds `MAX_HELD` reservations and tombstones.
+    /// Nothing was reserved.
+    Saturated,
 }
 
 #[cfg(test)]
@@ -435,7 +487,8 @@ pub trait LedgerStore {
     /// module's whole correctness story is about) — hence `#[allow(dead_code)]`
     /// rather than deleting a real, tested API.
     ///
-    /// Refused only for `AtCapacity`, `Contention` or `Unavailable`.
+    /// Refused only for `AtCapacity`, `Saturated`, `Contention` or
+    /// `Unavailable`.
     #[allow(dead_code)]
     fn force_reserve(
         &self,
@@ -664,11 +717,14 @@ impl Ledger {
         scope: &str,
         contribution: u64,
         now: u64,
-    ) -> Reservation {
+    ) -> Result<Reservation, Refusal> {
         let id = *next_id;
         *next_id += 1;
-        stats.active += 1;
-        state.hold(id, scope, contribution, now, self.ttl)
+        let reservation = state.hold(id, scope, contribution, now, self.ttl)?;
+        if contribution > 0 {
+            stats.active += 1;
+        }
+        Ok(reservation)
     }
 
     /// Settles `reservation` on its EXISTING scope. An untracked scope
@@ -676,6 +732,9 @@ impl Ledger {
     fn settle(&self, reservation: &Reservation, now: u64, commit: bool) -> Settlement {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        if let Some(outcome) = settle_free(&mut inner.stats, reservation, commit) {
+            return outcome;
+        }
         let outcome = match inner.scopes.get_mut(&reservation.scope) {
             None => Settlement::NotActive,
             Some(state) => {
@@ -701,6 +760,25 @@ impl Ledger {
 /// The window period `now` falls in (always 0 without a window).
 pub(crate) fn period(window: Option<u64>, now: u64) -> u64 {
     window.map_or(0, |window| now / window)
+}
+
+/// Settles a reservation of zero, which holds nothing: `Committed` or
+/// `Released`, counted, with no ledger access. `None` for any other.
+pub(crate) fn settle_free(
+    stats: &mut LedgerStats,
+    reservation: &Reservation,
+    commit: bool,
+) -> Option<Settlement> {
+    if reservation.contribution > 0 {
+        return None;
+    }
+    Some(if commit {
+        stats.committed += 1;
+        Settlement::Committed
+    } else {
+        stats.released += 1;
+        Settlement::Released
+    })
 }
 
 pub(crate) fn count_reclaim(stats: &mut LedgerStats, (expired, abandoned): (u64, u64)) {
@@ -736,7 +814,7 @@ impl LedgerStore for Ledger {
     ) -> Result<Reservation, Refusal> {
         self.with_state(scope, now, |state, next_id, stats| {
             state.check(scope, contribution, budget)?;
-            Ok(self.hold(state, next_id, stats, scope, contribution, now))
+            self.hold(state, next_id, stats, scope, contribution, now)
         })
     }
 
@@ -747,7 +825,7 @@ impl LedgerStore for Ledger {
         now: u64,
     ) -> Result<Reservation, Refusal> {
         self.with_state(scope, now, |state, next_id, stats| {
-            Ok(self.hold(state, next_id, stats, scope, contribution, now))
+            self.hold(state, next_id, stats, scope, contribution, now)
         })
     }
 
@@ -759,7 +837,7 @@ impl LedgerStore for Ledger {
         now: u64,
     ) -> Result<(Reservation, bool), Refusal> {
         self.with_state(scope, now, |state, next_id, stats| {
-            let reservation = self.hold(state, next_id, stats, scope, contribution, now);
+            let reservation = self.hold(state, next_id, stats, scope, contribution, now)?;
             let breached = reservation.total > budget;
             Ok((reservation, breached))
         })
@@ -1714,5 +1792,50 @@ mod test {
         ));
         assert!(ledger.reserve("b", 10, 100, DAY).is_ok());
         assert_eq!(ledger.scope_count(), 1);
+    }
+
+    #[test]
+    fn a_zero_contribution_holds_nothing_and_settles_as_a_no_op() {
+        let ledger = Ledger::new();
+        let r = ledger.reserve("s", 0, 3000, 0).unwrap();
+        assert_eq!((r.contribution, r.total), (0, 0));
+        assert_eq!(ledger.snapshot("s").reserved, 0);
+        assert_eq!(ledger.stats().active, 0);
+        assert_eq!(ledger.commit(&r, 1), Settlement::Committed);
+        let r = ledger.reserve("s", 0, 3000, 2).unwrap();
+        assert_eq!(ledger.release(&r, 3), Settlement::Released);
+        assert_eq!(ledger.snapshot("s").total(), 0);
+        let stats = ledger.stats();
+        assert_eq!((stats.committed, stats.released), (1, 1));
+        assert_eq!(
+            (stats.not_active, stats.expired, stats.abandoned),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_scope_refuses_reservations_past_max_held_until_entries_leave() {
+        let ledger = Ledger::new();
+        let held: Vec<Reservation> = (0..MAX_HELD)
+            .map(|_| ledger.reserve("s", 1, u64::MAX, 0).unwrap())
+            .collect();
+        assert_eq!(ledger.reserve("s", 1, u64::MAX, 0), Err(Refusal::Saturated));
+        assert_eq!(
+            ledger.force_reserve("s", 1, 0).err(),
+            Some(Refusal::Saturated),
+            "monitor mode is refused too (and flags it)"
+        );
+        // A zero contribution adds no entry, so it is never refused.
+        assert!(ledger.reserve("s", 0, u64::MAX, 0).is_ok());
+        // Other scopes are unaffected.
+        assert!(ledger.reserve("t", 1, u64::MAX, 0).is_ok());
+        // Expired reservations still count as tombstones...
+        assert_eq!(
+            ledger.reserve("s", 1, u64::MAX, TEST_TTL),
+            Err(Refusal::Saturated)
+        );
+        // ...until they are dropped one ttl later.
+        assert!(ledger.reserve("s", 1, u64::MAX, 2 * TEST_TTL).is_ok());
+        assert_eq!(ledger.commit(&held[0], 2 * TEST_TTL), Settlement::NotActive);
     }
 }

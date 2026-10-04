@@ -15,6 +15,19 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   cancellation or teardown. Batches are priced on their governed items only. A duplicate
   `method` member, or any duplicate member in a priced body, fails closed. Empty, blank,
   duplicate and `"*"` entries are rejected at configure time.
+- **Ledger hardening (P4A review of #53).** A scope record is capped at 512 held reservations
+  plus tombstones on both backends; past that a call is refused with the new
+  `reason=scope-saturated` (block fails closed, monitor forwards and flags). A zero contribution
+  creates no entry and settles as a no-op. On the node backend, a commit that cannot be written to
+  its record is persisted to a per-reservation commit marker, and no worker reclaims a reservation
+  or drops its tombstone without claiming that marker by compare-and-swap, so a deferred commit
+  is no longer under-counted when its worker goes idle or its VM restarts. A raw empty host value
+  (fixint `Eof`) now reads as absent instead of failing. Ledger keys sit under a fingerprint of
+  `scopeDigestKey`, `window` and `windowMs`, so a reconfiguration starts a fresh ledger instead
+  of leaving old records holding `maxScopes` slots; the reconfigure effects (a key rotation is a
+  budget reset for every identity) and the worker-lifetime slot behaviour are documented. An empty
+  `scopeDigestKey` with the node backend (the default) logs a startup warning; it is not refused,
+  because that would stop the default configuration from starting.
 - **Settlement documented (#49, finding B).** Settlement is by HTTP status only: 2xx and 3xx
   commit, 4xx and 5xx release. A JSON-RPC error or `isError` result inside an HTTP 200 is
   charged. Tests pin the mapping.
