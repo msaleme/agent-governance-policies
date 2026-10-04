@@ -24,8 +24,8 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 67 pass | 157 pass |
-| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 item 1 fixed; #52 items 2–3 documented; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 deferred to v2 with up-front disclosure; #49 A open |
+| Lib tests | 67 pass | 185 pass |
+| Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 item 1 fixed; #52 items 2–3 documented; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 fixed (node-wide ledger, the new default `ledgerBackend: node`) and #49 A fixed (a refusal at the scope cap is O(1)) |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
 ### Repo visibility — RESOLVED (2026-09-24)
@@ -96,7 +96,7 @@ excludes all Flex identity material). No further visibility action is required t
   *"Reserve-then-authorize aggregate-exposure control: refuses the individually-valid call that composes
   past a budget no per-call gate ever sees."*
 - **Config surface:** budgetScope(agent|fabric|tenant) / identitySource(authentication|trusted-header) /
-  identityField / scopeHeader / maxScopes / reservationTimeoutMs / scopeDisclosure(digest|none|raw) / scopeDigestKey (sensitive) /
+  identityField / scopeHeader / ledgerBackend(node|worker; cluster rejected) / ledgerNamespace / maxScopes / reservationTimeoutMs / scopeDisclosure(digest|none|raw) / scopeDigestKey (sensitive) /
   aggregateBudget / window(fixed-period|worker-lifetime, enforced) / windowMs / contribution(estimated-token-weight|spend-amount|fixed-weight) /
   fixedWeight / spendAmountField / spendCurrency / estimatedTokens / governedMethods / mode(block|monitor) /
   onDeny(rpc-error|empty-403) / resultHeader. All amounts are exact integers in 0–2^53−1 (spend amounts
@@ -105,12 +105,15 @@ excludes all Flex identity material). No further visibility action is required t
   canonicalized and bounded, and the result header shows a digest, not the raw ID (P4A review #14).
 - **Framework refs (supporting-measure):** NIST SP 800-53 Rev5 AC-4/SC-7/AU-2/AU-6/SI-4; OWASP LLM10:2025
   Unbounded Consumption; MITRE ATLAS AML.T0034 Cost Harvesting + Engage; EU AI Act Art 15. Full text in README.
-- **Honesty boundary (must be in the listing):** an in-process serialized ledger (real, atomic,
-  race-tested) with a real fixed window, **one budget per policy instance per gateway worker, which a
-  caller can multiply by opening more connections** (N workers admit up to N × the budget). Put this up
-  front in the listing, with the mitigations next to it: divide the intended budget by N, or set
-  `FLEX_SERVICE_ENVOY_CONCURRENCY=1`. A restart resets it (P4A reviews #15, #48). A node-wide ledger over
-  PDK shared data (#48), and later a shared, durable one, are v2 work. Response leg is headers-only:
+- **Honesty boundary (must be in the listing):** a real, atomic reserve-then-authorize ledger with a
+  real fixed window. By default (`ledgerBackend: node`, #48) it is **one budget per policy instance per
+  gateway replica**, shared by all of the replica's workers through compare-and-swap writes to PDK
+  node-local shared data, and **reset when the gateway process restarts** (P4A review #15). Replicas
+  are independent (R replicas admit up to R × the budget: divide by R or run one). Contention or a
+  storage error fails closed in block mode. The opt-in `ledgerBackend: worker` is one budget per
+  worker, which a caller can multiply by opening more connections; with it, divide by N or set
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1`. A cross-replica, durable ledger (`cluster`) is not implemented
+  and is rejected at configure time. Response leg is headers-only:
   settlement is by HTTP status (2xx/3xx commit, 4xx/5xx release), so a JSON-RPC error inside an HTTP 200
   is charged (#49).
 

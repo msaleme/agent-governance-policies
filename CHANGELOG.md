@@ -18,17 +18,35 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
 - **Settlement documented (#49, finding B).** Settlement is by HTTP status only: 2xx and 3xx
   commit, 4xx and 5xx release. A JSON-RPC error or `isError` result inside an HTTP 200 is
   charged. Tests pin the mapping.
-- **Per-worker budget disclosed up front (#48).** The `gcl.yaml` description and the top of the
-  README now say the budget is per gateway worker and a caller can multiply it by opening more
-  connections, with the divide-by-N and `FLEX_SERVICE_ENVOY_CONCURRENCY=1` mitigations beside
-  it. A node-wide ledger is deferred to v2.
+- **Node-wide ledger, now the default (#48).** The new `ledgerBackend` property selects where the
+  ledger lives. `node` (the default) keeps it in the gateway's node-local shared data (PDK
+  `LocalDataStorage`, through the `experimental_storage_sync` feature), so every Envoy worker of a
+  replica checks and reserves against one budget and opening more connections no longer multiplies
+  it. Every write is a compare-and-swap inside a bounded retry loop (12 attempts, no sleep), with
+  no read-then-write fallback and no unconditional overwrite. When retries run out, block mode
+  denies with `reason=ledger-contention`; a storage error denies with `reason=ledger-unavailable`;
+  monitor mode forwards both and flags them. Settlement keeps the #17 rules across workers and is
+  safe by direction: an unwritable commit is queued and retried (`settlement=deferred`, and a
+  long queue refuses new reservations), and an unwritable release stays held until reclaimed.
+  Keys are an HMAC of the scope, never the raw identity, private to the policy instance unless the
+  new `ledgerNamespace` is set. Stale keys are deleted, and `maxScopes` is enforced per replica
+  without evicting live state. `worker` keeps the old per-worker ledger, whose multiplier and
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1` workaround are still disclosed. `cluster` is rejected as not
+  implemented. The node budget is per replica and resets when the gateway process restarts.
+- **A refusal at the scope cap is cheap (#49, finding A).** The worker ledger keeps scopes ordered
+  by when each becomes idle, so a new scope at the cap examines at most one candidate instead of
+  scanning every live scope; a test refuses 1,000 new scopes against 100,000 live ones. On the
+  node ledger a refusal at the cap reads two small records, and only one worker per replica
+  rescans, at most once a second.
 - **Charset and unparseable bodies fail closed.** A body is inspected only when its
   `Content-Type` has no `charset` or `charset=utf-8`. Any other charset makes it
   uninspectable, so a `tools/call` can't be hidden by an encoding the upstream decodes
   differently, such as `utf-7`. A body the JSON parser rejects (nesting too deep, a lone
   surrogate, a BOM) is now unpriceable instead of being charged as a single call.
-- Library tests: 157 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
-  under `spend-amount` in block mode.
+- Library tests: 185 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
+  under `spend-amount` in block mode. New real-gateway cases: `case8n` asserts exactly 3 of 200
+  admitted across four Envoy workers with the node ledger, and `case8nb` records whether the node
+  ledger survives the startup config apply.
 
 ### Approval-to-Execution Binding
 

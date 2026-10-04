@@ -17,6 +17,10 @@ pub struct Config {
     pub identity_field: String,
     #[serde(alias = "identitySource")]
     pub identity_source: String,
+    #[serde(alias = "ledgerBackend")]
+    pub ledger_backend: String,
+    #[serde(alias = "ledgerNamespace")]
+    pub ledger_namespace: String,
     #[serde(alias = "maxScopes")]
     pub max_scopes: i64,
     #[serde(alias = "mode")]

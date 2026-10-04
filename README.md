@@ -158,7 +158,7 @@ Every pull request and every push to `main` runs the
 The packaging and runtime jobs need repository secrets, so pull requests from
 forks skip them.
 
-Current library test counts: **67** for Approval-to-Execution Binding and **157**
+Current library test counts: **67** for Approval-to-Execution Binding and **185**
 for the aggregate-risk gate.
 
 To run the CI's `policies` checks locally, from a policy directory:
@@ -198,13 +198,15 @@ The [docs index](docs/README.md) lists every report with its evidence file.
   Run P6 flows on a single replica. The store is capped at a fixed number of nonces
   per replica (see the policy README). A shared store with a TTL would make single
   use global.
-- **The aggregate budget is per worker, and a caller can multiply it.** Each gateway
-  worker holds its own ledger with the full budget, so a caller that opens more
-  connections can reach up to `N × aggregateBudget` across `N` workers. Divide the
-  intended budget by `N`, or set `FLEX_SERVICE_ENVOY_CONCURRENCY=1` for one budget per replica. A restart resets
-  the ledger, and so does a config apply that rebuilds the listener (the gateway
-  does this once at startup). A UI Save & Apply with no config change was tested and
-  did not reset it. A shared, durable ledger is planned v2 work.
+- **The aggregate budget is per gateway replica, and a restart resets it.** By default
+  (`ledgerBackend: node`) every worker of a replica shares one ledger in the gateway's
+  node-local data, with compare-and-swap writes, so more connections don't multiply the
+  budget. Replicas are still independent: with `R` replicas a scope can reach
+  `R × aggregateBudget`, so divide by `R` or run one. The ledger is not durable, so a
+  gateway process restart resets it. The opt-in `ledgerBackend: worker` keeps one ledger
+  per worker, which a caller *can* multiply across `N` workers: divide by `N` or set
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1`. A ledger shared across replicas
+  (`ledgerBackend: cluster`) is not implemented and is rejected.
 - **Bounded inspection.** Both policies inspect admitted JSON-RPC envelopes and
   bodies. They do not inspect URL paths, query strings or arbitrary headers, and
   they never treat a header as trusted provenance.

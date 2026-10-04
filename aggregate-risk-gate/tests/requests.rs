@@ -54,6 +54,8 @@ fn policy_config(scope_header: &str, overrides: serde_json::Value) -> PolicyConf
         "identitySource": "trusted-header",
         "identityField": "client_id",
         "scopeHeader": scope_header,
+        "ledgerBackend": "node",
+        "ledgerNamespace": "",
         "maxScopes": 10000,
         "reservationTimeoutMs": 60000,
         "scopeDisclosure": "raw",

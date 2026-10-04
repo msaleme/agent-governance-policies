@@ -51,7 +51,8 @@ Makefile (`make build-asset-files`) after changing `definition/gcl.yaml`.
   untracked. Scan before any push.
 - **Honesty over polish.** Framework references (NIST/OWASP/MITRE/EU AI Act/AIUC-1)
   are design and supporting-measure context, never certification claims. State
-  every limitation plainly: the per-worker ledger, which a restart resets; HMAC-only
+  every limitation plainly: the aggregate ledger is per replica (per worker with
+  `ledgerBackend: worker`) and a restart resets it; HMAC-only
   attestation; and P6 single use being per replica on `local()`. Do not weaken a
   test to make a gate pass; do not invent framework IDs, benchmarks, or counts.
 - **The repo is PUBLIC.** Never commit org, environment or client ids, hostnames,

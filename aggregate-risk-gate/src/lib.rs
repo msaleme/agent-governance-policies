@@ -36,16 +36,21 @@
 // admits exactly three (2,400) and refuses the other two.
 //
 // Scope of the guarantee (see also the gcl.yaml field docs and README): a real,
-// correct, exhaustively tested in-process reserve-then-authorize engine, with
-// one ledger per policy instance per gateway worker. It is not shared across
-// workers or replicas, a restart resets it, and it makes no cryptographic
-// non-repudiation claim about its decisions. A shared, durable ledger with
-// signed decision records is future work (v2).
+// correct, exhaustively tested reserve-then-authorize engine. With the default
+// `ledgerBackend: node` (`node_ledger.rs`, P4A review #48) there is one ledger
+// per policy instance per gateway REPLICA, shared by all of its Envoy workers
+// through compare-and-swap writes to node-local shared data; it is not shared
+// across replicas and a gateway process restart resets it. `ledgerBackend:
+// worker` (`ledger.rs`) keeps one in-memory ledger per worker, which a caller
+// can multiply across workers (mitigation: `FLEX_SERVICE_ENVOY_CONCURRENCY=1`).
+// A cross-replica, durable ledger (`cluster`) is not implemented and is
+// rejected. No cryptographic non-repudiation claim is made about decisions.
 //
 // NIST SP 800-53 Rev 5: AC-6 (Least Privilege / aggregate exposure), SI-4
 // (Monitoring), AU-6 (Audit Review — the running-total resultHeader).
 mod generated;
 mod ledger;
+mod node_ledger;
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
@@ -64,6 +69,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::generated::config::Config;
 use crate::ledger::{Denial, Ledger, LedgerStats, LedgerStore, Refusal, Reservation, Settlement};
+use crate::node_ledger::{KvStore, NodeLedger, PdkStore};
+use pdk::data_storage::DataStorageBuilder;
 
 /// JSON-RPC server-error code used when this policy prevents a call from
 /// reaching its upstream tool. Matches the sibling decoy/binding policies in
@@ -469,11 +476,46 @@ struct Gate {
     mode: Mode,
     on_deny: OnDeny,
     result_header: String,
-    ledger: Ledger,
+    ledger: Box<dyn LedgerStore>,
+}
+
+/// The store name of the node ledger in a policy instance's own namespace.
+const NODE_LEDGER_STORE: &str = "ledger";
+
+/// Checks `ledgerNamespace`: empty, or 1 to 64 letters, digits, `.`, `_`, `-`.
+fn ledger_namespace(raw: &str) -> Result<Option<String>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() <= 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Ok(Some(raw.to_string()));
+    }
+    Err(anyhow!(
+        "ledgerNamespace must be empty or 1 to 64 letters, digits, '.', '_' or '-'"
+    ))
 }
 
 impl Gate {
+    /// A gate whose node ledger uses an in-memory test store.
+    #[cfg(test)]
     fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with(
+            config,
+            |_| Box::new(node_ledger::fake::FakeStore::default()),
+        )
+    }
+
+    /// Builds the gate. `node_store` opens the shared-data store for the node
+    /// ledger: the policy instance's own namespace for `None`, or the named
+    /// shared one.
+    fn from_config_with(
+        config: &Config,
+        node_store: impl FnOnce(Option<&str>) -> Box<dyn KvStore>,
+    ) -> Result<Self> {
         let budget_scope = match config.budget_scope.as_str() {
             "agent" | "fabric" | "tenant" => config.budget_scope.clone(),
             other => {
@@ -592,6 +634,30 @@ impl Gate {
             .ok()
             .filter(|ms| (1_000..=86_400_000).contains(ms))
             .ok_or_else(|| anyhow!("reservationTimeoutMs must be between 1000 and 86400000"))?;
+        let namespace = ledger_namespace(&config.ledger_namespace)?;
+        let node = match config.ledger_backend.as_str() {
+            "node" => true,
+            "worker" => {
+                if namespace.is_some() {
+                    return Err(anyhow!(
+                        "ledgerNamespace applies only to ledgerBackend \"node\""
+                    ));
+                }
+                false
+            }
+            "cluster" => {
+                return Err(anyhow!(
+                    "ledgerBackend \"cluster\" is not implemented: a cluster-wide ledger \
+                     shared across gateway replicas does not exist yet. Use \"node\" (one \
+                     budget per replica) or \"worker\""
+                ))
+            }
+            other => {
+                return Err(anyhow!(
+                    "ledgerBackend must be node or worker, got {other:?}"
+                ))
+            }
+        };
 
         let disclosure = match config.scope_disclosure.as_str() {
             "digest" => Disclosure::Digest(config.scope_digest_key.as_bytes().to_vec()),
@@ -632,7 +698,22 @@ impl Gate {
             mode,
             on_deny,
             result_header,
-            ledger: Ledger::with_limits(max_scopes, reservation_timeout_ms, window),
+            ledger: if node {
+                Box::new(NodeLedger::new(
+                    node_store(namespace.as_deref()),
+                    config.scope_digest_key.as_bytes().to_vec(),
+                    max_scopes,
+                    reservation_timeout_ms,
+                    window,
+                    node_ledger::random_prefix(),
+                ))
+            } else {
+                Box::new(Ledger::with_limits(
+                    max_scopes,
+                    reservation_timeout_ms,
+                    window,
+                ))
+            },
         })
     }
 
@@ -887,6 +968,8 @@ enum DenyReason {
     MissingIdentity,
     InvalidIdentity,
     ScopeCapacity,
+    LedgerContention,
+    LedgerUnavailable,
     Unpriceable,
     OutOfRange,
     BudgetExceeded(Denial),
@@ -899,6 +982,8 @@ impl DenyReason {
             DenyReason::MissingIdentity => "missing-identity",
             DenyReason::InvalidIdentity => "invalid-identity",
             DenyReason::ScopeCapacity => "scope-capacity",
+            DenyReason::LedgerContention => "ledger-contention",
+            DenyReason::LedgerUnavailable => "ledger-unavailable",
             DenyReason::Unpriceable => "unpriceable",
             DenyReason::OutOfRange => "out-of-range",
             DenyReason::BudgetExceeded(_) => "budget-exceeded",
@@ -928,6 +1013,12 @@ impl DenyReason {
             DenyReason::ScopeCapacity => format!(
                 "aggregate risk gate: no capacity to track a new scope \"{scope}\""
             ),
+            DenyReason::LedgerContention => format!(
+                "aggregate risk gate: the shared ledger stayed contended for scope \"{scope}\""
+            ),
+            DenyReason::LedgerUnavailable => format!(
+                "aggregate risk gate: the shared ledger is unavailable for scope \"{scope}\""
+            ),
             DenyReason::Unpriceable => {
                 format!("aggregate risk gate: call could not be priced for scope \"{scope}\"")
             }
@@ -939,6 +1030,17 @@ impl DenyReason {
                 denial.would_be_total, denial.budget
             ),
         }
+    }
+}
+
+/// The `reason=` label monitor mode stamps when the ledger refused to track
+/// a call it still forwards.
+fn refusal_label(refusal: &Refusal) -> &'static str {
+    match refusal {
+        Refusal::OverBudget(_) => "budget-exceeded",
+        Refusal::AtCapacity => DenyReason::ScopeCapacity.label(),
+        Refusal::Contention => DenyReason::LedgerContention.label(),
+        Refusal::Unavailable => DenyReason::LedgerUnavailable.label(),
     }
 }
 
@@ -1011,6 +1113,8 @@ fn admit(
                 let reason = match refusal {
                     Refusal::OverBudget(denial) => DenyReason::BudgetExceeded(denial),
                     Refusal::AtCapacity => DenyReason::ScopeCapacity,
+                    Refusal::Contention => DenyReason::LedgerContention,
+                    Refusal::Unavailable => DenyReason::LedgerUnavailable,
                 };
                 return refuse(gate, reason, &display, echo_bytes);
             }
@@ -1020,7 +1124,7 @@ fn admit(
                 .ledger
                 .force_reserve_checked(scope, contribution, gate.aggregate_budget, now)
             {
-                Some((reservation, breached)) => {
+                Ok((reservation, breached)) => {
                     if breached {
                         // The call that would have been refused in block mode
                         // is still forwarded (monitor never denies), but the
@@ -1030,16 +1134,17 @@ fn admit(
                     }
                     reservation
                 }
-                None => {
+                Err(refusal) => {
                     violations.generate_policy_violation();
                     return Flow::Continue(Ticket::None(format!(
-                        "monitor;scope={display};reason=scope-capacity"
+                        "monitor;scope={display};reason={}",
+                        refusal_label(&refusal)
                     )));
                 }
             }
         }
     };
-    let total_after = gate.ledger.snapshot(scope).total();
+    let total_after = reservation.total;
     let verb = if gate.mode == Mode::Block {
         "allowed"
     } else {
@@ -1108,8 +1213,10 @@ fn decide(
         // zero, but there is nothing exact to charge) so the scope shows up in
         // the ledger and an operator can see the gap; the gap itself is made
         // visible on the header rather than silently inflating or deflating the
-        // running total. At the scope cap nothing is recorded.
-        gate.ledger.record(&scope, 0, now);
+        // running total. At the scope cap, or if the shared ledger is
+        // contended or unavailable, nothing is recorded; the stamp already
+        // flags the call.
+        let _ = gate.ledger.record(&scope, 0, now);
         let stamp = format!("monitor;scope={display};reason={}", reason.label());
         Flow::Continue(Ticket::None(stamp))
     }
@@ -1164,7 +1271,7 @@ fn epoch_ms(time: SystemTime) -> u64 {
 fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
     logger::info!(
         "aggregate-risk-gate: settlement={} active={} committed={} released={} expired={} \
-         late-committed={} late-released={} abandoned={} not-active={}",
+         late-committed={} late-released={} abandoned={} not-active={} deferred={} contended={}",
         settlement.label(),
         stats.active,
         stats.committed,
@@ -1173,7 +1280,9 @@ fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
         stats.late_committed,
         stats.late_released,
         stats.abandoned,
-        stats.not_active
+        stats.not_active,
+        stats.deferred,
+        stats.contended
     );
 }
 
@@ -1235,6 +1344,7 @@ async fn configure(
     Configuration(bytes): Configuration,
     violations: PolicyViolations,
     clock: Clock,
+    store_builder: DataStorageBuilder,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -1245,7 +1355,16 @@ async fn configure(
         )
     })?;
 
-    let gate = Gate::from_config(&config)?;
+    let gate = Gate::from_config_with(&config, |namespace| {
+        let storage = match namespace {
+            None => store_builder.local(NODE_LEDGER_STORE),
+            Some(namespace) => store_builder
+                .clone()
+                .shared()
+                .local(format!("aggregate-risk-gate-ledger-{namespace}")),
+        };
+        Box::new(PdkStore(storage))
+    })?;
     if gate
         .governed_methods
         .iter()
@@ -1257,10 +1376,12 @@ async fn configure(
         );
     }
     logger::info!(
-        "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, mode={}",
+        "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, \
+         ledgerBackend={}, mode={}",
         gate.budget_scope,
         gate.aggregate_budget,
         config.contribution,
+        config.ledger_backend,
         if gate.mode == Mode::Block {
             "block"
         } else {
@@ -1294,6 +1415,8 @@ mod test {
             "identityField": "client_id",
             "scopeHeader": "x-agent-id",
             "maxScopes": 10000,
+            "ledgerBackend": "node",
+            "ledgerNamespace": "",
             "reservationTimeoutMs": 60000,
             "scopeDisclosure": "raw",
             "scopeDigestKey": "",
@@ -2406,6 +2529,8 @@ mod test {
             governed_methods: vec!["tools/call".to_string()],
             identity_field: "client_id".to_string(),
             identity_source: "authentication".to_string(),
+            ledger_backend: "node".to_string(),
+            ledger_namespace: String::new(),
             max_scopes: 10000,
             reservation_timeout_ms: 60000,
             mode: "block".to_string(),
@@ -3604,5 +3729,205 @@ mod test {
                 body
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ledger backends (P4A review #48).
+    // -----------------------------------------------------------------------
+
+    /// A node-backend gate whose fake shared store the test can steer.
+    fn node_gate(overrides: Value) -> (Gate, node_ledger::fake::FakeStore) {
+        let store = node_ledger::fake::FakeStore::default();
+        let cfg: Config = serde_json::from_str(&config(overrides)).unwrap();
+        let handle = store.clone();
+        let gate = Gate::from_config_with(&cfg, move |_| Box::new(handle)).unwrap();
+        (gate, store)
+    }
+
+    fn tools_call() -> Vec<u8> {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}})
+            .to_string()
+            .into_bytes()
+    }
+
+    fn scope_of(agent: &str) -> Identity {
+        Identity::Scope(format!("agent:{agent}"))
+    }
+
+    #[test]
+    fn a_contended_node_ledger_fails_closed_in_block_mode() {
+        let (gate, store) = node_gate(json!({}));
+        store.force_mismatches(u32::MAX);
+        let body = tools_call();
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(matches!(flow, Flow::Break(_)));
+        store.force_mismatches(0);
+        assert_eq!(gate.ledger.snapshot("agent:b7").total(), 0);
+        assert_eq!(gate.ledger.stats().contended, 1);
+        assert_eq!(
+            DenyReason::LedgerContention.stamp("agent:b7", "points"),
+            "denied;scope=agent:b7;reason=ledger-contention"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_node_ledger_fails_closed_in_block_mode() {
+        let (gate, store) = node_gate(json!({}));
+        store.set_failing(true);
+        let body = tools_call();
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(matches!(flow, Flow::Break(_)));
+        store.set_failing(false);
+        assert_eq!(gate.ledger.snapshot("agent:b7").total(), 0);
+    }
+
+    #[test]
+    fn a_contended_or_unavailable_node_ledger_is_forwarded_and_flagged_in_monitor_mode() {
+        let (gate, store) = node_gate(json!({"mode": "monitor"}));
+        let body = tools_call();
+        store.force_mismatches(u32::MAX);
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(
+            matches!(flow, Flow::Continue(Ticket::None(ref stamp))
+                if stamp == "monitor;scope=agent:b7;reason=ledger-contention"),
+            "{:?}",
+            flow
+        );
+        store.force_mismatches(0);
+        store.set_failing(true);
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(
+            matches!(flow, Flow::Continue(Ticket::None(ref stamp))
+                if stamp == "monitor;scope=agent:b7;reason=ledger-unavailable"),
+            "{:?}",
+            flow
+        );
+    }
+
+    #[test]
+    fn two_node_gates_on_one_store_share_one_budget() {
+        let (a, store) = node_gate(json!({}));
+        let cfg: Config = serde_json::from_str(&config(json!({}))).unwrap();
+        let handle = store.clone();
+        let b = Gate::from_config_with(&cfg, move |_| Box::new(handle)).unwrap();
+        let body = tools_call();
+        let admitted = (0..10)
+            .filter(|i| {
+                let gate = if i % 2 == 0 { &a } else { &b };
+                matches!(
+                    decide(
+                        scope_of("b7"),
+                        0,
+                        gate,
+                        RawBody::Present(&body),
+                        &violations()
+                    ),
+                    Flow::Continue(Ticket::Reserved(..))
+                )
+            })
+            .count();
+        assert_eq!(admitted, 3, "budget 3000 at weight 800 across both workers");
+    }
+
+    #[test]
+    fn the_worker_backend_keeps_one_ledger_per_gate() {
+        let a = gate_with(json!({"ledgerBackend": "worker"}));
+        let b = gate_with(json!({"ledgerBackend": "worker"}));
+        let body = tools_call();
+        let admitted = (0..10)
+            .filter(|i| {
+                let gate = if i % 2 == 0 { &a } else { &b };
+                matches!(
+                    decide(
+                        scope_of("b7"),
+                        0,
+                        gate,
+                        RawBody::Present(&body),
+                        &violations()
+                    ),
+                    Flow::Continue(Ticket::Reserved(..))
+                )
+            })
+            .count();
+        assert_eq!(admitted, 6, "each worker admits the full budget");
+    }
+
+    #[test]
+    fn the_worker_backend_runs_through_the_filter() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"ledgerBackend": "worker"})))
+            .with_backend(Rc::new(TraceBackend::new(ok_backend)))
+            .with_entrypoint(super::configure);
+        let errors: Vec<Option<i64>> = (0..4)
+            .map(|i| response_error_code(&tester.request(rpc_request(i, "broker-7"))))
+            .collect();
+        assert_eq!(errors, vec![None, None, None, Some(-32008)]);
+    }
+
+    #[test]
+    fn a_cluster_ledger_is_rejected_as_not_implemented() {
+        let mut cfg = valid_config_struct();
+        cfg.ledger_backend = "cluster".to_string();
+        let err = Gate::from_config(&cfg).err().unwrap().to_string();
+        assert!(err.contains("not implemented"), "{}", err);
+        cfg.ledger_backend = "redis".to_string();
+        assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn the_ledger_namespace_is_validated() {
+        for ok in ["", "team-a", "fabric.v1_2", &"n".repeat(64)] {
+            let mut cfg = valid_config_struct();
+            cfg.ledger_namespace = ok.to_string();
+            assert!(Gate::from_config(&cfg).is_ok(), "{:?}", ok);
+        }
+        for bad in ["a b", "a:b", "a/b", &"n".repeat(65), "é"] {
+            let mut cfg = valid_config_struct();
+            cfg.ledger_namespace = bad.to_string();
+            assert!(Gate::from_config(&cfg).is_err(), "{:?}", bad);
+        }
+        let mut cfg = valid_config_struct();
+        cfg.ledger_backend = "worker".to_string();
+        cfg.ledger_namespace = "team-a".to_string();
+        assert!(Gate::from_config(&cfg).is_err(), "namespace needs node");
+    }
+
+    #[test]
+    fn the_node_ledger_store_is_opened_in_the_configured_namespace() {
+        let mut cfg = valid_config_struct();
+        let seen = std::cell::RefCell::new(Vec::new());
+        for namespace in ["", "team-a"] {
+            cfg.ledger_namespace = namespace.to_string();
+            Gate::from_config_with(&cfg, |ns| {
+                seen.borrow_mut().push(ns.map(str::to_string));
+                Box::new(node_ledger::fake::FakeStore::default())
+            })
+            .unwrap();
+        }
+        assert_eq!(*seen.borrow(), vec![None, Some("team-a".to_string())]);
     }
 }

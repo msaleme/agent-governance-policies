@@ -20,13 +20,15 @@
 > denial nor a passing test run establishes compliance on its own. Design context, not a compliance
 > claim; see also the [MuleSoft PDK overview](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview).
 
-> **The budget is per gateway worker.** Each Envoy worker keeps its own in-memory ledger with the
-> full `aggregateBudget`, and a caller usually cannot be pinned to one worker. A caller that opens
-> more connections can be spread across `N` workers (times replicas) and spend up to
-> `N × aggregateBudget`. For an exact budget, run the gateway with one worker
-> (`FLEX_SERVICE_ENVOY_CONCURRENCY=1`) and one replica. Otherwise set `aggregateBudget` to the
-> intended total divided by `N`, the number of workers across all replicas. See Scope of the
-> guarantee below.
+> **The budget is per gateway replica, and a restart resets it.** With the default
+> `ledgerBackend: node`, every Envoy worker of one gateway replica checks and reserves against one
+> shared ledger in the gateway's node-local data, so opening more connections does not multiply the
+> budget on that replica. Replicas still hold independent budgets: with `R` replicas a scope can
+> spend up to `R × aggregateBudget`, so divide the intended total by `R`, or run one replica. The
+> ledger is not durable: a gateway process restart starts every scope again at zero.
+> `ledgerBackend: worker` keeps the older per-worker ledger, which a caller *can* multiply across
+> the `N` workers of each replica (up to `N × R × aggregateBudget`); with that backend, set
+> `FLEX_SERVICE_ENVOY_CONCURRENCY=1` or divide by `N × R`. See Scope of the guarantee below.
 
 ## The customer need
 
@@ -200,7 +202,9 @@ batch have no request id to answer and are not echoed.
 | `identitySource` | `authentication`\|`trusted-header` | `authentication` | Where the identity comes from. `authentication` — the verified `AuthenticationData` set by an authentication policy (Client ID Enforcement, JWT Validation, OAuth introspection) that runs **before** this one. `trusted-header` — the `scopeHeader` value, which this policy cannot verify; use it only behind a chain that strips and re-injects that header (see Identity below). Ignored for `fabric`. |
 | `identityField` | `client_id`\|`principal`\|`properties.<path>` | `client_id` | Which `AuthenticationData` field identifies the caller when `identitySource=authentication`. `properties.<path>` reads a dot path into the authentication properties (for example a JWT claim); the value must be a string. |
 | `scopeHeader` | string | `x-agent-id` | Header carrying the identity when `identitySource=trusted-header`; must be non-blank in that mode, ignored otherwise. Matched case-insensitively. A header sent more than once is invalid. |
-| `maxScopes` | integer, `1`–`1000000` | `10000` | Most scopes the ledger tracks at once. At the cap a new scope may evict one idle scope (nothing committed or reserved). If none is idle the call is denied in `block` mode with `reason=scope-capacity`, or forwarded in `monitor` mode with that reason stamped. Live totals are never evicted. |
+| `ledgerBackend` | `node`\|`worker` | `node` | Where the ledger lives. `node` — one ledger per policy instance per gateway replica, in the gateway's node-local shared data, shared by all its Envoy workers; every write is a bounded compare-and-swap (see Scope of the guarantee). `worker` — one in-memory ledger per Envoy worker, as in earlier builds; a caller can multiply it across workers. `cluster` (one budget across replicas) is **not implemented** and is rejected at configure time, as is any other value. |
+| `ledgerNamespace` | string, empty or 1–64 of `A–Z a–z 0–9 . _ -` | `""` | Empty — the node ledger is private to this policy instance. Set — the ledger is stored under that name, so every instance on the replica configured with the same namespace (and the same `scopeDigestKey`) shares one budget per scope. Requires `ledgerBackend: node`. |
+| `maxScopes` | integer, `1`–`1000000` | `10000` | Most scopes the ledger tracks at once (per worker for `worker`, per replica for `node`). At the cap a new scope may take the place of an idle scope (nothing committed or reserved). If none is idle the call is denied in `block` mode with `reason=scope-capacity`, or forwarded in `monitor` mode with that reason stamped. Live totals are never evicted. A refusal at the cap costs constant work, however many scopes are live (see Identity below). |
 | `reservationTimeoutMs` | integer, `1000`–`86400000` | `60000` | How long a reservation may stay unsettled before it is reclaimed and its budget freed. Set it above the longest upstream timeout. See Reservation lifecycle below. |
 | `scopeDisclosure` | `digest`\|`none`\|`raw` | `digest` | How the scope appears in `resultHeader` and denial messages. `digest` — `<budgetScope>:hmac-<16 hex>` (HMAC-SHA256 under `scopeDigestKey`, first 8 bytes), or `sha256-…` when no key is set. `none` — just `<budgetScope>`. `raw` — the canonical identity itself; only for trusted, internal consumers. |
 | `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest`. Without a key the digest is a plain SHA-256, which anyone holding a candidate identity can recompute. Set a key when identities are guessable. |
@@ -215,7 +219,7 @@ batch have no request id to answer and are not echoed.
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. In both modes a reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
-| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
+| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `ledger-contention`, `ledger-unavailable`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
 
 ```yaml
 - policyRef:
@@ -225,6 +229,8 @@ batch have no request id to answer and are not echoed.
     identitySource: authentication
     identityField: client_id
     scopeHeader: x-agent-id
+    ledgerBackend: node
+    ledgerNamespace: ""
     maxScopes: 10000
     reservationTimeoutMs: 60000
     scopeDisclosure: digest
@@ -295,7 +301,12 @@ identity contains a space, so these never collide with a real scope.
 
 `maxScopes` bounds the ledger's memory. A flood of distinct identities cannot grow it past the cap,
 and the cap cannot be used to reset someone else's total, because only idle scopes are evicted.
-Idle scopes hold nothing committed or reserved. A stranded reservation stops pinning its scope two
+Idle scopes hold nothing committed or reserved. A flood also cannot make the cap expensive (P4A
+review #49 A). The worker ledger keeps its scopes ordered by when each becomes idle, so a new scope
+at the cap looks at one candidate and either evicts it or is refused; a unit test refuses 1,000 new
+scopes against 100,000 live ones without examining any. The node ledger refuses at the cap after
+reading two small records, and only one worker per replica rescans for idle scopes, at most once a
+second; idle scopes are also swept every minute, so stale keys are deleted below the cap too. A stranded reservation stops pinning its scope two
 timeouts after it was made (see Reservation lifecycle). Committed exposure does not expire; that is
 reset by `window`.
 
@@ -305,7 +316,8 @@ must now set `identitySource: trusted-header` and, to keep raw scopes in the res
 
 ## Reservation lifecycle
 
-Every reservation gets an id that is unique within the worker, a creation time and an expiry time
+Every reservation gets an id that is unique on the replica (a random 64-bit per-worker prefix
+and a counter), so a response handled by another worker settles it by id, a creation time and an expiry time
 of creation + `reservationTimeoutMs`. Time is the gateway's own clock, read when the request
 headers arrive and again when the response headers arrive. A reservation ends in exactly one of
 these states, and the response stamps which one as `settlement=`:
@@ -342,10 +354,12 @@ Too long, and a stranded reservation holds budget longer than needed. Overshoot 
 the timeout. Within it the budget holds exactly.
 
 A response that is not one of the normal kinds (`committed`, `released`) writes one log line with
-the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned
-and not-active. The line carries no identity.
+the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned,
+not-active, deferred and contended. The line carries no identity. `settlement=deferred` appears only
+with the node ledger, when a settlement could not be written (see Scope of the guarantee).
 
-**Worker restart and config apply.** The ledger is in the memory of the worker's wasm VM. When the
+**Worker restart and config apply.** This paragraph describes `ledgerBackend: worker`; for the
+node ledger see Scope of the guarantee. The worker ledger is in the memory of the worker's wasm VM. When the
 worker restarts, every committed and reserved amount is gone and all scopes start again at zero. A
 config apply that rebuilds the listener does the same, because Envoy then builds new wasm VMs, each
 with an empty ledger. On a real Flex 1.14.0 gateway this happens at startup: the gateway applies its
@@ -354,8 +368,8 @@ again after it ([case 8b](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#f4-a-co
 Not every apply rebuilds the listener. On a connected gateway, a UI Save & Apply with no config
 change was applied, but the exhausted scope stayed denied (case 2d in the same doc). A policy
 config change was not tested and may reset the ledger. A reset fails open. Apart from window boundaries, a restart or a config apply is the
-only thing that resets totals. Settlement is an in-process map update, so it has no transient
-failure to retry.
+only thing that resets totals. Worker-ledger settlement is an in-process map update, so it has no
+transient failure to retry.
 
 ## Accounting window
 
@@ -370,7 +384,8 @@ until it settles. When it commits, it is charged to the period it settles in. A 
 backwards never resets a total, because periods only move forward. A scope whose committed total
 is from an earlier period counts as idle for `maxScopes` eviction.
 
-With `window: worker-lifetime` committed exposure accumulates until the worker restarts.
+With `window: worker-lifetime` committed exposure accumulates until the ledger is reset: a worker
+restart for `ledgerBackend: worker`, a gateway process restart for `node`.
 
 ## Units
 
@@ -392,33 +407,67 @@ around to a small number.
 
 ## Scope of the guarantee
 
-The ledger is real, atomic, in-process reserve-then-authorize, backed by a mutex-serialized map
-keyed by budget scope. It is genuinely race-safe: the concurrent-admission unit test shows it
-holding the budget under contention where a naive read-then-write counter breaches. Its scope is
-**one policy instance in one gateway worker**. Concretely:
+The ledger is real, atomic reserve-then-authorize, keyed by budget scope. There are two backends.
 
-- **The budget is per worker, not per fleet.** Each gateway worker, and each replica's workers,
-  holds its own ledger with the full `aggregateBudget`. With `N` workers in total behind the same
-  API, a scope can be admitted up to `N × aggregateBudget` in a window, and a caller can push
-  toward that by opening more connections. The ledger's mutex serializes callers within one
-  worker only; it gives no protection across workers. To make `aggregateBudget`
-  an upper bound for the whole deployment, divide the intended budget by `N`. That bound is safe
+**`ledgerBackend: node` (the default).** The scope records live in the gateway's node-local shared
+data (PDK `LocalDataStorage`, used through the `experimental_storage_sync` feature), which every
+Envoy worker of one gateway replica reads and writes. Each worker is its own single-threaded wasm
+VM, so the check and the reservation are made atomic with compare-and-swap: a worker reads the
+scope's record, reclaims expired reservations, checks the budget and writes the new record back
+only if nobody wrote it in between, retrying up to 12 times with no sleep. There is no
+read-then-write fallback and no unconditional overwrite. Concretely:
+
+- **One budget per policy instance per gateway replica.** Opening more connections does not
+  multiply it. Unit tests drive two ledgers over one store with a CAS conflict forced on every
+  write and admit exactly 3 of the reference calls; the real-gateway case `case8n` in
+  `tests/connected_e2e.rs` runs the same 200-call burst on four Envoy workers and asserts exactly
+  3 admitted. Replicas still have independent budgets: with `R` replicas a scope can reach
+  `R × aggregateBudget`, so divide the intended total by `R` or run one replica.
+- **Contention and storage errors fail closed.** When the retries run out, `block` mode denies with
+  `reason=ledger-contention`; a storage error denies with `reason=ledger-unavailable`. `monitor`
+  mode forwards either and stamps the reason. Nothing is reserved in either case.
+- **Settlement is safe by direction.** A commit that cannot be written is queued on the worker and
+  retried on its next calls, stamped `settlement=deferred`; while 256 or more commits are queued,
+  new reservations are refused as contended, so committed exposure is never dropped silently. A
+  release that cannot be written leaves the reservation held until it is reclaimed: an over-count
+  that frees itself after `reservationTimeoutMs`.
+- **Keys carry no identity.** A record is stored under an HMAC-SHA256 of the scope (under
+  `scopeDigestKey`), never the raw identity. Records are private to the policy instance unless
+  `ledgerNamespace` is set.
+- **A gateway process restart resets it.** The shared data is in process memory, not durable, so a
+  restart or redeploy starts every scope again at zero, even mid-window. Whether a config apply
+  that rebuilds the listener (which resets the worker ledger) keeps the node ledger is **not yet
+  verified on a real gateway**: the shared data lives outside the wasm VMs, so it should survive,
+  and `case8nb` in `tests/connected_e2e.rs` records what a real Flex 1.14.0 gateway does.
+- **Known edges.** A scope slot whose release exhausts its retries stays counted against
+  `maxScopes`, so fewer scopes fit (never more state evicted). A worker that stalls between its read
+  and its write for longer than 30 s across a cleanup pass could re-create a deleted record without
+  taking a slot. Neither can admit more than the budget.
+
+**`ledgerBackend: worker`.** One in-process ledger per Envoy worker, backed by a mutex-serialized
+map, as in earlier builds. It is race-safe within a worker (the concurrent-admission unit test
+shows it holding the budget where a naive read-then-write counter breaches), but:
+
+- **The budget is per worker, and a caller can multiply it.** Each worker, on each replica, holds
+  the full `aggregateBudget`. With `N` workers in total a scope can be admitted up to
+  `N × aggregateBudget` in a window, and a caller can push toward that by opening more connections.
+  To make `aggregateBudget` an upper bound, divide the intended budget by `N`. That bound is safe
   but loose: a scope whose traffic lands on one worker gets only `1/N` of the intended budget.
 - **Single-worker configuration gives one budget per replica.** Setting
   `FLEX_SERVICE_ENVOY_CONCURRENCY=1` gives each policy instance one worker ledger per replica,
   at the cost of worker parallelism. In the [real Flex 1.14.0 run, case 8](../docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md#8-per-worker-scope-observed-15),
   12 of 200 calls were admitted with four workers and 3 of 200 with one worker, using
-  `aggregateBudget: 3000` and `fixedWeight: 800`. These are observations from that run;
-  replicas still have independent budgets, and a restart or config apply still resets the ledger.
-- **A restart, redeploy or config apply resets the ledger.** Every committed and reserved amount is
-  lost and all scopes start again at zero, even mid-window. A config apply resets it when it
-  rebuilds the listener, which gives Envoy new wasm VMs. The gateway does this once at startup,
-  about 5 s after it first applies its config, so a scope can be admitted up to its budget again
-  after that apply. A UI Save & Apply with no config change did not reset it. There is no persistence and no storage dependency, so there are no storage
-  conflicts or storage errors to handle.
-- **No signed decision records.** Every ledger operation happens in-process and is not
-  independently attestable outside this policy's own process. This build makes no claim that its
-  admit/deny decisions are cryptographically non-repudiable.
+  `aggregateBudget: 3000` and `fixedWeight: 800`. These are observations from that run.
+- **A restart, redeploy or config apply resets it.** A config apply resets it when it rebuilds the
+  listener, which gives Envoy new wasm VMs. The gateway does this once at startup, about 5 s after
+  it first applies its config. A UI Save & Apply with no config change did not reset it. There is
+  no storage dependency, so no storage conflicts or errors to handle.
+
+**Both backends:**
+
+- **No signed decision records.** No ledger operation is independently attestable outside the
+  gateway. This build makes no claim that its admit/deny decisions are cryptographically
+  non-repudiable.
 - **`estimated-token-weight` contribution is estimate-then-SETTLE, not estimate-then-reconcile,
   and it never measures actual token usage.** The reservation made before authorizing an
   `estimated-token-weight` call is `estimatedTokens`, a configured upper bound. This build's
@@ -428,17 +477,17 @@ holding the budget under contention where a naive read-then-write counter breach
   unchanged (or released outright on failure). Set the estimate conservatively for the traffic
   this instance governs, since it is what actually lands in the ledger.
 
-A shared, durable ledger, with one budget across workers and replicas that survives restarts and
-has signed decision records (the full model in the `authorized-but-composed` reference work), is
-future work for a v2. It is **not implemented here**. Do not present this build as shipping it.
-The earlier `ledgerEndpoint` placeholder for it has been removed.
+A ledger shared across replicas that survives restarts (`ledgerBackend: cluster`, rejected today),
+and signed decision records (the full model in the `authorized-but-composed` reference work), are
+**not implemented here**. Do not present this build as shipping them. The earlier `ledgerEndpoint`
+placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 157 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 185 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 51 tests): correctness of
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 53 tests): correctness of
   `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
@@ -464,13 +513,31 @@ Docker:
   periods are aligned to the epoch, not first use; an in-flight reservation carries across a
   boundary and settles in the new period; a clock stepping backwards never resets a total;
   without a window nothing resets; and a scope from an earlier period can be evicted.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (63 tests,
-  from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
+  Two cover the cost of the cap (#49 A): 1,000 refusals against 100,000 live scopes examine no
+  scope at all, and the idle index follows every settlement.
+- **`src/node_ledger.rs` — the node-wide ledger** (17 tests, over an in-memory test store that can
+  force CAS conflicts and storage errors): two workers racing on every write admit exactly 3 of the
+  reference calls, and interleaved workers admit exactly what fits; persistent CAS mismatch is
+  `Contention` and a storage error `Unavailable`, both reserving nothing; a reservation made on
+  one worker settles on another exactly once, late settlement follows the tombstone rules and ids
+  are unique across workers; the store never holds a raw identity; a window rollover resets
+  every worker's view; at the cap an idle scope is swept and live state kept, a refusal costs at
+  most three store operations with 1,000 live scopes, and a settlement that leaves a scope idle
+  lets the next new scope in; stale keys are deleted and a doomed record is never written over;
+  and an unwritable commit is queued, an unwritable release stays held, and a long commit queue
+  refuses new reservations.
+- **`src/lib.rs` — the PDK filter** (115 tests), mostly exercised end to end through the
+  `pdk-unit` harness, which runs the node backend over the real `LocalDataStorage` adapter: per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
   unpriceable and estimate-then-settle edge cases, independent per-scope budgets, the missing-
   identity path in both modes, and that the `resultHeader` stamp lands on the client-facing
   response (not the upstream request) in both the allow and deny paths. Also:
+  - **Ledger backends** — a contended or unavailable node ledger fails closed in `block` mode
+    and is forwarded with `reason=ledger-contention`/`ledger-unavailable` in `monitor` mode; two
+    node gates on one store share one budget while two worker gates each keep their own; the worker
+    backend still runs through the filter; `cluster` is rejected as not implemented;
+    `ledgerNamespace` is validated and selects the store the ledger opens.
   - **Identity** — a spoofed, rotating scope header does not mint a fresh budget under
     `authentication`; missing authentication fails closed; oversized, delimiter-bearing and
     space-bearing identities are denied as invalid; case and whitespace variants share one budget;
@@ -553,8 +620,12 @@ HTTP mock upstream:
   - reservation reclaim and late settlement, on one worker;
   - the fixed-window reset;
   - a restart;
-  - the per-worker budget;
-  - the reset caused by a config apply.
+  - the per-worker budget (`ledgerBackend: worker`, case 8) and the reset caused by a config
+    apply (case 8b);
+  - one budget across four Envoy workers with `ledgerBackend: node` (`case8n`, asserts exactly
+    3 of 200 admitted; the container gets `FLEX_SERVICE_ENVOY_CONCURRENCY=4` through
+    `FlexConfig::builder().env(...)`), and whether the node ledger survives the startup config
+    apply (`case8nb`, observational).
 
   One more case, `case2c`, needs a connected-mode registration, a control-plane API instance
   and two real UI Save & Apply presses, so it is run by hand only.

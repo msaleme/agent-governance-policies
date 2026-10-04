@@ -15,23 +15,25 @@
 // of `reserved` happen while holding one lock, so no other caller can observe an
 // intermediate state.
 //
-// Scope of the guarantee: this is a single, in-process, mutex-serialized store.
-// It is a real, correct reserve-then-authorize engine (proven below, including
-// under genuine multi-thread contention), not a simulation of one. One `Ledger`
-// exists per policy instance per gateway worker: it is NOT shared across
-// workers or replicas, it does not survive a restart, and it carries no
-// cryptographic attestation of its decisions. A shared, durable ledger is
-// future work (v2); nothing here should be read as a claim of durability,
-// multi-worker sharing, or non-repudiation.
+// Two backends implement `LedgerStore`:
 //
-// The Mutex is NOT cross-worker protection. The concurrency tests below prove
-// atomicity between threads that share one `Ledger`; on the gateway each Envoy
-// worker holds its own `Ledger`, so the lock never sees another worker's
-// callers. A caller spread across N workers (e.g. by opening more connections)
-// faces N independent budgets and can spend up to N times the configured
-// budget. The deployment answer is one worker (`FLEX_SERVICE_ENVOY_CONCURRENCY=1`)
-// and one replica, or a per-worker budget of the intended total divided by N;
-// see the README.
+// - `Ledger` (this file, `ledgerBackend: worker`): an in-process,
+//   mutex-serialized store. One exists per policy instance per gateway worker.
+//   It is NOT shared across workers, so a caller spread across N workers (for
+//   example by opening more connections) faces N independent budgets and can
+//   spend up to N times the configured budget. The Mutex is not cross-worker
+//   protection: the concurrency tests below prove atomicity between threads
+//   that share one `Ledger`. The deployment answer for this backend is one
+//   worker (`FLEX_SERVICE_ENVOY_CONCURRENCY=1`), or a budget of the intended
+//   total divided by N; see the README.
+// - `NodeLedger` (`node_ledger.rs`, `ledgerBackend: node`, the default): the
+//   same scope state, held in the gateway's node-local shared data and updated
+//   with compare-and-swap, so every worker of one gateway replica shares one
+//   budget.
+//
+// Neither backend is shared across replicas, survives a process restart, or
+// carries a cryptographic attestation of its decisions. Nothing here should be
+// read as a claim of durability, cluster-wide sharing, or non-repudiation.
 
 // Units: every amount here is an exact, non-negative integer (`u64`) in the
 // policy's configured unit (fixed-weight points, estimated tokens, or a
@@ -51,12 +53,19 @@
 // carry into the new period, and settle there. Periods only move forward, so a
 // clock that steps backwards never resets a total.
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 
+/// A reservation id: unique across every worker that shares a ledger. The
+/// high 64 bits are a per-ledger prefix (random for the node backend, whose
+/// reservations are settled by whichever worker sees the response), the low
+/// 64 bits a counter that is never reused.
+pub type ReservationId = u128;
+
 /// One in-flight reservation's ledger record.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Held {
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Held {
     contribution: u64,
     expires_at: u64,
 }
@@ -71,14 +80,18 @@ struct Held {
 /// `reclaimed` keeps a tombstone for each reservation that expired before it
 /// was settled, until `expires_at + ttl`, so a late settlement is recognised
 /// as late rather than as a duplicate (see `LedgerStore::commit`).
-#[derive(Default, Clone, Debug, PartialEq)]
-struct ScopeState {
+#[derive(Default, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ScopeState {
     /// The window period `committed` belongs to (always 0 without a window).
     period: u64,
     committed: u64,
     reserved: u64,
-    active: HashMap<u64, Held>,
-    reclaimed: HashMap<u64, Held>,
+    active: HashMap<ReservationId, Held>,
+    reclaimed: HashMap<ReservationId, Held>,
+    /// Where this scope sits in the worker ledger's idle index (`None` when
+    /// not indexed). Never stored by the node backend.
+    #[serde(skip)]
+    indexed_at: Option<u64>,
 }
 
 impl ScopeState {
@@ -86,17 +99,45 @@ impl ScopeState {
     /// tombstone, so it holds no enforcement state: dropping it and re-creating
     /// it later at zero is indistinguishable from keeping it. Only idle scopes
     /// are ever evicted.
-    fn is_idle(&self) -> bool {
+    pub(crate) fn is_idle(&self) -> bool {
         self.committed == 0 && self.active.is_empty() && self.reclaimed.is_empty()
     }
 
-    fn total(&self) -> u64 {
+    pub(crate) fn total(&self) -> u64 {
         self.committed.saturating_add(self.reserved)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            committed: self.committed,
+            reserved: self.reserved,
+        }
+    }
+
+    /// The earliest time at which this scope will be idle if nothing else
+    /// happens to it: when its window period ends (never, without a window,
+    /// if anything is committed) and when its last reservation's tombstone is
+    /// dropped. `roll` then `reclaim` at any `now >= idle_at` leaves it idle.
+    /// A settlement can only bring that moment forward, never push it back,
+    /// except a commit, which is followed by a fresh computation.
+    pub(crate) fn idle_at(&self, ttl: u64, window: Option<u64>) -> u64 {
+        let mut at = 0;
+        if self.committed > 0 {
+            at = match window {
+                Some(window) => self.period.saturating_add(1).saturating_mul(window),
+                None => u64::MAX,
+            };
+        }
+        for held in self.active.values().chain(self.reclaimed.values()) {
+            at = at.max(held.expires_at.saturating_add(ttl));
+        }
+        at
     }
 
     /// Starts a new window period: committed exposure from an earlier period
     /// no longer counts. Reservations are untouched.
-    fn roll(&mut self, period: u64) {
+    pub(crate) fn roll(&mut self, period: u64) {
         if period > self.period {
             self.period = period;
             self.committed = 0;
@@ -107,8 +148,8 @@ impl ScopeState {
     /// contribution leaves `reserved`; `committed` is untouched) and drops
     /// tombstones older than one further `ttl`. Returns how many reservations
     /// expired and how many tombstones were dropped unsettled.
-    fn reclaim(&mut self, now: u64, ttl: u64) -> (u64, u64) {
-        let expired: Vec<u64> = self
+    pub(crate) fn reclaim(&mut self, now: u64, ttl: u64) -> (u64, u64) {
+        let expired: Vec<ReservationId> = self
             .active
             .iter()
             .filter(|(_, held)| now >= held.expires_at)
@@ -125,6 +166,79 @@ impl ScopeState {
             .retain(|_, held| now < held.expires_at.saturating_add(ttl));
         (expired.len() as u64, (before - self.reclaimed.len()) as u64)
     }
+
+    /// The budget check, without mutating anything.
+    pub(crate) fn check(&self, scope: &str, contribution: u64, budget: u64) -> Result<(), Refusal> {
+        let current_total = self.total();
+        let would_be_total = current_total.saturating_add(contribution);
+        if would_be_total > budget {
+            return Err(Refusal::OverBudget(Denial {
+                scope: scope.to_string(),
+                contribution,
+                current_total,
+                would_be_total,
+                budget,
+            }));
+        }
+        Ok(())
+    }
+
+    /// Adds a new active reservation `id` and returns it.
+    pub(crate) fn hold(
+        &mut self,
+        id: ReservationId,
+        scope: &str,
+        contribution: u64,
+        now: u64,
+        ttl: u64,
+    ) -> Reservation {
+        let expires_at = now.saturating_add(ttl);
+        self.reserved = self.reserved.saturating_add(contribution);
+        self.active.insert(
+            id,
+            Held {
+                contribution,
+                expires_at,
+            },
+        );
+        Reservation {
+            id,
+            scope: scope.to_string(),
+            contribution,
+            created_at: now,
+            expires_at,
+            total: self.total(),
+        }
+    }
+
+    /// Settles reservation `id` on this state: settlement first, so a
+    /// response that lands before the scope is next touched still settles
+    /// normally even if its deadline has technically passed. The caller
+    /// reclaims afterwards.
+    pub(crate) fn settle(&mut self, id: ReservationId, commit: bool) -> Settlement {
+        if let Some(held) = self.active.remove(&id) {
+            self.reserved = self.reserved.saturating_sub(held.contribution);
+            if commit {
+                self.committed = self.committed.saturating_add(held.contribution);
+                Settlement::Committed
+            } else {
+                Settlement::Released
+            }
+        } else if let Some(held) = self.reclaimed.remove(&id) {
+            if commit {
+                self.committed = self.committed.saturating_add(held.contribution);
+                Settlement::LateCommitted
+            } else {
+                Settlement::LateReleased
+            }
+        } else {
+            Settlement::NotActive
+        }
+    }
+
+    pub(crate) fn record(&mut self, contribution: u64) {
+        self.committed = self.committed.saturating_add(contribution);
+    }
 }
 
 /// A held reservation against a scope, returned by a successful `reserve` or
@@ -133,14 +247,14 @@ impl ScopeState {
 /// called by `expires_at`, the next ledger operation on the scope reclaims it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reservation {
-    /// Unique for the life of the ledger that issued it: a counter that is
-    /// never reused. Stage A IDs never leave the worker process. A shared
-    /// Stage B store would need IDs unique across workers.
-    pub id: u64,
+    pub id: ReservationId,
     pub scope: String,
     pub contribution: u64,
     pub created_at: u64,
     pub expires_at: u64,
+    /// The scope's committed-plus-reserved total right after this
+    /// reservation was made, for the result header.
+    pub total: u64,
 }
 
 /// How a `commit` or `release` call was applied.
@@ -162,6 +276,13 @@ pub enum Settlement {
     /// that arrived more than `2 × ttl` after the reservation was made). A
     /// no-op, so a duplicate or reordered settlement never double-counts.
     NotActive,
+    /// Node backend only: the shared store could not apply the settlement
+    /// now (persistent contention or a storage error). Both directions stay
+    /// safe: a deferred commit is queued on this worker and retried on its
+    /// next ledger calls, and a deferred release leaves the reservation held
+    /// until it is reclaimed, an over-count that frees itself after the
+    /// timeout.
+    Deferred,
 }
 
 impl Settlement {
@@ -172,12 +293,15 @@ impl Settlement {
             Settlement::LateCommitted => "late-committed",
             Settlement::LateReleased => "late-released",
             Settlement::NotActive => "not-active",
+            Settlement::Deferred => "deferred",
         }
     }
 }
 
 /// Ledger-wide reservation counters for operator telemetry. Each counter only
-/// ever increases except `active`, which is the current number in flight.
+/// ever increases except `active`, which is the current number in flight. The
+/// node backend keeps these per worker: they count the operations this worker
+/// performed on the shared ledger.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LedgerStats {
     pub active: u64,
@@ -192,6 +316,11 @@ pub struct LedgerStats {
     pub abandoned: u64,
     /// Settlements that matched nothing (duplicate, reordered, or too late).
     pub not_active: u64,
+    /// Node backend: settlements that could not be applied at once.
+    pub deferred: u64,
+    /// Node backend: calls refused (block) or flagged (monitor) because the
+    /// shared ledger stayed contended or failed.
+    pub contended: u64,
 }
 
 /// A denied reservation attempt: the call was NOT reserved and NOT mutated into
@@ -209,15 +338,16 @@ pub struct Denial {
     pub budget: u64,
 }
 
-/// A point-in-time view of one scope's ledger state, for tests and for stamping
-/// diagnostic headers. Not itself part of the decision engine.
+/// A point-in-time view of one scope's ledger state, for tests. Not itself
+/// part of the decision engine.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Snapshot {
     pub committed: u64,
     pub reserved: u64,
 }
 
-/// Why `reserve` refused a call.
+/// Why a ledger operation refused a call.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Refusal {
     /// Admitting the contribution would push the scope over its budget.
@@ -225,6 +355,12 @@ pub enum Refusal {
     /// `scope` is new and the ledger already tracks `max_scopes` scopes, none
     /// of them idle. The call is refused rather than evicting live state.
     AtCapacity,
+    /// Node backend: every compare-and-swap attempt lost to a concurrent
+    /// writer. Nothing was reserved.
+    Contention,
+    /// Node backend: the shared store returned an error or a record it could
+    /// not read. Nothing was reserved.
+    Unavailable,
 }
 
 #[cfg(test)]
@@ -233,30 +369,29 @@ impl Refusal {
     pub fn over_budget(self) -> Denial {
         match self {
             Refusal::OverBudget(denial) => denial,
-            Refusal::AtCapacity => panic!("expected OverBudget, got AtCapacity"),
+            _ => panic!("expected OverBudget"),
         }
     }
 }
 
+#[cfg(test)]
 impl Snapshot {
     pub fn total(&self) -> u64 {
         self.committed.saturating_add(self.reserved)
     }
 }
 
-/// The behavior every backend must provide. `lib.rs` (the PDK-aware filter)
-/// calls the ledger only through this trait (it constructs a `Ledger` once), so
-/// a shared (v2) backend could later implement the same trait without touching
-/// the filter's decision logic — an explicit seam for the roadmap work called out in the module
-/// doc comment, not a claim that such a backend exists today.
+/// The behavior every backend provides. `lib.rs` (the PDK-aware filter) calls
+/// the ledger only through this trait, so the worker and node backends share
+/// the filter's decision logic unchanged.
 ///
-/// Every method first reclaims the scope's expired reservations, under the
-/// same lock as the operation itself.
+/// Every method first reclaims the scope's expired reservations, as part of
+/// the same atomic step as the operation itself.
 pub trait LedgerStore {
     /// Atomically checks `scope`'s committed-plus-reserved exposure against
     /// `budget` and, only if `contribution` fits, reserves it until
-    /// `now + ttl`. On denial, no reservation is made for `scope`. A new scope
-    /// that does not fit under the ledger's scope cap is refused with
+    /// `now + ttl`. On any refusal, no reservation is made for `scope`. A new
+    /// scope that does not fit under the ledger's scope cap is refused with
     /// `AtCapacity`.
     fn reserve(
         &self,
@@ -275,29 +410,33 @@ pub trait LedgerStore {
     /// monitor mode needs the breach signal to raise a policy violation.
     /// `force_reserve` is kept as the simpler, directly-tested primitive
     /// `force_reserve_checked` is documented against (and is deliberately
-    /// NOT implemented by delegating to this method plus a second locked
-    /// read, which would reopen the exact read-then-write race window this
+    /// NOT implemented by delegating to this method plus a second read,
+    /// which would reopen the exact read-then-write race window this
     /// module's whole correctness story is about) — hence `#[allow(dead_code)]`
     /// rather than deleting a real, tested API.
     ///
-    /// `None` only when `scope` is new and the ledger is at its scope cap.
+    /// Refused only for `AtCapacity`, `Contention` or `Unavailable`.
     #[allow(dead_code)]
-    fn force_reserve(&self, scope: &str, contribution: u64, now: u64) -> Option<Reservation>;
+    fn force_reserve(
+        &self,
+        scope: &str,
+        contribution: u64,
+        now: u64,
+    ) -> Result<Reservation, Refusal>;
 
     /// `force_reserve`, plus a breach signal: reserves `contribution`
-    /// against `scope` unconditionally (never denies — monitor mode still
-    /// forwards every call), but also reports whether doing so pushed
-    /// committed-plus-reserved exposure over `budget`. This is what lets
-    /// monitor mode raise the same policy-violation signal a block-mode
-    /// denial would, without actually denying the call. `None` only when
-    /// `scope` is new and the ledger is at its scope cap.
+    /// against `scope` unconditionally (never denies for budget — monitor
+    /// mode still forwards every call), but also reports whether doing so
+    /// pushed committed-plus-reserved exposure over `budget`. This is what
+    /// lets monitor mode raise the same policy-violation signal a block-mode
+    /// denial would, without actually denying the call.
     fn force_reserve_checked(
         &self,
         scope: &str,
         contribution: u64,
         budget: u64,
         now: u64,
-    ) -> Option<(Reservation, bool)>;
+    ) -> Result<(Reservation, bool), Refusal>;
 
     /// Settles a reservation as successful. An active reservation moves its
     /// contribution from `reserved` into `committed`. See `Settlement` for
@@ -314,23 +453,84 @@ pub trait LedgerStore {
     /// budget check and the reserve/commit two-step. Used for a call whose
     /// exposure is known only after it already happened and so can no longer be
     /// denied (e.g. monitor mode's unpriceable-at-request-time cases, or a
-    /// direct audit correction). Returns `false`, recording nothing, only when
-    /// `scope` is new and the ledger is at its scope cap.
-    fn record(&self, scope: &str, contribution: u64, now: u64) -> bool;
+    /// direct audit correction). Refused only for `AtCapacity`, `Contention`
+    /// or `Unavailable`, in which case nothing is recorded.
+    fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal>;
 
-    /// A read-only view of one scope's current state, for diagnostics/tests.
+    /// A read-only view of one scope's current state, for tests.
     /// Never creates an entry, reclaims, or starts a new window period: it
     /// shows the scope as of its last touch. An untracked scope reads as zero.
+    #[cfg(test)]
     fn snapshot(&self, scope: &str) -> Snapshot;
 
     /// The ledger-wide reservation counters.
     fn stats(&self) -> LedgerStats;
+
+    /// How many scopes the ledger currently tracks.
+    #[cfg(test)]
+    fn scope_count(&self) -> usize;
 }
 
 struct Inner {
     scopes: HashMap<String, ScopeState>,
-    next_id: u64,
+    /// Every tracked scope, ordered by `ScopeState::idle_at`, so the scope
+    /// that becomes idle first is always the first entry (P4A review #49).
+    idle_index: BTreeSet<(u64, String)>,
+    next_id: ReservationId,
     stats: LedgerStats,
+    /// How many scope states the capacity path has examined.
+    #[cfg(test)]
+    examined: u64,
+}
+
+impl Inner {
+    /// Moves `scope`'s idle-index entry to its current `idle_at`.
+    fn reindex(&mut self, scope: &str, ttl: u64, window: Option<u64>) {
+        let Some(state) = self.scopes.get_mut(scope) else {
+            return;
+        };
+        let at = state.idle_at(ttl, window);
+        if state.indexed_at == Some(at) {
+            return;
+        }
+        if let Some(old) = state.indexed_at.replace(at) {
+            self.idle_index.remove(&(old, scope.to_string()));
+        }
+        self.idle_index.insert((at, scope.to_string()));
+    }
+
+    /// Makes room for one new scope by evicting the scope that becomes idle
+    /// first, if it is idle by `now`. Examines at most one scope state, so a
+    /// refusal at the cap costs one ordered-set lookup, never a scan.
+    fn evict_one(&mut self, now: u64, period: u64, ttl: u64, window: Option<u64>) -> bool {
+        let Some((at, key)) = self.idle_index.first() else {
+            return false;
+        };
+        if *at > now {
+            return false;
+        }
+        let entry = (*at, key.clone());
+        #[cfg(test)]
+        {
+            self.examined += 1;
+        }
+        let idle = match self.scopes.get_mut(&entry.1) {
+            Some(state) => {
+                state.roll(period);
+                count_reclaim(&mut self.stats, state.reclaim(now, ttl));
+                state.is_idle()
+            }
+            None => true,
+        };
+        if idle {
+            self.scopes.remove(&entry.1);
+            self.idle_index.remove(&entry);
+        } else {
+            // Unreachable while the index is exact; refuse rather than scan.
+            self.reindex(&entry.1, ttl, window);
+        }
+        idle
+    }
 }
 
 /// The per-worker ledger: an in-process, mutex-serialized `HashMap` of scope states.
@@ -342,11 +542,11 @@ struct Inner {
 /// the budget under a race.
 ///
 /// Cardinality is bounded by `max_scopes`. When a NEW scope arrives at the cap,
-/// expired reservations are reclaimed across the ledger and then one idle scope
-/// (see `ScopeState::is_idle`) is evicted to make room; if every tracked scope
-/// still holds committed or reserved exposure, the new scope is refused
-/// instead. Live enforcement state is never evicted, so the cap can never be
-/// used to reset another scope's running total.
+/// the scope that becomes idle first (see `ScopeState::is_idle` and
+/// `idle_at`) is evicted if it is idle now; otherwise the new scope is
+/// refused. Live enforcement state is never evicted, so the cap can never be
+/// used to reset another scope's running total, and a refusal at the cap costs
+/// O(log n), not a scan of every scope.
 pub struct Ledger {
     inner: Mutex<Inner>,
     max_scopes: usize,
@@ -381,8 +581,11 @@ impl Ledger {
         Ledger {
             inner: Mutex::new(Inner {
                 scopes: HashMap::new(),
+                idle_index: BTreeSet::new(),
                 next_id: 1,
                 stats: LedgerStats::default(),
+                #[cfg(test)]
+                examined: 0,
             }),
             max_scopes,
             ttl,
@@ -391,7 +594,7 @@ impl Ledger {
     }
 
     fn period(&self, now: u64) -> u64 {
-        self.window.map_or(0, |window| now / window)
+        period(self.window, now)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -406,46 +609,37 @@ impl Ledger {
     }
 
     /// Runs `f` on `scope`'s state, creating it if needed, after reclaiming
-    /// its expired reservations. Returns `None`, without running `f`, if
-    /// `scope` is new and there is no room for it. The capacity check, any
+    /// its expired reservations. Returns `AtCapacity`, without running `f`,
+    /// if `scope` is new and there is no room for it. The capacity check, any
     /// reclamation or eviction, and `f` all happen under one lock.
     fn with_state<R>(
         &self,
         scope: &str,
         now: u64,
-        f: impl FnOnce(&mut ScopeState, &mut u64, &mut LedgerStats) -> R,
-    ) -> Option<R> {
+        f: impl FnOnce(&mut ScopeState, &mut ReservationId, &mut LedgerStats) -> Result<R, Refusal>,
+    ) -> Result<R, Refusal> {
         let mut guard = self.lock();
         let inner = &mut *guard;
         let period = self.period(now);
-        if !inner.scopes.contains_key(scope) && inner.scopes.len() >= self.max_scopes {
-            for state in inner.scopes.values_mut() {
-                state.roll(period);
-                count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
-            }
-            let idle = inner
-                .scopes
-                .iter()
-                .find(|(_, state)| state.is_idle())
-                .map(|(key, _)| key.clone());
-            match idle {
-                Some(key) => {
-                    inner.scopes.remove(&key);
-                }
-                None => return None,
-            }
+        if !inner.scopes.contains_key(scope)
+            && inner.scopes.len() >= self.max_scopes
+            && !inner.evict_one(now, period, self.ttl, self.window)
+        {
+            return Err(Refusal::AtCapacity);
         }
         let state = inner.scopes.entry(scope.to_string()).or_default();
         state.roll(period);
         count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
-        Some(f(state, &mut inner.next_id, &mut inner.stats))
+        let result = f(state, &mut inner.next_id, &mut inner.stats);
+        inner.reindex(scope, self.ttl, self.window);
+        result
     }
 
     /// Adds a new active reservation to `state`.
     fn hold(
         &self,
         state: &mut ScopeState,
-        next_id: &mut u64,
+        next_id: &mut ReservationId,
         stats: &mut LedgerStats,
         scope: &str,
         contribution: u64,
@@ -453,23 +647,8 @@ impl Ledger {
     ) -> Reservation {
         let id = *next_id;
         *next_id += 1;
-        let expires_at = now.saturating_add(self.ttl);
-        state.reserved = state.reserved.saturating_add(contribution);
-        state.active.insert(
-            id,
-            Held {
-                contribution,
-                expires_at,
-            },
-        );
         stats.active += 1;
-        Reservation {
-            id,
-            scope: scope.to_string(),
-            contribution,
-            created_at: now,
-            expires_at,
-        }
+        state.hold(id, scope, contribution, now, self.ttl)
     }
 
     /// Settles `reservation` on its EXISTING scope. An untracked scope
@@ -477,59 +656,54 @@ impl Ledger {
     fn settle(&self, reservation: &Reservation, now: u64, commit: bool) -> Settlement {
         let mut guard = self.lock();
         let inner = &mut *guard;
-        let stats = &mut inner.stats;
         let outcome = match inner.scopes.get_mut(&reservation.scope) {
             None => Settlement::NotActive,
             Some(state) => {
                 // A commit lands in the current window period.
                 state.roll(self.period(now));
-                // Settlement first, reclamation second: a response that lands
-                // before the scope is next touched still settles normally,
-                // even if its deadline has technically passed.
-                let outcome = if let Some(held) = state.active.remove(&reservation.id) {
-                    state.reserved = state.reserved.saturating_sub(held.contribution);
-                    stats.active = stats.active.saturating_sub(1);
-                    if commit {
-                        state.committed = state.committed.saturating_add(held.contribution);
-                        Settlement::Committed
-                    } else {
-                        Settlement::Released
-                    }
-                } else if let Some(held) = state.reclaimed.remove(&reservation.id) {
-                    if commit {
-                        state.committed = state.committed.saturating_add(held.contribution);
-                        Settlement::LateCommitted
-                    } else {
-                        Settlement::LateReleased
-                    }
-                } else {
-                    Settlement::NotActive
-                };
-                count_reclaim(stats, state.reclaim(now, self.ttl));
+                let outcome = state.settle(reservation.id, commit);
+                count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
                 outcome
             }
         };
-        match outcome {
-            Settlement::Committed => stats.committed += 1,
-            Settlement::Released => stats.released += 1,
-            Settlement::LateCommitted => stats.late_committed += 1,
-            Settlement::LateReleased => stats.late_released += 1,
-            Settlement::NotActive => stats.not_active += 1,
-        }
+        inner.reindex(&reservation.scope, self.ttl, self.window);
+        count_settlement(&mut inner.stats, outcome);
         outcome
     }
 
-    /// How many scopes the ledger currently tracks.
+    /// How many scope states the capacity path has examined so far.
     #[cfg(test)]
-    pub fn scope_count(&self) -> usize {
-        self.lock().scopes.len()
+    pub fn examined(&self) -> u64 {
+        self.lock().examined
     }
 }
 
-fn count_reclaim(stats: &mut LedgerStats, (expired, abandoned): (u64, u64)) {
+/// The window period `now` falls in (always 0 without a window).
+pub(crate) fn period(window: Option<u64>, now: u64) -> u64 {
+    window.map_or(0, |window| now / window)
+}
+
+pub(crate) fn count_reclaim(stats: &mut LedgerStats, (expired, abandoned): (u64, u64)) {
     stats.active = stats.active.saturating_sub(expired);
     stats.expired += expired;
     stats.abandoned += abandoned;
+}
+
+pub(crate) fn count_settlement(stats: &mut LedgerStats, outcome: Settlement) {
+    match outcome {
+        Settlement::Committed => {
+            stats.active = stats.active.saturating_sub(1);
+            stats.committed += 1
+        }
+        Settlement::Released => {
+            stats.active = stats.active.saturating_sub(1);
+            stats.released += 1
+        }
+        Settlement::LateCommitted => stats.late_committed += 1,
+        Settlement::LateReleased => stats.late_released += 1,
+        Settlement::NotActive => stats.not_active += 1,
+        Settlement::Deferred => stats.deferred += 1,
+    }
 }
 
 impl LedgerStore for Ledger {
@@ -541,25 +715,19 @@ impl LedgerStore for Ledger {
         now: u64,
     ) -> Result<Reservation, Refusal> {
         self.with_state(scope, now, |state, next_id, stats| {
-            let current_total = state.total();
-            let would_be_total = current_total.saturating_add(contribution);
-            if would_be_total > budget {
-                return Err(Refusal::OverBudget(Denial {
-                    scope: scope.to_string(),
-                    contribution,
-                    current_total,
-                    would_be_total,
-                    budget,
-                }));
-            }
+            state.check(scope, contribution, budget)?;
             Ok(self.hold(state, next_id, stats, scope, contribution, now))
         })
-        .unwrap_or(Err(Refusal::AtCapacity))
     }
 
-    fn force_reserve(&self, scope: &str, contribution: u64, now: u64) -> Option<Reservation> {
+    fn force_reserve(
+        &self,
+        scope: &str,
+        contribution: u64,
+        now: u64,
+    ) -> Result<Reservation, Refusal> {
         self.with_state(scope, now, |state, next_id, stats| {
-            self.hold(state, next_id, stats, scope, contribution, now)
+            Ok(self.hold(state, next_id, stats, scope, contribution, now))
         })
     }
 
@@ -569,10 +737,11 @@ impl LedgerStore for Ledger {
         contribution: u64,
         budget: u64,
         now: u64,
-    ) -> Option<(Reservation, bool)> {
+    ) -> Result<(Reservation, bool), Refusal> {
         self.with_state(scope, now, |state, next_id, stats| {
             let reservation = self.hold(state, next_id, stats, scope, contribution, now);
-            (reservation, state.total() > budget)
+            let breached = reservation.total > budget;
+            Ok((reservation, breached))
         })
     }
 
@@ -584,21 +753,19 @@ impl LedgerStore for Ledger {
         self.settle(reservation, now, false)
     }
 
-    fn record(&self, scope: &str, contribution: u64, now: u64) -> bool {
+    fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal> {
         self.with_state(scope, now, |state, _, _| {
-            state.committed = state.committed.saturating_add(contribution);
+            state.record(contribution);
+            Ok(())
         })
-        .is_some()
     }
 
+    #[cfg(test)]
     fn snapshot(&self, scope: &str) -> Snapshot {
         self.lock()
             .scopes
             .get(scope)
-            .map(|state| Snapshot {
-                committed: state.committed,
-                reserved: state.reserved,
-            })
+            .map(ScopeState::snapshot)
             .unwrap_or(Snapshot {
                 committed: 0,
                 reserved: 0,
@@ -607,6 +774,11 @@ impl LedgerStore for Ledger {
 
     fn stats(&self) -> LedgerStats {
         self.lock().stats
+    }
+
+    #[cfg(test)]
+    fn scope_count(&self) -> usize {
+        self.lock().scopes.len()
     }
 }
 
@@ -901,7 +1073,7 @@ mod test {
     fn record_bypasses_the_budget_check_entirely() {
         let ledger = Ledger::new();
         // record() has no budget parameter: it cannot be denied by construction.
-        ledger.record("s", 10_000, 0);
+        ledger.record("s", 10_000, 0).unwrap();
         assert_eq!(ledger.snapshot("s").committed, 10_000);
     }
 
@@ -1121,7 +1293,7 @@ mod test {
     #[test]
     fn an_overflowing_sum_is_denied_rather_than_wrapping() {
         let ledger = Ledger::new();
-        ledger.record("s", u64::MAX - 1, 0);
+        ledger.record("s", u64::MAX - 1, 0).unwrap();
         let denial = ledger
             .reserve("s", 10, u64::MAX - 1, 0)
             .unwrap_err()
@@ -1137,7 +1309,7 @@ mod test {
     #[test]
     fn force_reserve_checked_saturates_and_reports_the_breach() {
         let ledger = Ledger::new();
-        ledger.record("s", u64::MAX, 0);
+        ledger.record("s", u64::MAX, 0).unwrap();
         let (reservation, breached) = ledger.force_reserve_checked("s", 5, 1000, 0).unwrap();
         assert!(breached);
         assert_eq!(ledger.snapshot("s").total(), u64::MAX);
@@ -1165,6 +1337,62 @@ mod test {
     }
 
     #[test]
+    fn a_refusal_at_capacity_examines_at_most_one_scope_however_many_are_live() {
+        // P4A review #49 A: 100k live (non-idle) scopes, then 1000 new
+        // identities. Each refusal must cost an index lookup, not a scan.
+        const LIVE: usize = 100_000;
+        let ledger = Ledger::with_max_scopes(LIVE);
+        for i in 0..LIVE {
+            let r = ledger.reserve(&format!("live-{i}"), 1, 10, 0).unwrap();
+            ledger.commit(&r, 0);
+        }
+        assert_eq!(ledger.examined(), 0, "filling the ledger never evicts");
+        for i in 0..1000 {
+            assert_eq!(
+                ledger.reserve(&format!("new-{i}"), 1, 10, 1).unwrap_err(),
+                Refusal::AtCapacity
+            );
+        }
+        // Committed exposure without a window never goes idle, so the index
+        // head is never even due: no scope state is examined at all.
+        assert_eq!(ledger.examined(), 0);
+        assert_eq!(ledger.scope_count(), LIVE);
+
+        // With a window, the head is due once the period ends; it is
+        // examined once and evicted, and the next refusal is again O(1).
+        let windowed = Ledger::with_limits(2, TEST_TTL, Some(DAY));
+        for scope in ["a", "b"] {
+            let r = windowed.reserve(scope, 1, 10, 0).unwrap();
+            windowed.commit(&r, 0);
+        }
+        let _live = windowed.reserve("c", 1, 10, DAY).unwrap();
+        assert_eq!(windowed.examined(), 1, "one stale scope evicted for c");
+        assert!(windowed.reserve("d", 1, 10, DAY).is_ok());
+        assert_eq!(windowed.examined(), 2, "the other stale scope for d");
+        assert_eq!(
+            windowed.reserve("e", 1, 10, DAY).unwrap_err(),
+            Refusal::AtCapacity
+        );
+        assert_eq!(windowed.examined(), 2, "nothing due: refused unexamined");
+    }
+
+    #[test]
+    fn the_idle_index_follows_every_settlement() {
+        let ledger = Ledger::with_max_scopes(1);
+        let r = ledger.reserve("a", 5, 100, 0).unwrap();
+        // In flight until 2 * TTL at the latest.
+        assert_eq!(
+            ledger.reserve("b", 1, 100, 1).unwrap_err(),
+            Refusal::AtCapacity
+        );
+        // Released at once: idle now, so the next new scope may take its slot.
+        ledger.release(&r, 2);
+        assert!(ledger.reserve("b", 1, 100, 3).is_ok());
+        assert_eq!(ledger.snapshot("a").total(), 0);
+        assert_eq!(ledger.scope_count(), 1);
+    }
+
+    #[test]
     fn a_full_ledger_refuses_a_new_scope_when_no_scope_is_idle() {
         let ledger = Ledger::with_max_scopes(2);
         let a = ledger.reserve("a", 10, 100, 0).unwrap();
@@ -1174,8 +1402,11 @@ mod test {
             ledger.reserve("c", 10, 100, 0),
             Err(Refusal::AtCapacity)
         ));
-        assert!(ledger.force_reserve_checked("c", 10, 100, 0).is_none());
-        assert!(!ledger.record("c", 10, 0));
+        assert_eq!(
+            ledger.force_reserve_checked("c", 10, 100, 0),
+            Err(Refusal::AtCapacity)
+        );
+        assert_eq!(ledger.record("c", 10, 0), Err(Refusal::AtCapacity));
         assert_eq!(ledger.scope_count(), 2);
         // Neither live scope lost its state to make room.
         assert_eq!(ledger.snapshot("a").committed, 10);
@@ -1213,13 +1444,14 @@ mod test {
     }
 
     /// A reservation this ledger never issued.
-    fn forged(scope: &str, id: u64, contribution: u64) -> Reservation {
+    fn forged(scope: &str, id: ReservationId, contribution: u64) -> Reservation {
         Reservation {
             id,
             scope: scope.to_string(),
             contribution,
             created_at: 0,
             expires_at: TEST_TTL,
+            total: contribution,
         }
     }
 
@@ -1302,7 +1534,7 @@ mod test {
         let r = ledger.reserve("s", 800, 3000, 0).unwrap();
         // Another call at the deadline reclaims it.
         assert_eq!(ledger.snapshot("s").reserved, 800);
-        ledger.record("s", 0, TEST_TTL);
+        ledger.record("s", 0, TEST_TTL).unwrap();
         assert_eq!(ledger.snapshot("s").reserved, 0);
         // Then the slow upstream succeeds: the call happened, so it is charged.
         assert_eq!(ledger.commit(&r, TEST_TTL + 1), Settlement::LateCommitted);
@@ -1315,7 +1547,7 @@ mod test {
     fn a_late_release_after_reclaim_changes_nothing() {
         let ledger = Ledger::new();
         let r = ledger.reserve("s", 800, 3000, 0).unwrap();
-        ledger.record("s", 0, TEST_TTL);
+        ledger.record("s", 0, TEST_TTL).unwrap();
         assert_eq!(ledger.release(&r, TEST_TTL + 1), Settlement::LateReleased);
         assert_eq!(ledger.snapshot("s").total(), 0);
     }
@@ -1334,9 +1566,9 @@ mod test {
     fn a_cancelled_request_is_counted_abandoned_and_a_very_late_settlement_is_dropped() {
         let ledger = Ledger::new();
         let r = ledger.reserve("s", 800, 3000, 0).unwrap();
-        ledger.record("s", 0, TEST_TTL);
+        ledger.record("s", 0, TEST_TTL).unwrap();
         assert_eq!(ledger.stats().abandoned, 0, "tombstone still held");
-        ledger.record("s", 0, 2 * TEST_TTL);
+        ledger.record("s", 0, 2 * TEST_TTL).unwrap();
         assert_eq!(ledger.stats().abandoned, 1);
         // Past 2 × ttl the ledger no longer knows the reservation.
         assert_eq!(ledger.commit(&r, 2 * TEST_TTL + 1), Settlement::NotActive);
@@ -1354,9 +1586,9 @@ mod test {
         ledger.commit(&committed, 1);
         ledger.release(&released, 1);
         ledger.commit(&committed, 2);
-        ledger.record("s", 0, TEST_TTL);
+        ledger.record("s", 0, TEST_TTL).unwrap();
         ledger.commit(&late, TEST_TTL + 1);
-        ledger.record("s", 0, 2 * TEST_TTL);
+        ledger.record("s", 0, 2 * TEST_TTL).unwrap();
         assert_eq!(
             ledger.stats(),
             LedgerStats {
@@ -1368,6 +1600,7 @@ mod test {
                 late_released: 0,
                 abandoned: 1,
                 not_active: 1,
+                ..LedgerStats::default()
             }
         );
     }

@@ -39,6 +39,8 @@ fn gate(overrides: Value) -> PolicyConfig {
         "identitySource": "trusted-header",
         "identityField": "client_id",
         "scopeHeader": "x-agent-id",
+        "ledgerBackend": "node",
+        "ledgerNamespace": "",
         "maxScopes": 10000,
         "reservationTimeoutMs": 60000,
         "scopeDisclosure": "raw",
@@ -66,6 +68,14 @@ fn gate(overrides: Value) -> PolicyConfig {
 }
 
 async fn start(policies: Vec<PolicyConfig>) -> anyhow::Result<(TestComposite, String, HttpMock)> {
+    start_with_env(policies, Vec::new()).await
+}
+
+/// `start`, with extra environment variables for the Flex container.
+async fn start_with_env(
+    policies: Vec<PolicyConfig>,
+    env: Vec<(&str, &str)>,
+) -> anyhow::Result<(TestComposite, String, HttpMock)> {
     let httpmock_config = HttpMockConfig::builder()
         .port(80)
         .version("latest")
@@ -86,6 +96,7 @@ async fn start(policies: Vec<PolicyConfig>) -> anyhow::Result<(TestComposite, St
             (POLICY_DIR, "custom-policies"),
             (COMMON_CONFIG_DIR, "common"),
         ])
+        .env(env)
         .build();
     let composite = TestComposite::builder()
         .with_service(flex_config)
@@ -622,13 +633,13 @@ fn envoy_layout(container: &str) -> Value {
     })
 }
 
-/// Case 8: once the gateway has settled, fire many parallel calls over separate
-/// connections and record how many the per-worker ledgers admit. Observational:
-/// no fixed number asserted.
+/// Case 8 (`ledgerBackend: worker`): once the gateway has settled, fire many
+/// parallel calls over separate connections and record how many the per-worker
+/// ledgers admit. Observational: no fixed number asserted.
 #[pdk_test]
 #[ignore]
 async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
-    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
+    let (_c, url, httpmock) = start(vec![gate(json!({"ledgerBackend": "worker"}))]).await?;
     let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
     let upstream = ok_mock(&server);
     let container = flex_container()?;
@@ -662,7 +673,7 @@ async fn case8_observe_the_per_worker_budget() -> anyhow::Result<()> {
 #[pdk_test]
 #[ignore]
 async fn case8b_config_apply_resets_the_ledger() -> anyhow::Result<()> {
-    let (_c, url, httpmock) = start(vec![gate(json!({}))]).await?;
+    let (_c, url, httpmock) = start(vec![gate(json!({"ledgerBackend": "worker"}))]).await?;
     let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
     let _upstream = ok_mock(&server);
     let container = flex_container()?;
@@ -692,6 +703,92 @@ async fn case8b_config_apply_resets_the_ledger() -> anyhow::Result<()> {
         }),
     );
     anyhow::ensure!(exhaust.other == 0, "case 8b transport errors");
+    Ok(())
+}
+
+/// Case 8n (`ledgerBackend: node`): the same burst as case 8, on four Envoy
+/// workers. The node ledger is one budget for the replica, so exactly
+/// `3000 / 800 = 3` calls are admitted however the connections spread.
+#[pdk_test]
+#[ignore]
+async fn case8n_the_node_ledger_admits_exactly_one_budget_across_workers() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start_with_env(
+        vec![gate(json!({"ledgerBackend": "node"}))],
+        vec![("FLEX_SERVICE_ENVOY_CONCURRENCY", "4")],
+    )
+    .await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let upstream = ok_mock(&server);
+    let container = flex_container()?;
+    let settle = wait_for_config_applies(&container, 2, Duration::from_secs(30)).await?;
+    let result = burst(&url, "broker-7").await?;
+    let hits = upstream.hits();
+    let envoy = envoy_layout(&container);
+    let pass =
+        result.admitted == 3 && result.refused == BURST_CALLS - 3 && result.other == 0 && hits == 3;
+    record(
+        "8n-node-ledger-one-budget",
+        if pass { "pass" } else { "fail" },
+        json!({
+            "calls": BURST_CALLS, "expected_admitted": 3,
+            "burst": result.to_json(), "upstream_hits": hits,
+            "settle": settle, "envoy": envoy
+        }),
+    );
+    anyhow::ensure!(
+        pass,
+        "case 8n: admitted {} refused {} other {} hits {}",
+        result.admitted,
+        result.refused,
+        result.other,
+        hits
+    );
+    Ok(())
+}
+
+/// Case 8nb (`ledgerBackend: node`): exhaust a scope as soon as the gateway
+/// answers, wait for the second startup config apply (which rebuilds the wasm
+/// VMs), then call the same scope again. The node ledger lives in the
+/// gateway's shared data, outside the VMs, so the scope should stay exhausted.
+/// Observational: whether the burst lands before the apply depends on timing,
+/// so the config-apply counts around the burst are recorded too.
+#[pdk_test]
+#[ignore]
+async fn case8nb_the_node_ledger_survives_a_config_apply() -> anyhow::Result<()> {
+    let (_c, url, httpmock) = start_with_env(
+        vec![gate(json!({"ledgerBackend": "node"}))],
+        vec![("FLEX_SERVICE_ENVOY_CONCURRENCY", "4")],
+    )
+    .await?;
+    let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let _upstream = ok_mock(&server);
+    let container = flex_container()?;
+    let before = gateway_log_counts(&container)?;
+    let exhaust = burst(&url, "broker-7").await?;
+    let after_exhaust = gateway_log_counts(&container)?;
+    let settle = wait_for_config_applies(&container, 2, Duration::from_secs(30)).await?;
+    let c = client()?;
+    let mut probe = Vec::new();
+    for id in 1..=4 {
+        let w = send(&c, &url, 1000 + id, &[("x-agent-id", "broker-7")]).await?;
+        probe.push(json!({"status": w.status, "rpc_error": w.rpc_error, "stamp": w.stamp}));
+    }
+    let survived = probe.iter().all(|w| w["rpc_error"] == json!(-32008));
+    let apply_between =
+        after_exhaust["configuration_applied"].as_u64() < settle["configuration_applied"].as_u64();
+    record(
+        "8nb-node-ledger-survives-config-apply",
+        "observed",
+        json!({
+            "exhaust_burst": exhaust.to_json(),
+            "applies_before_exhaust": before["configuration_applied"],
+            "applies_after_exhaust": after_exhaust["configuration_applied"],
+            "apply_between_exhaust_and_probe": apply_between,
+            "settle": settle, "probe_same_scope": probe, "ledger_survived": survived,
+            "envoy": envoy_layout(&container)
+        }),
+    );
+    anyhow::ensure!(exhaust.other == 0, "case 8nb transport errors");
     Ok(())
 }
 
