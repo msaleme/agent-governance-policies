@@ -158,7 +158,7 @@ Every pull request and every push to `main` runs the
 The packaging and runtime jobs need repository secrets, so pull requests from
 forks skip them.
 
-Current library test counts: **67** for Approval-to-Execution Binding and **185**
+Current library test counts: **67** for Approval-to-Execution Binding and **190**
 for the aggregate-risk gate.
 
 To run the CI's `policies` checks locally, from a policy directory:

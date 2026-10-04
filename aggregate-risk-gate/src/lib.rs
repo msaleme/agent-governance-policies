@@ -1260,7 +1260,7 @@ async fn request_filter(
 }
 
 /// Milliseconds since the Unix epoch. A clock before the epoch reads as 0.
-fn epoch_ms(time: SystemTime) -> u64 {
+pub(crate) fn epoch_ms(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
@@ -1355,6 +1355,7 @@ async fn configure(
         )
     })?;
 
+    let clock = std::rc::Rc::new(clock);
     let gate = Gate::from_config_with(&config, |namespace| {
         let storage = match namespace {
             None => store_builder.local(NODE_LEDGER_STORE),
@@ -1363,7 +1364,10 @@ async fn configure(
                 .shared()
                 .local(format!("aggregate-risk-gate-ledger-{namespace}")),
         };
-        Box::new(PdkStore(storage))
+        Box::new(PdkStore {
+            storage,
+            clock: clock.clone(),
+        })
     })?;
     if gate
         .governed_methods

@@ -27,7 +27,11 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   denies with `reason=ledger-contention`; a storage error denies with `reason=ledger-unavailable`;
   monitor mode forwards both and flags them. Settlement keeps the #17 rules across workers and is
   safe by direction: an unwritable commit is queued and retried (`settlement=deferred`, and a
-  long queue refuses new reservations), and an unwritable release stays held until reclaimed.
+  long queue refuses new reservations) and is charged even after its reservation is reclaimed; a
+  commit whose record reads as missing within the reservation's lifetime is charged, not dropped;
+  and an unwritable release stays held until reclaimed. Only the cleanup pass that marks a
+  tombstone deletes it, timed on the gateway clock. Remaining known edges are listed in the policy
+  README.
   Keys are an HMAC of the scope, never the raw identity, private to the policy instance unless the
   new `ledgerNamespace` is set. Stale keys are deleted, and `maxScopes` is enforced per replica
   without evicting live state. `worker` keeps the old per-worker ledger, whose multiplier and
@@ -43,7 +47,7 @@ Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
   uninspectable, so a `tools/call` can't be hidden by an encoding the upstream decodes
   differently, such as `utf-7`. A body the JSON parser rejects (nesting too deep, a lone
   surrogate, a BOM) is now unpriceable instead of being charged as a single call.
-- Library tests: 185 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
+- Library tests: 190 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
   under `spend-amount` in block mode. New real-gateway cases: `case8n` asserts exactly 3 of 200
   admitted across four Envoy workers with the node ledger, and `case8nb` records whether the node
   ledger survives the startup config apply.

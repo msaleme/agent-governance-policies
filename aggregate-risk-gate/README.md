@@ -427,10 +427,15 @@ read-then-write fallback and no unconditional overwrite. Concretely:
   `reason=ledger-contention`; a storage error denies with `reason=ledger-unavailable`. `monitor`
   mode forwards either and stamps the reason. Nothing is reserved in either case.
 - **Settlement is safe by direction.** A commit that cannot be written is queued on the worker and
-  retried on its next calls, stamped `settlement=deferred`; while 256 or more commits are queued,
-  new reservations are refused as contended, so committed exposure is never dropped silently. A
+  retried on its next calls, stamped `settlement=deferred`, and is charged even if its reservation
+  has meanwhile been reclaimed; while 256 or more commits are queued, new reservations are refused
+  as contended. A commit whose record reads as missing while the reservation could still be on it
+  (PDK reports a host read error as "no value") is charged as a late commit rather than dropped. A
   release that cannot be written leaves the reservation held until it is reclaimed: an over-count
   that frees itself after `reservationTimeoutMs`.
+- **Cleanup never deletes live state.** An idle record becomes a tombstone by compare-and-swap,
+  and only the cleanup pass that marked a tombstone for deletion deletes it, at once. Tombstones
+  are timed on the gateway clock read at that moment, not on the request's start time.
 - **Keys carry no identity.** A record is stored under an HMAC-SHA256 of the scope (under
   `scopeDigestKey`), never the raw identity. Records are private to the policy instance unless
   `ledgerNamespace` is set.
@@ -439,10 +444,27 @@ read-then-write fallback and no unconditional overwrite. Concretely:
   that rebuilds the listener (which resets the worker ledger) keeps the node ledger is **not yet
   verified on a real gateway**: the shared data lives outside the wasm VMs, so it should survive,
   and `case8nb` in `tests/connected_e2e.rs` records what a real Flex 1.14.0 gateway does.
-- **Known edges.** A scope slot whose release exhausts its retries stays counted against
-  `maxScopes`, so fewer scopes fit (never more state evicted). A worker that stalls between its read
-  and its write for longer than 30 s across a cleanup pass could re-create a deleted record without
-  taking a slot. Neither can admit more than the budget.
+- **Known edges.**
+  - The commit queue lives in the worker's VM. It is retried only when that worker next handles a
+    governed call (there is no timer), and it is lost if the VM is restarted. While a commit
+    waits, other workers keep admitting against a total that still holds it as reserved until it
+    is reclaimed after `reservationTimeoutMs`.
+  - A duplicate commit of an already-settled reservation whose first read hits a host storage
+    error is charged again as a late commit. This over-counts and never under-counts. The filter
+    settles each reservation once, so it does not send duplicates itself.
+  - A scope slot whose release exhausts its retries stays counted against `maxScopes`, and nothing
+    recounts it, so fewer scopes fit (never more state evicted).
+  - A worker that stalls between its read and its write across a whole cleanup pass could re-create
+    a deleted record without taking a slot. A cleanup pass stalled for more than 10 minutes between
+    marking a tombstone and deleting it could delete a record re-created meanwhile. Each wasm VM is
+    single-threaded and these are back-to-back host calls, so both are very unlikely.
+  - Instances that share a `ledgerNamespace` must use the same `scopeDigestKey`,
+    `reservationTimeoutMs`, window and `maxScopes`. Nothing checks this, and rotating the key
+    orphans the old records until cleanup removes them.
+  - A storage status other than success or a CAS conflict panics inside PDK, which fails the call.
+  - One hot scope serialises every worker on one record, and a record grows with its in-flight
+    reservations. A cleanup pass scans the whole namespace inside the call that runs it, at most
+    once a second per replica.
 
 **`ledgerBackend: worker`.** One in-process ledger per Envoy worker, backed by a mutex-serialized
 map, as in earlier builds. It is race-safe within a worker (the concurrent-admission unit test
@@ -484,7 +506,7 @@ placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 185 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 190 tests, none of which touch the network or
 Docker:
 
 - **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 53 tests): correctness of
@@ -515,7 +537,7 @@ Docker:
   without a window nothing resets; and a scope from an earlier period can be evicted.
   Two cover the cost of the cap (#49 A): 1,000 refusals against 100,000 live scopes examine no
   scope at all, and the idle index follows every settlement.
-- **`src/node_ledger.rs` — the node-wide ledger** (17 tests, over an in-memory test store that can
+- **`src/node_ledger.rs` — the node-wide ledger** (22 tests, over an in-memory test store that can
   force CAS conflicts and storage errors): two workers racing on every write admit exactly 3 of the
   reference calls, and interleaved workers admit exactly what fits; persistent CAS mismatch is
   `Contention` and a storage error `Unavailable`, both reserving nothing; a reservation made on
@@ -523,7 +545,11 @@ Docker:
   are unique across workers; the store never holds a raw identity; a window rollover resets
   every worker's view; at the cap an idle scope is swept and live state kept, a refusal costs at
   most three store operations with 1,000 live scopes, and a settlement that leaves a scope idle
-  lets the next new scope in; stale keys are deleted and a doomed record is never written over;
+  lets the next new scope in; stale keys are deleted, a doomed record is never written over or
+  deleted by a writer, a cleanup whose delete fails restores the tombstone, tombstones age on the
+  store clock rather than a stale request time, and a swept scope keeps its window period; a
+  commit whose record reads as missing is still charged, and a queued commit is charged even after
+  its tombstone is dropped;
   and an unwritable commit is queued, an unwritable release stays held, and a long commit queue
   refuses new reservations.
 - **`src/lib.rs` — the PDK filter** (115 tests), mostly exercised end to end through the

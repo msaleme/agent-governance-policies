@@ -99,6 +99,18 @@ impl ScopeState {
     /// tombstone, so it holds no enforcement state: dropping it and re-creating
     /// it later at zero is indistinguishable from keeping it. Only idle scopes
     /// are ever evicted.
+    /// An empty state that starts in window `period`.
+    pub(crate) fn at_period(period: u64) -> Self {
+        ScopeState {
+            period,
+            ..ScopeState::default()
+        }
+    }
+
+    pub(crate) fn period(&self) -> u64 {
+        self.period
+    }
+
     pub(crate) fn is_idle(&self) -> bool {
         self.committed == 0 && self.active.is_empty() && self.reclaimed.is_empty()
     }

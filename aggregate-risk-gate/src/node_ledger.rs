@@ -33,9 +33,13 @@
 // at most one O(n) scan per `MIN_RESCAN_MS` per replica. A scan turns each idle
 // scope into a `Vacant` tombstone by CAS (a concurrent writer's CAS then fails
 // and it retries) and frees its slot; a `Vacant` record older than `GRACE_MS` is
-// CAS'd to `Doomed`, which no writer ever writes over, and then deleted. Live
-// state is never evicted. The same scan runs every `GC_INTERVAL_MS` so stale
-// keys are deleted even below the cap.
+// CAS'd to `Doomed`, which no writer ever writes over, and deleted at once by the
+// sweep that won that CAS and by nobody else (if the delete fails, that sweep
+// CASes it back to `Vacant`; a `Doomed` left older than `RECOVER_MS` is CAS'd
+// back to `Vacant`, never deleted). Tombstones are stamped and aged on the
+// store's clock read at that moment, not on the request's possibly stale `now`.
+// Live state is never evicted. The same scan runs every `GC_INTERVAL_MS` so
+// stale keys are deleted even below the cap.
 //
 // Reservation ids carry a random 64-bit per-worker prefix and a counter, so a
 // reservation made on worker A can be settled by id on worker B (the response
@@ -43,16 +47,35 @@
 // late settlement while the tombstone is held, `NotActive` otherwise.
 //
 // Settlement exhaustion is safe by direction. A commit that cannot be written is
-// queued on this worker and retried at the start of its next ledger calls; while
-// that queue is long, new reservations are refused, so exposure is never lost
-// silently. A release that cannot be written leaves the reservation held until
-// it is reclaimed: an over-count that frees itself after the timeout.
+// queued on this worker and retried at the start of its next ledger calls, and a
+// queued commit is charged even if its reservation has meanwhile been reclaimed
+// and dropped; while that queue is long, new reservations are refused. A commit
+// whose record reads as missing while the reservation could still be on it (PDK
+// reports a host read error as "no value") is charged too, never dropped. A
+// release that cannot be written leaves the reservation held until it is
+// reclaimed: an over-count that frees itself after the timeout.
 //
-// Known edges, documented rather than hidden: a slot whose decrement exhausts its
-// retries stays counted (fewer scopes fit, never more state evicted); and a
-// writer that stalls between its get and its CAS for longer than `GRACE_MS`
-// across a sweep could re-create a deleted record without a slot. Neither can
-// over-admit a budget.
+// Known edges, documented rather than hidden:
+// - The commit queue lives in the worker's VM: it is retried only when that
+//   worker next runs a ledger call (there is no timer), it is lost if the VM is
+//   restarted, and while a commit waits other workers keep admitting against a
+//   total that still holds it as reserved, then reclaimed after `ttl`.
+// - A duplicate commit whose first read hits a host error (reported as "no
+//   value") is charged again as a late commit: an over-count, never an under.
+// - A slot whose decrement exhausts its retries stays counted, and nothing
+//   recounts `n`: fewer scopes fit, never more state evicted.
+// - A writer that stalls between its get and its CAS across a whole sweep could
+//   re-create a deleted record without a slot; a sweep stalled for longer than
+//   `RECOVER_MS` between its `Doomed` CAS and its delete could delete a record
+//   re-created after recovery. Single-threaded VMs make both very unlikely.
+// - Workers sharing an explicit `ledgerNamespace` must share the digest key,
+//   `ttl`, `window` and `maxScopes`; nothing checks that, and rotating the key
+//   orphans the old records until they are swept.
+// - A host storage status other than ok or CAS mismatch panics inside PDK.
+// - One hot scope serialises every worker on one key, and a record grows with
+//   its in-flight reservations (no size cap beyond `ttl`).
+// - The sweep scans every key of the namespace inline in the call that runs it
+//   (at most once per `MIN_RESCAN_MS`).
 //
 // Scope of the guarantee: one budget per policy instance per gateway REPLICA,
 // reset when the gateway process restarts. Not shared across replicas, not
@@ -83,6 +106,9 @@ const DRAIN_PER_CALL: usize = 16;
 const PENDING_LIMIT: usize = 256;
 /// How long a `Vacant` tombstone is kept before it is deleted.
 const GRACE_MS: u64 = 30_000;
+/// A `Doomed` record this old was left by a sweep that never finished its
+/// delete; a later sweep turns it back into `Vacant` (by CAS, never a delete).
+const RECOVER_MS: u64 = 600_000;
 /// The shortest gap between two capacity sweeps on one replica.
 const MIN_RESCAN_MS: u64 = 1_000;
 /// The longest a full ledger waits before it rescans.
@@ -120,19 +146,33 @@ pub trait KvStore {
     fn put(&self, key: &str, mode: Put<'_>, value: &[u8]) -> Result<(), StoreError>;
     fn delete(&self, key: &str) -> Result<(), StoreError>;
     fn keys(&self) -> Result<Vec<String>, StoreError>;
+    /// The current time in epoch milliseconds, read at the moment of the
+    /// call. The tombstone protocol uses it instead of the request's `now`,
+    /// which may be older (it is read before the body is buffered). `0`
+    /// means "no clock" and leaves the caller's `now` in force.
+    fn now(&self) -> u64 {
+        0
+    }
 }
 
 /// A scope key's value.
 #[derive(Debug, Serialize, Deserialize)]
 enum Record {
     Scope(ScopeState),
-    /// Swept while idle; its slot is free. Re-used by the next writer.
+    /// Swept while idle; its slot is free. Re-used by the next writer, which
+    /// starts from the swept scope's window `period` (so a writer whose `now`
+    /// is a little stale cannot land a commit in an earlier period).
     Vacant {
         since: u64,
+        #[serde(default)]
+        period: u64,
     },
-    /// Being deleted since `at`; never written over.
+    /// Being deleted by the sweep that wrote it at `at`. No writer writes
+    /// over it and only that sweep deletes it.
     Doomed {
         at: u64,
+        #[serde(default)]
+        period: u64,
     },
 }
 
@@ -159,10 +199,11 @@ fn unavailable(_: StoreError) -> Refusal {
 
 /// What a scope key held when it was read.
 enum Read {
-    /// No record, or a `Vacant` one: a new scope that needs a slot.
-    New(Option<String>),
+    /// No record, or a `Vacant` one (with its CAS and window period): a new
+    /// scope that needs a slot.
+    New(Option<String>, u64),
     Live(ScopeState, String),
-    Doomed(u64),
+    Doomed,
 }
 
 /// The node-wide ledger. One per policy instance per worker, all sharing one
@@ -228,11 +269,11 @@ impl NodeLedger {
 
     fn read(&self, key: &str) -> Result<Read, StoreError> {
         Ok(match self.store.get(key)? {
-            None => Read::New(None),
+            None => Read::New(None, 0),
             Some((bytes, cas)) => match decode::<Record>(&bytes)? {
                 Record::Scope(state) => Read::Live(state, cas),
-                Record::Vacant { .. } => Read::New(Some(cas)),
-                Record::Doomed { at } => Read::Doomed(at),
+                Record::Vacant { period, .. } => Read::New(Some(cas), period),
+                Record::Doomed { .. } => Read::Doomed,
             },
         })
     }
@@ -271,20 +312,25 @@ impl NodeLedger {
             return Err(Refusal::Contention);
         }
         self.maybe_collect(now);
-        let key = self.key(scope);
-        for _ in 0..RESERVE_RETRIES {
-            let (mut state, cas, new) = match self.read(&key).map_err(unavailable)? {
-                Read::Doomed(at) => {
-                    // A sweep is deleting this key. Only once the sweeper is
-                    // surely done may a writer remove it itself; until then
-                    // the call reads again (and is refused as contended if
-                    // the delete never lands within the retries).
-                    if now >= at.saturating_add(GRACE_MS) {
-                        let _ = self.store.delete(&key);
-                    }
-                    continue;
-                }
-                Read::New(cas) => (ScopeState::default(), cas, true),
+        self.mutate_core(&self.key(scope), now, RESERVE_RETRIES, f)
+    }
+
+    /// The CAS loop itself, with no draining or collection, so a queued
+    /// commit can be charged through it from `drain_pending`.
+    fn mutate_core<R>(
+        &self,
+        key: &str,
+        now: u64,
+        retries: u32,
+        f: &mut impl FnMut(&mut ScopeState) -> Result<R, Refusal>,
+    ) -> Result<R, Refusal> {
+        for _ in 0..retries {
+            let (mut state, cas, new) = match self.read(key).map_err(unavailable)? {
+                // The sweep that wrote it is deleting this key: read again,
+                // and be refused as contended if that never lands within the
+                // retries. A writer never deletes it itself.
+                Read::Doomed => continue,
+                Read::New(cas, period) => (ScopeState::at_period(period), cas, true),
                 Read::Live(state, cas) => (state, Some(cas), false),
             };
             state.roll(period(self.window, now));
@@ -293,7 +339,7 @@ impl NodeLedger {
             if new {
                 self.acquire_slot(now)?;
             }
-            match self.put_record(&key, cas.as_deref(), &Record::Scope(state)) {
+            match self.put_record(key, cas.as_deref(), &Record::Scope(state)) {
                 Ok(()) => {
                     count_reclaim(&mut self.stats.borrow_mut(), reclaimed);
                     return Ok(result);
@@ -423,6 +469,9 @@ impl NodeLedger {
     /// Correctness never depends on the claim being exclusive: every change
     /// is a CAS, and only a sweep's own successful conversions free slots.
     fn sweep(&self, now: u64, claim_cas: String) {
+        // Tombstones are stamped and aged on the store's clock, read now:
+        // the request's `now` may be stale. Scheduling stays on `now`.
+        let clock = now.max(self.store.now());
         let Ok(keys) = self.store.keys() else {
             return;
         };
@@ -437,7 +486,10 @@ impl NodeLedger {
                     state.roll(period(self.window, now));
                     let _ = state.reclaim(now, self.ttl);
                     if state.is_idle() {
-                        let vacant = Record::Vacant { since: now };
+                        let vacant = Record::Vacant {
+                            since: clock,
+                            period: state.period(),
+                        };
                         if self.put_record(key, Some(&cas), &vacant).is_ok() {
                             freed += 1;
                             continue;
@@ -445,21 +497,22 @@ impl NodeLedger {
                     }
                     next_idle = next_idle.min(state.idle_at(self.ttl, self.window));
                 }
-                Ok(Record::Vacant { since }) => {
-                    if now >= since.saturating_add(GRACE_MS)
-                        && self
-                            .put_record(key, Some(&cas), &Record::Doomed { at: now })
-                            .is_ok()
-                    {
-                        let _ = self.store.delete(key);
+                Ok(Record::Vacant { since, period }) => {
+                    if clock >= since.saturating_add(GRACE_MS) {
+                        self.delete_vacant(key, &cas, since, period, clock);
                     }
                 }
-                // Left behind by a sweep that stopped mid-delete; nothing
-                // writes over `Doomed`, so once that sweep is surely done
-                // it is safe to drop.
-                Ok(Record::Doomed { at }) => {
-                    if now >= at.saturating_add(GRACE_MS) {
-                        let _ = self.store.delete(key);
+                // Left behind by a sweep whose delete never landed (and whose
+                // restore failed too). Deleting it here could remove a record
+                // re-created after that sweep's own delete, so it is only
+                // ever CAS'd back to `Vacant`, for a later sweep to retry.
+                Ok(Record::Doomed { at, period }) => {
+                    if clock >= at.saturating_add(RECOVER_MS) {
+                        let vacant = Record::Vacant {
+                            since: clock,
+                            period,
+                        };
+                        let _ = self.put_record(key, Some(&cas), &vacant);
                     }
                 }
                 Err(_) => {}
@@ -478,25 +531,43 @@ impl NodeLedger {
         let _ = self.put_sweep(&done, Some(&claim_cas));
     }
 
-    /// One settlement attempt loop on the shared record.
+    /// Deletes a `Vacant` record: CAS it to `Doomed` (so no writer re-uses
+    /// it meanwhile), then delete it at once. Only the sweep that won that
+    /// CAS deletes; if its delete fails it puts the `Vacant` record back.
+    fn delete_vacant(&self, key: &str, cas: &str, since: u64, period: u64, now: u64) {
+        let doomed = Record::Doomed { at: now, period };
+        if self.put_record(key, Some(cas), &doomed).is_err() {
+            return;
+        }
+        if self.store.delete(key).is_ok() {
+            return;
+        }
+        if let Ok(Some((_, cas))) = self.store.get(key) {
+            let vacant = Record::Vacant { since, period };
+            let _ = self.put_record(key, Some(&cas), &vacant);
+        }
+    }
+
+    /// One settlement attempt loop on the shared record. `Ok(None)` means
+    /// the scope has no live record.
     fn try_settle(
         &self,
         reservation: &Reservation,
         now: u64,
         commit: bool,
         retries: u32,
-    ) -> Result<Settlement, StoreError> {
+    ) -> Result<Option<Settlement>, StoreError> {
         let key = self.key(&reservation.scope);
         for _ in 0..retries {
             let (mut state, cas) = match self.read(&key)? {
                 Read::Live(state, cas) => (state, cas),
                 // Untracked (never created, or swept while idle).
-                Read::New(_) | Read::Doomed(_) => return Ok(Settlement::NotActive),
+                Read::New(..) | Read::Doomed => return Ok(None),
             };
             state.roll(period(self.window, now));
             let outcome = state.settle(reservation.id, commit);
             if outcome == Settlement::NotActive {
-                return Ok(outcome);
+                return Ok(Some(outcome));
             }
             let reclaimed = state.reclaim(now, self.ttl);
             let idle = state.is_idle();
@@ -506,7 +577,7 @@ impl NodeLedger {
                     if idle {
                         self.hint_idle(now);
                     }
-                    return Ok(outcome);
+                    return Ok(Some(outcome));
                 }
                 Err(StoreError::CasMismatch) => continue,
                 Err(err) => return Err(err),
@@ -535,18 +606,48 @@ impl NodeLedger {
         }
     }
 
-    /// Retries queued commits, a few per call.
+    /// Charges a commit whose reservation may no longer be on the record:
+    /// settles it if it is still held, and otherwise adds its contribution
+    /// to `committed` (creating the record if it is missing) as a late
+    /// commit. Used for a commit that was never written (a queued one) and
+    /// for one whose record is missing while the reservation could still be
+    /// on it (a host read error or a sweep race), so neither is dropped.
+    fn charge(
+        &self,
+        reservation: &Reservation,
+        now: u64,
+        retries: u32,
+    ) -> Result<Settlement, Refusal> {
+        let key = self.key(&reservation.scope);
+        self.mutate_core(&key, now, retries, &mut |state| {
+            Ok(match state.settle(reservation.id, true) {
+                Settlement::NotActive => {
+                    state.record(reservation.contribution);
+                    Settlement::LateCommitted
+                }
+                outcome => outcome,
+            })
+        })
+    }
+
+    /// Retries queued commits, a few per call. A queued commit was never
+    /// written, so it is charged even if its reservation has meanwhile been
+    /// reclaimed and dropped.
     fn drain_pending(&self, now: u64) {
         for _ in 0..DRAIN_PER_CALL {
             let Some(reservation) = self.pending.borrow_mut().pop_front() else {
                 return;
             };
-            match self.try_settle(&reservation, now, true, DRAIN_RETRIES) {
+            match self.charge(&reservation, now, DRAIN_RETRIES) {
                 Ok(outcome) => count_settlement(&mut self.stats.borrow_mut(), outcome),
-                Err(_) => {
+                // The store is down: stop, and keep the order.
+                Err(Refusal::Unavailable) => {
                     self.pending.borrow_mut().push_front(reservation);
                     return;
                 }
+                // Stuck on its own key (contended, or no slot for a missing
+                // record): let the commits queued behind it go first.
+                Err(_) => self.pending.borrow_mut().push_back(reservation),
             }
         }
     }
@@ -603,12 +704,19 @@ impl LedgerStore for NodeLedger {
 
     fn commit(&self, reservation: &Reservation, now: u64) -> Settlement {
         self.drain_pending(now);
+        let defer = || {
+            self.pending.borrow_mut().push_back(reservation.clone());
+            Settlement::Deferred
+        };
         let outcome = match self.try_settle(reservation, now, true, SETTLE_RETRIES) {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                self.pending.borrow_mut().push_back(reservation.clone());
-                Settlement::Deferred
-            }
+            Ok(Some(outcome)) => outcome,
+            // No record although the reservation (or its tombstone) would
+            // still be on it: charge rather than trust the read.
+            Ok(None) if now < reservation.expires_at.saturating_add(self.ttl) => self
+                .charge(reservation, now, SETTLE_RETRIES)
+                .unwrap_or_else(|_| defer()),
+            Ok(None) => Settlement::NotActive,
+            Err(_) => defer(),
         };
         count_settlement(&mut self.stats.borrow_mut(), outcome);
         outcome
@@ -619,7 +727,9 @@ impl LedgerStore for NodeLedger {
         // A release that cannot be written stays held until reclaimed.
         let outcome = self
             .try_settle(reservation, now, false, SETTLE_RETRIES)
-            .unwrap_or(Settlement::Deferred);
+            .map_or(Settlement::Deferred, |outcome| {
+                outcome.unwrap_or(Settlement::NotActive)
+            });
         count_settlement(&mut self.stats.borrow_mut(), outcome);
         outcome
     }
@@ -659,12 +769,15 @@ impl LedgerStore for NodeLedger {
 
 /// `KvStore` over PDK local shared data, through the synchronous
 /// `blocking()` handle (the ledger runs inside one filter callback).
-pub struct PdkStore(pub pdk::data_storage::LocalDataStorage);
+pub struct PdkStore {
+    pub storage: pdk::data_storage::LocalDataStorage,
+    pub clock: std::rc::Rc<pdk::hl::timer::Clock>,
+}
 
 impl KvStore for PdkStore {
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, StoreError> {
         use pdk::data_storage::BlockingDataStorage;
-        self.0
+        self.storage
             .blocking()
             .get::<Vec<u8>>(key)
             .map_err(|_| StoreError::Failed)
@@ -676,7 +789,7 @@ impl KvStore for PdkStore {
             Put::Absent => StoreMode::Absent,
             Put::Cas(cas) => StoreMode::Cas(cas.to_string()),
         };
-        match self.0.blocking().store(key, &mode, &value.to_vec()) {
+        match self.storage.blocking().store(key, &mode, &value.to_vec()) {
             Ok(()) => Ok(()),
             Err(DataStorageError::CasMismatch) => Err(StoreError::CasMismatch),
             Err(_) => Err(StoreError::Failed),
@@ -685,7 +798,7 @@ impl KvStore for PdkStore {
 
     fn delete(&self, key: &str) -> Result<(), StoreError> {
         use pdk::data_storage::BlockingDataStorage;
-        self.0
+        self.storage
             .blocking()
             .delete(key)
             .map_err(|_| StoreError::Failed)
@@ -693,7 +806,14 @@ impl KvStore for PdkStore {
 
     fn keys(&self) -> Result<Vec<String>, StoreError> {
         use pdk::data_storage::BlockingDataStorage;
-        self.0.blocking().get_keys().map_err(|_| StoreError::Failed)
+        self.storage
+            .blocking()
+            .get_keys()
+            .map_err(|_| StoreError::Failed)
+    }
+
+    fn now(&self) -> u64 {
+        crate::epoch_ms(self.clock.now())
     }
 }
 
@@ -728,6 +848,9 @@ pub mod fake {
         hooks: VecDeque<Hook>,
         forced_mismatches: u32,
         failing: bool,
+        failing_deletes: bool,
+        hidden_gets: u32,
+        clock: u64,
         ops: u64,
     }
 
@@ -750,6 +873,22 @@ pub mod fake {
             self.0.borrow_mut().failing = failing;
         }
 
+        /// Makes every delete fail with a storage error.
+        pub fn set_failing_deletes(&self, failing: bool) {
+            self.0.borrow_mut().failing_deletes = failing;
+        }
+
+        /// Makes the next `n` gets read as missing, like a host read error
+        /// that PDK reports as no value.
+        pub fn hide_next_gets(&self, n: u32) {
+            self.0.borrow_mut().hidden_gets = n;
+        }
+
+        /// Sets the store's own clock (`0` means none).
+        pub fn set_now(&self, now: u64) {
+            self.0.borrow_mut().clock = now;
+        }
+
         /// How many operations have reached the store.
         pub fn ops(&self) -> u64 {
             self.0.borrow().ops
@@ -768,9 +907,12 @@ pub mod fake {
     impl KvStore for FakeStore {
         fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, StoreError> {
             self.enter()?;
-            Ok(self
-                .0
-                .borrow()
+            let mut inner = self.0.borrow_mut();
+            if inner.hidden_gets > 0 {
+                inner.hidden_gets -= 1;
+                return Ok(None);
+            }
+            Ok(inner
                 .map
                 .get(key)
                 .map(|(value, cas)| (value.clone(), cas.to_string())))
@@ -804,13 +946,21 @@ pub mod fake {
 
         fn delete(&self, key: &str) -> Result<(), StoreError> {
             self.enter()?;
-            self.0.borrow_mut().map.remove(key);
+            let mut inner = self.0.borrow_mut();
+            if inner.failing_deletes {
+                return Err(StoreError::Failed);
+            }
+            inner.map.remove(key);
             Ok(())
         }
 
         fn keys(&self) -> Result<Vec<String>, StoreError> {
             self.enter()?;
             Ok(self.0.borrow().map.keys().cloned().collect())
+        }
+
+        fn now(&self) -> u64 {
+            self.0.borrow().clock
         }
     }
 }
@@ -1050,13 +1200,116 @@ mod test {
             .put(
                 &key,
                 Put::Absent,
-                &encode(&Record::Doomed { at: 0 }).unwrap(),
+                &encode(&Record::Doomed { at: 0, period: 0 }).unwrap(),
             )
             .unwrap();
-        // While the sweep that doomed it may still be running: refused.
+        // Only the sweep that doomed it deletes it: a writer is refused,
+        // however late it is, and never deletes the key itself.
         assert_eq!(a.reserve("s", 1, 100, 1), Err(Refusal::Contention));
-        // Once it is surely done, the writer deletes it and proceeds.
-        assert!(a.reserve("s", 1, 100, GRACE_MS).is_ok());
+        assert_eq!(
+            a.reserve("s", 1, 100, 10 * GRACE_MS),
+            Err(Refusal::Contention)
+        );
+        assert!(matches!(a.read(&key), Ok(Read::Doomed)));
+        // Left that long, a sweep CASes it back to Vacant and it is re-used.
+        assert!(a.reserve("s", 1, 100, RECOVER_MS).is_ok());
+        assert_eq!(a.snapshot("s").reserved, 1);
+    }
+
+    #[test]
+    fn a_sweep_whose_delete_fails_puts_the_vacant_record_back() {
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let r = a.reserve("s", 5, 100, 0).unwrap();
+        a.release(&r, 0);
+        let key = a.key("s");
+        a.record("other", 0, GC_INTERVAL_MS).unwrap();
+        assert!(matches!(a.read(&key), Ok(Read::New(Some(_), _))), "vacant");
+        store.set_failing_deletes(true);
+        a.record("other", 0, 3 * GC_INTERVAL_MS).unwrap();
+        assert!(
+            matches!(a.read(&key), Ok(Read::New(Some(_), _))),
+            "restored"
+        );
+        store.set_failing_deletes(false);
+        a.record("other", 0, 5 * GC_INTERVAL_MS).unwrap();
+        assert!(store.get(&key).unwrap().is_none(), "deleted on retry");
+    }
+
+    #[test]
+    fn the_tombstone_protocol_runs_on_the_store_clock_not_a_stale_request_time() {
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let r = a.reserve("s", 5, 100, 0).unwrap();
+        a.release(&r, 0);
+        let key = a.key("s");
+        // The request times lag the real clock by a lot.
+        store.set_now(10 * GC_INTERVAL_MS);
+        a.record("other", 0, GC_INTERVAL_MS).unwrap();
+        // By request time the grace period has passed; by the clock it
+        // has not, so the tombstone stays.
+        a.record("other", 0, 3 * GC_INTERVAL_MS).unwrap();
+        assert!(matches!(a.read(&key), Ok(Read::New(Some(_), _))), "kept");
+        store.set_now(10 * GC_INTERVAL_MS + GRACE_MS);
+        a.record("other", 0, 5 * GC_INTERVAL_MS).unwrap();
+        assert!(store.get(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_commit_whose_record_reads_as_missing_is_still_charged() {
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let b = worker(&store, 2);
+        // A host read error that PDK reports as "no value".
+        let r = a.reserve("s", 800, 3000, 0).unwrap();
+        store.hide_next_gets(1);
+        assert_eq!(b.commit(&r, 1), Settlement::Committed);
+        assert_eq!(a.snapshot("s").committed, 800);
+        assert_eq!(a.snapshot("s").reserved, 0);
+        // The record really is gone within the reservation's lifetime.
+        let r = a.reserve("t", 800, 3000, 0).unwrap();
+        store.delete(&a.key("t")).unwrap();
+        assert_eq!(b.commit(&r, 1), Settlement::LateCommitted);
+        assert_eq!(a.snapshot("t").committed, 800);
+        // Past `expires_at + ttl` the #17 rule holds: too late.
+        let r = a.reserve("u", 800, 3000, 0).unwrap();
+        store.delete(&a.key("u")).unwrap();
+        assert_eq!(b.commit(&r, 2 * TTL), Settlement::NotActive);
+        assert_eq!(a.snapshot("u").committed, 0);
+    }
+
+    #[test]
+    fn a_queued_commit_is_charged_even_after_its_tombstone_is_dropped() {
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let b = worker(&store, 2);
+        let r = a.reserve("s", 800, 3000, 0).unwrap();
+        store.force_mismatches(u32::MAX);
+        assert_eq!(a.commit(&r, 1), Settlement::Deferred);
+        store.force_mismatches(0);
+        // B reclaims the reservation and later drops its tombstone.
+        b.record("s", 0, 3 * TTL).unwrap();
+        assert_eq!(b.snapshot("s").total(), 0);
+        a.record("other", 0, 3 * TTL + 1).unwrap();
+        assert_eq!(a.pending(), 0);
+        assert_eq!(b.snapshot("s").committed, 800, "charged, not dropped");
+        assert_eq!(a.stats().late_committed, 1);
+    }
+
+    #[test]
+    fn a_swept_scope_keeps_its_window_period() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 10, Some(DAY));
+        let r = a.reserve("s", 5, 100, 5 * DAY).unwrap();
+        a.release(&r, 5 * DAY);
+        a.record("other", 0, 5 * DAY + GC_INTERVAL_MS).unwrap();
+        assert!(matches!(a.read(&a.key("s")), Ok(Read::New(Some(_), 5))));
+        // A writer whose time is a little stale (the previous period) re-uses
+        // the record: its commit lands in the swept scope's period.
+        a.record("s", 100, 5 * DAY - 1).unwrap();
+        assert!(a
+            .reserve("s", 1, 100, 5 * DAY + GC_INTERVAL_MS + 1)
+            .is_err());
     }
 
     #[test]
