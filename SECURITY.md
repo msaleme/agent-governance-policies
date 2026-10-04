@@ -60,8 +60,9 @@ extend them are still welcome as issues:
 
 - **P6 replicas:** single use on gateway `local()` storage is per replica, and a
   restart resets it.
-- **Per-worker budget:** the aggregate budget is per worker, so `N` workers admit
-  up to `N × aggregateBudget`, and a restart resets it.
+- **Per-replica budget:** the aggregate budget is per gateway replica (per worker
+  with the opt-in `ledgerBackend: worker`), so `R` replicas admit up to
+  `R × aggregateBudget`, and a gateway restart resets it.
 - **HMAC attestation:** P5 HMAC gives separation of duties, not non-repudiation.
 - **Uninspected inputs:** traffic the policies don't inspect, such as URL paths,
   query strings, arbitrary headers and non-MCP asset types.

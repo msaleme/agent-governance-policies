@@ -26,8 +26,8 @@ reaches the upstream tool.
 ## Boundaries
 
 - **No shared state.** Each filter decides from the request in front of it plus
-  its own configuration (and, for the aggregate-risk gate, its own per-worker
-  ledger). One filter's denial rendering is not an input to the other.
+  its own configuration (and, for the aggregate-risk gate, its own ledger, per
+  replica or per worker). One filter's denial rendering is not an input to the other.
 - **Independent budgets and records.** The aggregate-risk gate's ledger is not
   aware of approval records, and approval-binding does not track exposure. Running
   them together does not merge those concerns; it layers two separate checks.

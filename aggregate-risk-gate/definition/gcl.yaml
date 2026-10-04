@@ -6,10 +6,10 @@ metadata:
     title: Cross-Session Aggregate-Risk Gate
     category: Security
     description: >-
-      Reserve-then-authorize exposure gate for MCP: atomically reserves each
-      call's contribution against a per-scope aggregate budget before
-      forwarding, refusing calls that compose past it. In-process ledger,
-      scoped to one gateway worker.
+      Reserve-then-authorize exposure gate for MCP: reserves each governed
+      call's contribution (default: tools/call only) against a per-scope
+      budget before forwarding. One budget per gateway replica, shared by its
+      workers; reset on restart (see README).
     metadata/capabilities/injectionPoint: inbound
     metadata/capabilities/assetTypes: mcp
     metadata/interfaceScope: api,resource
@@ -18,6 +18,15 @@ spec:
     - name: extension-definition
       namespace: default
   properties:
+    # BUDGET SCOPE DEPENDS ON ledgerBackend. "node" (default): the ledger is
+    # in the gateway replica's node-local shared data, so every Envoy worker
+    # of one replica shares one budget. It is not shared across replicas and
+    # a gateway process restart resets it; with R replicas set aggregateBudget
+    # to the intended total divided by R. "worker": the ledger lives in each
+    # Envoy worker's memory, and a caller that opens more connections can be
+    # spread across N workers and spend up to N times aggregateBudget; run
+    # one worker (FLEX_SERVICE_ENVOY_CONCURRENCY=1) or divide the budget by N
+    # workers times replicas. See budgetScope, ledgerBackend and the README.
     budgetScope:
       type: string
       default: agent
@@ -31,7 +40,14 @@ spec:
         same mechanics, intended for a tenant/org identity rather than a
         per-agent one. "fabric" — one running total shared by every request
         this policy instance sees; no identity is read. The ledger key is
-        "<budgetScope>:<canonical identity>", or "fabric:*".
+        "<budgetScope>:<canonical identity>", or "fabric:*". With
+        ledgerBackend "node" (default) every scope's budget is per gateway
+        replica: all workers share it, but replicas do not, and a process
+        restart resets it. With ledgerBackend "worker" it is per gateway
+        worker: a caller that opens more connections can be spread across N
+        workers and spend up to N times aggregateBudget. For an exact budget
+        there, run one worker (FLEX_SERVICE_ENVOY_CONCURRENCY=1) and one
+        replica, or divide aggregateBudget by N workers times replicas.
     identitySource:
       type: string
       default: authentication
@@ -78,6 +94,38 @@ spec:
         (nothing committed or reserved). If every tracked scope holds exposure,
         the new scope is refused with reason=scope-capacity. Live enforcement
         state is never evicted.
+    ledgerBackend:
+      type: string
+      default: node
+      enum:
+        - node
+        - worker
+      description: >-
+        Where the ledger lives. "node" (default) keeps it in the gateway
+        replica's node-local shared data and updates it with compare-and-swap,
+        so every Envoy worker of the replica checks and reserves against one
+        budget; a call whose update keeps losing to concurrent writers, or
+        that hits a storage error, fails closed in block mode with
+        reason=ledger-contention or reason=ledger-unavailable (monitor mode
+        forwards and flags it). With either backend, a scope with 512
+        reservations still in flight refuses more with reason=scope-saturated
+        until some settle or time out. Not shared across replicas; reset when the
+        gateway process restarts. "worker" keeps one in-memory ledger per
+        Envoy worker (N workers can admit up to N times aggregateBudget). A
+        cluster-wide ledger is not implemented, and "cluster" is rejected.
+    ledgerNamespace:
+      type: string
+      default: ""
+      description: >-
+        With ledgerBackend "node", an optional name (1 to 64 letters, digits,
+        dots, underscores, or hyphens) that lets several policy instances on
+        the same gateway share one ledger. Empty (default) keeps the ledger
+        private to this policy instance. Instances sharing a namespace must
+        use the same scopeDigestKey, maxScopes, reservationTimeoutMs, window
+        and windowMs. Changing scopeDigestKey, window or windowMs starts a
+        fresh ledger: every scope starts from zero, and the old ledger's
+        records stay in shared data (unreachable, holding no slots) until
+        the gateway restarts.
     reservationTimeoutMs:
       type: integer
       default: 60000
@@ -111,10 +159,15 @@ spec:
         "@characteristics":
           - "security:sensitive"
       description: >-
-        Secret key for the "digest" scopeDisclosure (HMAC-SHA256). With a key,
-        a client cannot confirm a guessed identity from its digest. When empty,
-        an unkeyed SHA-256 is used, which hides the value but lets anyone who
-        can guess an identity confirm it.
+        Secret key for the "digest" scopeDisclosure (HMAC-SHA256), and with
+        ledgerBackend "node" the key for the shared-data ledger keys. Set it.
+        With a key, a client cannot confirm a guessed identity from its digest,
+        and nothing that can list the replica's shared data can map a ledger
+        key back to an identity. When empty (the default, kept so the default
+        configuration starts; the policy logs a warning at startup with the
+        node backend), an unkeyed SHA-256 / HMAC is used, which hides the
+        value but lets anyone who can guess an identity confirm it. Changing
+        it starts every scope from zero (a fresh budget for every identity).
     aggregateBudget:
       type: integer
       default: 3000
@@ -128,7 +181,10 @@ spec:
         exposure for its scope, including this call's own contribution, does
         not exceed this number. All budget arithmetic is exact integer
         arithmetic; fractional, negative, or out-of-range values are rejected
-        when the policy is configured.
+        when the policy is configured. This budget is enforced per gateway
+        replica with ledgerBackend "node", or per worker with "worker", where
+        N workers let a caller reach up to N times this number (see
+        budgetScope).
     window:
       type: string
       default: fixed-period
@@ -140,8 +196,9 @@ spec:
         "fixed-period" resets every scope's committed total at each windowMs
         boundary, counted from the Unix epoch (24h windows start at 00:00
         UTC). Calls still in flight at a boundary carry into the new period.
-        "worker-lifetime" never resets. In both, the ledger is per gateway
-        worker and a worker restart resets it (see README).
+        "worker-lifetime" never resets for as long as the ledger lives: the
+        gateway process with ledgerBackend "node", the worker with "worker".
+        A restart resets it either way (see README).
     windowMs:
       type: integer
       default: 86400000
@@ -166,8 +223,10 @@ spec:
         never reads actual token usage, so the estimate is the charge on every
         successful call, whatever the real usage was. (Renamed from
         "token-cost", which is now rejected so it cannot be mistaken for
-        actual token accounting.) A JSON-RPC batch (array) is charged per item,
-        never as a single call. A contribution above 9007199254740991 is
+        actual token accounting.) Only requests whose method is listed in
+        governedMethods are priced; everything else passes uncharged (see
+        governedMethods). A JSON-RPC batch (array) is charged per governed
+        item, never as a single call. A contribution above 9007199254740991 is
         rejected as out of range.
     fixedWeight:
       type: integer
@@ -177,6 +236,32 @@ spec:
       description: >-
         Per-call exposure contribution, in integer points, when
         contribution=fixed-weight. Range 0 to 9007199254740991.
+    governedMethods:
+      type: array
+      default:
+        - tools/call
+      items:
+        type: string
+      description: >-
+        The JSON-RPC methods this policy prices and enforces. Default
+        ["tools/call"]. Matching is exact and case-sensitive ("Tools/Call" is
+        not "tools/call"). Any other request, a notification of an unlisted
+        method, a JSON-RPC response (e.g. an elicitation or sampling reply),
+        and a request with no body are ungoverned: forwarded with no ledger or
+        scope change and stamped "pass;reason=ungoverned-method". So an
+        exhausted budget never blocks initialize, notifications/initialized,
+        ping, tools/list, notifications/cancelled, or session teardown. A
+        message the policy cannot classify (a body over the inspection limit,
+        a Content-Type charset other than utf-8, a body this policy cannot
+        parse as JSON, a non-object item, a missing "jsonrpc": "2.0", a non-string
+        method, or a duplicate "method" member) stays governed and fails
+        closed in block mode. In a mixed batch only the governed items are
+        priced; if the batch is denied, every request id in it gets a -32008
+        error. The list must be non-empty, with no blank, whitespace-padded,
+        or duplicate entries; "*" is rejected (there is no wildcard).
+        Listing initialize or a notifications/* method is allowed but logged
+        as a warning, since it lets an exhausted budget block session setup or
+        cancellation.
     spendAmountField:
       type: string
       default: params.amount
@@ -187,10 +272,11 @@ spec:
         integer count of spendCurrency minor units, between 0 and
         9007199254740991: 1234 means 12.34 USD. A fraction (12.34 or 1234.0),
         an exponent (1e3), a negative value, a string, or anything out of
-        range is rejected, never rounded. A request whose body is missing,
-        unparseable, or has no valid amount at this path is unpriceable:
+        range is rejected, never rounded. A governed request whose body is
+        unparseable or has no valid amount at this path is unpriceable:
         denied in block mode (onDeny applies), recorded as zero contribution
-        in monitor mode so the gap is visible.
+        in monitor mode so the gap is visible. Ungoverned methods (see
+        governedMethods) are never read for an amount.
     spendCurrency:
       type: string
       default: USD
@@ -211,7 +297,8 @@ spec:
         unchanged on a successful response; actual usage is never read, so
         there is no true-up in either direction. Set it too low and real
         consumption is under-counted; set it too high and successful calls are
-        over-charged. It is released in full if the upstream call fails.
+        over-charged. It is released in full if the upstream returns HTTP 4xx
+        or 5xx (see mode for the full settlement rule).
     mode:
       type: string
       default: monitor
@@ -225,6 +312,10 @@ spec:
         regardless of budget. Use to characterize composition before enforcing.
         "block" — deny a call whose contribution would push committed-plus-
         reserved exposure for its scope over aggregateBudget, per onDeny.
+        In both modes a reservation settles on the upstream's HTTP status
+        only: 2xx and 3xx commit it, 4xx and 5xx release it. The response body
+        is never read, so a JSON-RPC error or an "isError": true tool result
+        inside an HTTP 200 is still charged.
     onDeny:
       type: string
       default: rpc-error
@@ -257,9 +348,11 @@ spec:
         or "monitor;scope=...;contribution=...;total=.../..."; on a block-mode
         denial, e.g. "denied;scope=agent:broker-7;would-be-total=3200;
         budget=3000;unit=points" (or "reason=missing-identity",
-        "reason=invalid-identity", "reason=scope-capacity",
+        "reason=invalid-identity", "reason=scope-capacity", "reason=scope-saturated",
+        "reason=ledger-contention", "reason=ledger-unavailable",
         "reason=unpriceable", or "reason=out-of-range" for the non-budget deny
-        reasons). The scope is shown per scopeDisclosure; the examples use
+        reasons); on an ungoverned message (see governedMethods),
+        "pass;reason=ungoverned-method". The scope is shown per scopeDisclosure; the examples use
         "raw". All amounts are exact integers; unit is "points"
         (fixed-weight), "estimated-tokens" (estimated-token-weight), or
         "<spendCurrency>-minor" such as "USD-minor" (spend-amount). Never carries other sessions'
@@ -272,6 +365,8 @@ spec:
     - identityField
     - scopeHeader
     - maxScopes
+    - ledgerBackend
+    - ledgerNamespace
     - reservationTimeoutMs
     - scopeDisclosure
     - scopeDigestKey
@@ -280,6 +375,7 @@ spec:
     - windowMs
     - contribution
     - fixedWeight
+    - governedMethods
     - spendAmountField
     - spendCurrency
     - estimatedTokens

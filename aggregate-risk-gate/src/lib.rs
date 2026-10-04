@@ -7,6 +7,13 @@
 // cap are all structurally blind to the SUM; this policy is a control that sees
 // it.
 //
+// Governed calls: only JSON-RPC messages whose `method` is in `governedMethods`
+// (default `["tools/call"]`) are priced. The rest of the MCP protocol
+// (`initialize`, `tools/list`, `ping`, `notifications/*`, client responses to
+// server requests, and bodyless requests such as the SSE GET and the session
+// DELETE) passes through with no contribution and no ledger mutation (P4A
+// review #47). See `compute_contribution`.
+//
 // Mechanism: reserve-then-authorize. On each governed call this policy computes
 // the call's exposure contribution as an exact integer (an estimated-token
 // weight, a spend amount in currency minor units read from the request body, or
@@ -29,16 +36,21 @@
 // admits exactly three (2,400) and refuses the other two.
 //
 // Scope of the guarantee (see also the gcl.yaml field docs and README): a real,
-// correct, exhaustively tested in-process reserve-then-authorize engine, with
-// one ledger per policy instance per gateway worker. It is not shared across
-// workers or replicas, a restart resets it, and it makes no cryptographic
-// non-repudiation claim about its decisions. A shared, durable ledger with
-// signed decision records is future work (v2).
+// correct, exhaustively tested reserve-then-authorize engine. With the default
+// `ledgerBackend: node` (`node_ledger.rs`, P4A review #48) there is one ledger
+// per policy instance per gateway REPLICA, shared by all of its Envoy workers
+// through compare-and-swap writes to node-local shared data; it is not shared
+// across replicas and a gateway process restart resets it. `ledgerBackend:
+// worker` (`ledger.rs`) keeps one in-memory ledger per worker, which a caller
+// can multiply across workers (mitigation: `FLEX_SERVICE_ENVOY_CONCURRENCY=1`).
+// A cross-replica, durable ledger (`cluster`) is not implemented and is
+// rejected. No cryptographic non-repudiation claim is made about decisions.
 //
 // NIST SP 800-53 Rev 5: AC-6 (Least Privilege / aggregate exposure), SI-4
 // (Monitoring), AU-6 (Audit Review — the running-total resultHeader).
 mod generated;
 mod ledger;
+mod node_ledger;
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};
@@ -57,6 +69,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::generated::config::Config;
 use crate::ledger::{Denial, Ledger, LedgerStats, LedgerStore, Refusal, Reservation, Settlement};
+use crate::node_ledger::{KvStore, NodeLedger, PdkStore};
+use pdk::data_storage::DataStorageBuilder;
 
 /// JSON-RPC server-error code used when this policy prevents a call from
 /// reaching its upstream tool. Matches the sibling decoy/binding policies in
@@ -173,8 +187,12 @@ impl<'a> RawBody<'a> {
 /// Buffering a body only to discover afterward that it was oversized,
 /// compressed, or a non-JSON media type would defeat the purpose of gating in
 /// the first place. A missing/invalid Content-Length, a declared length over
-/// `MAX_INSPECT_BYTES`, a non-JSON Content-Type, or any Content-Encoding
-/// (this build never decompresses) all fail this gate. See README.md's
+/// `MAX_INSPECT_BYTES`, a non-JSON Content-Type, a `charset` parameter other
+/// than UTF-8, or any Content-Encoding (this build never decompresses) all
+/// fail this gate. The charset check matters because this policy parses the
+/// body as UTF-8 while an upstream may decode it with the declared charset:
+/// under `charset=utf-7`, `"tools+AC8-call"` reads here as an unlisted method
+/// but decodes upstream to `tools/call`. See README.md's
 /// "Inspection boundary" section for the SSE/streaming/compressed/non-UTF-8
 /// exclusions this enforces.
 fn request_is_inspectable(handler: &(impl HeadersHandler + ?Sized)) -> bool {
@@ -184,17 +202,38 @@ fn request_is_inspectable(handler: &(impl HeadersHandler + ?Sized)) -> bool {
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|len| len <= MAX_INSPECT_BYTES);
     let json = handler.header("content-type").is_some_and(|value| {
-        let media = value
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase();
-        media == "application/json"
-            || (media.starts_with("application/") && media.ends_with("+json"))
+        let mut parts = value.split(';');
+        let media = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+        let json_media = media == "application/json"
+            || (media.starts_with("application/") && media.ends_with("+json"));
+        json_media && parts.all(utf8_or_not_charset)
     });
     let uncompressed = handler.header("content-encoding").is_none();
     length_ok && json && uncompressed
+}
+
+/// True unless `param` is a `charset` parameter naming anything but UTF-8.
+/// The name and value are case-insensitive, surrounding whitespace is ignored
+/// and the value may be quoted. A malformed `charset` parameter (no `=`) is
+/// not UTF-8.
+fn utf8_or_not_charset(param: &str) -> bool {
+    let param = param.trim();
+    let (name, value) = match param.split_once('=') {
+        Some((name, value)) => (name.trim(), Some(value.trim())),
+        None => (param, None),
+    };
+    if !name.eq_ignore_ascii_case("charset") {
+        return true;
+    }
+    let Some(value) = value else {
+        return false;
+    };
+    let value = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value)
+        .trim();
+    value.eq_ignore_ascii_case("utf-8")
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +314,13 @@ fn parse_jsonrpc_request(body: &[u8]) -> Option<ParsedJsonRpcRequest> {
     let root: Value = serde_json::from_slice(body).ok()?;
     let is_batch = matches!(root, Value::Array(_));
     let items: Vec<&Value> = match &root {
-        Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        // A client's JSON-RPC responses (to server-initiated requests) can
+        // share a batch with its requests. They carry the SERVER's ids, so
+        // they are skipped: only request ids are echoed on deny.
+        Value::Array(items) if !items.is_empty() => items
+            .iter()
+            .filter(|item| !is_jsonrpc_response(item))
+            .collect(),
         Value::Object(_) => vec![&root],
         _ => return None,
     };
@@ -382,6 +427,35 @@ fn config_units(name: &str, value: i64) -> Result<u64> {
         .ok_or_else(|| anyhow!("{name} must be an integer between 0 and {MAX_UNITS}"))
 }
 
+/// Validates `governedMethods`. An empty list would silently disable the
+/// policy, so it is rejected, as are blank or space-padded entries (which
+/// could never match, since matching is exact) and duplicates. `"*"` is not a
+/// wildcard in this build and is rejected rather than matched literally.
+fn governed_methods(methods: &[String]) -> Result<Vec<String>> {
+    if methods.is_empty() {
+        return Err(anyhow!(
+            "governedMethods must list at least one JSON-RPC method, e.g. [\"tools/call\"]"
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for method in methods {
+        if method.trim().is_empty() || method.trim() != method {
+            return Err(anyhow!(
+                "governedMethods entries must be non-blank with no surrounding whitespace, got {method:?}"
+            ));
+        }
+        if method == "*" {
+            return Err(anyhow!(
+                "governedMethods does not support \"*\": list each JSON-RPC method to price"
+            ));
+        }
+        if !seen.insert(method.as_str()) {
+            return Err(anyhow!("governedMethods lists {method:?} more than once"));
+        }
+    }
+    Ok(methods.to_vec())
+}
+
 /// Compiled, validated policy state, built once at configuration time and
 /// shared (by reference) across every exchange this instance governs. Owns the
 /// per-worker ledger described in the module doc comment.
@@ -395,16 +469,53 @@ struct Gate {
     /// downstream reader never has to guess what "800" means.
     unit: String,
     fixed_weight: u64,
+    /// The JSON-RPC methods that are priced. Matched case-sensitively.
+    governed_methods: Vec<String>,
     spend_amount_field: String,
     estimated_tokens: u64,
     mode: Mode,
     on_deny: OnDeny,
     result_header: String,
-    ledger: Ledger,
+    ledger: Box<dyn LedgerStore>,
+}
+
+/// The store name of the node ledger in a policy instance's own namespace.
+const NODE_LEDGER_STORE: &str = "ledger";
+
+/// Checks `ledgerNamespace`: empty, or 1 to 64 letters, digits, `.`, `_`, `-`.
+fn ledger_namespace(raw: &str) -> Result<Option<String>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() <= 64
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Ok(Some(raw.to_string()));
+    }
+    Err(anyhow!(
+        "ledgerNamespace must be empty or 1 to 64 letters, digits, '.', '_' or '-'"
+    ))
 }
 
 impl Gate {
+    /// A gate whose node ledger uses an in-memory test store.
+    #[cfg(test)]
     fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with(
+            config,
+            |_| Box::new(node_ledger::fake::FakeStore::default()),
+        )
+    }
+
+    /// Builds the gate. `node_store` opens the shared-data store for the node
+    /// ledger: the policy instance's own namespace for `None`, or the named
+    /// shared one.
+    fn from_config_with(
+        config: &Config,
+        node_store: impl FnOnce(Option<&str>) -> Box<dyn KvStore>,
+    ) -> Result<Self> {
         let budget_scope = match config.budget_scope.as_str() {
             "agent" | "fabric" | "tenant" => config.budget_scope.clone(),
             other => {
@@ -523,6 +634,30 @@ impl Gate {
             .ok()
             .filter(|ms| (1_000..=86_400_000).contains(ms))
             .ok_or_else(|| anyhow!("reservationTimeoutMs must be between 1000 and 86400000"))?;
+        let namespace = ledger_namespace(&config.ledger_namespace)?;
+        let node = match config.ledger_backend.as_str() {
+            "node" => true,
+            "worker" => {
+                if namespace.is_some() {
+                    return Err(anyhow!(
+                        "ledgerNamespace applies only to ledgerBackend \"node\""
+                    ));
+                }
+                false
+            }
+            "cluster" => {
+                return Err(anyhow!(
+                    "ledgerBackend \"cluster\" is not implemented: a cluster-wide ledger \
+                     shared across gateway replicas does not exist yet. Use \"node\" (one \
+                     budget per replica) or \"worker\""
+                ))
+            }
+            other => {
+                return Err(anyhow!(
+                    "ledgerBackend must be node or worker, got {other:?}"
+                ))
+            }
+        };
 
         let disclosure = match config.scope_disclosure.as_str() {
             "digest" => Disclosure::Digest(config.scope_digest_key.as_bytes().to_vec()),
@@ -547,6 +682,8 @@ impl Gate {
             return Err(anyhow!("resultHeader must not be blank"));
         }
 
+        let governed_methods = governed_methods(&config.governed_methods)?;
+
         Ok(Self {
             budget_scope,
             identity_source,
@@ -555,12 +692,28 @@ impl Gate {
             contribution,
             unit,
             fixed_weight,
+            governed_methods,
             spend_amount_field,
             estimated_tokens,
             mode,
             on_deny,
             result_header,
-            ledger: Ledger::with_limits(max_scopes, reservation_timeout_ms, window),
+            ledger: if node {
+                Box::new(NodeLedger::new(
+                    node_store(namespace.as_deref()),
+                    config.scope_digest_key.as_bytes().to_vec(),
+                    max_scopes,
+                    reservation_timeout_ms,
+                    window,
+                    node_ledger::random_prefix(),
+                ))
+            } else {
+                Box::new(Ledger::with_limits(
+                    max_scopes,
+                    reservation_timeout_ms,
+                    window,
+                ))
+            },
         })
     }
 
@@ -679,6 +832,9 @@ enum ContributionOutcome {
     /// The amount was a valid integer, but it (or the batch total) exceeds
     /// `MAX_UNITS`, so it cannot be charged exactly.
     OutOfRange,
+    /// Nothing in the request is a governed call: pass it through with no
+    /// contribution, no reservation and no scope entry.
+    Ungoverned,
 }
 
 /// Reads a spend amount as an exact count of minor units. Only a JSON integer
@@ -704,55 +860,98 @@ fn per_item_total(per_item: u64, items: usize) -> ContributionOutcome {
         .map_or(ContributionOutcome::OutOfRange, ContributionOutcome::Known)
 }
 
-/// How many JSON-RPC calls `body` represents, for contribution accounting. A
-/// batch (JSON array) body must never be priced as if it were a single call —
-/// that would fail-open the aggregate-risk check by letting a batch of N
-/// calls each escape at 1/N of their real weight. `body` is assumed already
-/// size-checked (`RawBody::Present` only, never `Uninspectable`).
-fn body_item_count(body: &[u8]) -> usize {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Array(items)) if !items.is_empty() => items.len(),
-        _ => 1,
+/// A JSON-RPC response object: `"jsonrpc": "2.0"`, no `method`, an `id`, and
+/// exactly one of `result`/`error`. An MCP client POSTs these to answer
+/// server-initiated requests such as `sampling/createMessage` or
+/// `elicitation/create`.
+fn is_jsonrpc_response(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && !object.contains_key("method")
+        && object.contains_key("id")
+        && object.contains_key("result") != object.contains_key("error")
+}
+
+/// Whether one JSON-RPC item is a governed call. Only an item this policy can
+/// positively classify is ungoverned: a JSON-RPC 2.0 message whose string
+/// `method` is not in `governedMethods` (a request or a notification), or a
+/// JSON-RPC response. Anything it cannot classify (not an object, no
+/// `"jsonrpc": "2.0"`, a non-string `method`, no `method` and not a response)
+/// is governed, so it is priced or fails closed rather than slipping through.
+/// A governed method sent as a notification (no `id`) is still governed: the
+/// upstream may run it anyway.
+fn is_governed(methods: &[String], item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return true;
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return true;
+    }
+    match object.get("method") {
+        Some(Value::String(method)) => methods.iter().any(|governed| governed == method),
+        Some(_) => true,
+        None => !is_jsonrpc_response(item),
     }
 }
 
+/// Prices a request. A batch (JSON array) is never priced as if it were a
+/// single call — that would fail-open the aggregate-risk check by letting a
+/// batch of N calls each escape at 1/N of their real weight. Only governed
+/// items are priced; a request with none is `Ungoverned`.
 fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
     let body = match raw_body {
         // An uninspectable-but-present body might be a batch of any size —
         // fail closed rather than guess it is worth exactly one call.
         RawBody::Uninspectable => return ContributionOutcome::Unpriceable,
-        RawBody::NoBody => None,
-        RawBody::Present(bytes) => Some(bytes),
+        // No body means no JSON-RPC message, so no governed call: the SSE
+        // stream GET and the session DELETE. It cannot hide a batch.
+        RawBody::NoBody => return ContributionOutcome::Ungoverned,
+        RawBody::Present(bytes) => bytes,
     };
+    let Ok(root) = serde_json::from_slice::<Value>(body) else {
+        // Not JSON to this parser (malformed, a BOM, a lone surrogate, nesting
+        // past serde's 128-level limit). Another parser upstream may still
+        // read it, possibly as a batch of any size, so it cannot be priced as
+        // one call. Fail closed.
+        return ContributionOutcome::Unpriceable;
+    };
+    // A duplicate member (e.g. two `method`s) means this policy and the
+    // upstream could classify the same bytes differently. Fail closed.
+    if serde_json::from_slice::<NoDuplicateMembers>(body).is_err() {
+        return ContributionOutcome::Unpriceable;
+    }
+    let items: Vec<&Value> = match &root {
+        Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        _ => vec![&root],
+    };
+    let governed: Vec<&Value> = items
+        .into_iter()
+        .filter(|item| is_governed(&gate.governed_methods, item))
+        .collect();
+    price(gate, &governed)
+}
+
+/// Prices the governed items of a request.
+fn price(gate: &Gate, governed: &[&Value]) -> ContributionOutcome {
+    if governed.is_empty() {
+        return ContributionOutcome::Ungoverned;
+    }
     match gate.contribution {
-        Contribution::FixedWeight => {
-            per_item_total(gate.fixed_weight, body.map(body_item_count).unwrap_or(1))
-        }
-        Contribution::EstimatedTokenWeight => per_item_total(
-            gate.estimated_tokens,
-            body.map(body_item_count).unwrap_or(1),
-        ),
+        Contribution::FixedWeight => per_item_total(gate.fixed_weight, governed.len()),
+        Contribution::EstimatedTokenWeight => per_item_total(gate.estimated_tokens, governed.len()),
         Contribution::SpendAmount => {
-            let Some(body) = body else {
-                return ContributionOutcome::Unpriceable;
-            };
-            let Ok(value) = serde_json::from_slice::<Value>(body) else {
-                return ContributionOutcome::Unpriceable;
-            };
-            let items: Vec<&Value> = match &value {
-                Value::Array(items) if !items.is_empty() => items.iter().collect(),
-                _ => vec![&value],
-            };
             let mut total: u64 = 0;
-            for item in &items {
+            for item in governed {
                 match dot_path_value(item, &gate.spend_amount_field).and_then(exact_minor_units) {
                     Some(Ok(amount)) => match total.checked_add(amount) {
                         Some(sum) if sum <= MAX_UNITS => total = sum,
                         _ => return ContributionOutcome::OutOfRange,
                     },
                     Some(Err(())) => return ContributionOutcome::OutOfRange,
-                    // Fail closed on the WHOLE batch if any one item is
-                    // unpriceable — never silently price the batch at only
+                    // Fail closed on the WHOLE batch if any one governed item
+                    // is unpriceable — never silently price the batch at only
                     // the items that happened to parse.
                     None => return ContributionOutcome::Unpriceable,
                 }
@@ -769,6 +968,9 @@ enum DenyReason {
     MissingIdentity,
     InvalidIdentity,
     ScopeCapacity,
+    ScopeSaturated,
+    LedgerContention,
+    LedgerUnavailable,
     Unpriceable,
     OutOfRange,
     BudgetExceeded(Denial),
@@ -781,6 +983,9 @@ impl DenyReason {
             DenyReason::MissingIdentity => "missing-identity",
             DenyReason::InvalidIdentity => "invalid-identity",
             DenyReason::ScopeCapacity => "scope-capacity",
+            DenyReason::ScopeSaturated => "scope-saturated",
+            DenyReason::LedgerContention => "ledger-contention",
+            DenyReason::LedgerUnavailable => "ledger-unavailable",
             DenyReason::Unpriceable => "unpriceable",
             DenyReason::OutOfRange => "out-of-range",
             DenyReason::BudgetExceeded(_) => "budget-exceeded",
@@ -810,6 +1015,15 @@ impl DenyReason {
             DenyReason::ScopeCapacity => format!(
                 "aggregate risk gate: no capacity to track a new scope \"{scope}\""
             ),
+            DenyReason::ScopeSaturated => format!(
+                "aggregate risk gate: too many reservations in flight for scope \"{scope}\""
+            ),
+            DenyReason::LedgerContention => format!(
+                "aggregate risk gate: the shared ledger stayed contended for scope \"{scope}\""
+            ),
+            DenyReason::LedgerUnavailable => format!(
+                "aggregate risk gate: the shared ledger is unavailable for scope \"{scope}\""
+            ),
             DenyReason::Unpriceable => {
                 format!("aggregate risk gate: call could not be priced for scope \"{scope}\"")
             }
@@ -821,6 +1035,18 @@ impl DenyReason {
                 denial.would_be_total, denial.budget
             ),
         }
+    }
+}
+
+/// The `reason=` label monitor mode stamps when the ledger refused to track
+/// a call it still forwards.
+fn refusal_label(refusal: &Refusal) -> &'static str {
+    match refusal {
+        Refusal::OverBudget(_) => "budget-exceeded",
+        Refusal::AtCapacity => DenyReason::ScopeCapacity.label(),
+        Refusal::Saturated => DenyReason::ScopeSaturated.label(),
+        Refusal::Contention => DenyReason::LedgerContention.label(),
+        Refusal::Unavailable => DenyReason::LedgerUnavailable.label(),
     }
 }
 
@@ -843,8 +1069,9 @@ fn refuse(gate: &Gate, reason: DenyReason, scope: &str, echo_bytes: Option<&[u8]
 /// request to the upstream, not the response the caller sees.
 #[derive(Clone, Debug)]
 enum Ticket {
-    /// Nothing was reserved (a monitor-mode unpriceable or out-of-range
-    /// call) — the response filter only needs to stamp the header.
+    /// Nothing was reserved (an ungoverned request, or a monitor-mode
+    /// unpriceable or out-of-range call) — the response filter only needs to
+    /// stamp the header.
     None(String),
     /// A reservation for the call's exact contribution: commit on a
     /// successful response, release otherwise. Every contribution mode,
@@ -854,6 +1081,10 @@ enum Ticket {
     Reserved(String, Reservation),
 }
 
+/// Settlement is by HTTP status alone: 2xx and 3xx commit, everything else
+/// (4xx, 5xx) releases. The response body is never read, so a JSON-RPC error
+/// or an `isError` tool result inside an HTTP 200 is committed (charged), and
+/// a 202 whose result arrives later over SSE is committed at the 202.
 fn is_success(status: u32) -> bool {
     (200..400).contains(&status)
 }
@@ -888,6 +1119,9 @@ fn admit(
                 let reason = match refusal {
                     Refusal::OverBudget(denial) => DenyReason::BudgetExceeded(denial),
                     Refusal::AtCapacity => DenyReason::ScopeCapacity,
+                    Refusal::Saturated => DenyReason::ScopeSaturated,
+                    Refusal::Contention => DenyReason::LedgerContention,
+                    Refusal::Unavailable => DenyReason::LedgerUnavailable,
                 };
                 return refuse(gate, reason, &display, echo_bytes);
             }
@@ -897,7 +1131,7 @@ fn admit(
                 .ledger
                 .force_reserve_checked(scope, contribution, gate.aggregate_budget, now)
             {
-                Some((reservation, breached)) => {
+                Ok((reservation, breached)) => {
                     if breached {
                         // The call that would have been refused in block mode
                         // is still forwarded (monitor never denies), but the
@@ -907,16 +1141,17 @@ fn admit(
                     }
                     reservation
                 }
-                None => {
+                Err(refusal) => {
                     violations.generate_policy_violation();
                     return Flow::Continue(Ticket::None(format!(
-                        "monitor;scope={display};reason=scope-capacity"
+                        "monitor;scope={display};reason={}",
+                        refusal_label(&refusal)
                     )));
                 }
             }
         }
     };
-    let total_after = gate.ledger.snapshot(scope).total();
+    let total_after = reservation.total;
     let verb = if gate.mode == Mode::Block {
         "allowed"
     } else {
@@ -941,6 +1176,15 @@ fn decide(
     // still needs the original bytes to attempt an in-band id-echo.
     let echo_bytes = raw_body.as_bytes();
 
+    // Classified before identity: ungoverned traffic (the MCP handshake,
+    // listings, pings, notifications, client responses, bodyless requests) is
+    // never refused, even with no identity or an exhausted budget, and never
+    // touches the ledger.
+    let outcome = compute_contribution(gate, raw_body);
+    if matches!(outcome, ContributionOutcome::Ungoverned) {
+        return Flow::Continue(Ticket::None("pass;reason=ungoverned-method".to_string()));
+    }
+
     let scope = match identity {
         Identity::Scope(key) => key,
         unidentified => {
@@ -959,12 +1203,13 @@ fn decide(
         }
     };
 
-    let reason = match compute_contribution(gate, raw_body) {
+    let reason = match outcome {
         ContributionOutcome::Known(amount) => {
             return admit(gate, &scope, amount, now, echo_bytes, violations)
         }
         ContributionOutcome::Unpriceable => DenyReason::Unpriceable,
         ContributionOutcome::OutOfRange => DenyReason::OutOfRange,
+        ContributionOutcome::Ungoverned => unreachable!("returned above"),
     };
     let display = gate.display_scope(&scope);
     if gate.mode == Mode::Block {
@@ -975,8 +1220,10 @@ fn decide(
         // zero, but there is nothing exact to charge) so the scope shows up in
         // the ledger and an operator can see the gap; the gap itself is made
         // visible on the header rather than silently inflating or deflating the
-        // running total. At the scope cap nothing is recorded.
-        gate.ledger.record(&scope, 0, now);
+        // running total. At the scope cap, or if the shared ledger is
+        // contended or unavailable, nothing is recorded; the stamp already
+        // flags the call.
+        let _ = gate.ledger.record(&scope, 0, now);
         let stamp = format!("monitor;scope={display};reason={}", reason.label());
         Flow::Continue(Ticket::None(stamp))
     }
@@ -1020,7 +1267,7 @@ async fn request_filter(
 }
 
 /// Milliseconds since the Unix epoch. A clock before the epoch reads as 0.
-fn epoch_ms(time: SystemTime) -> u64 {
+pub(crate) fn epoch_ms(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
@@ -1031,7 +1278,7 @@ fn epoch_ms(time: SystemTime) -> u64 {
 fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
     logger::info!(
         "aggregate-risk-gate: settlement={} active={} committed={} released={} expired={} \
-         late-committed={} late-released={} abandoned={} not-active={}",
+         late-committed={} late-released={} abandoned={} not-active={} deferred={} contended={}",
         settlement.label(),
         stats.active,
         stats.committed,
@@ -1040,7 +1287,9 @@ fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
         stats.late_committed,
         stats.late_released,
         stats.abandoned,
-        stats.not_active
+        stats.not_active,
+        stats.deferred,
+        stats.contended
     );
 }
 
@@ -1102,6 +1351,7 @@ async fn configure(
     Configuration(bytes): Configuration,
     violations: PolicyViolations,
     clock: Clock,
+    store_builder: DataStorageBuilder,
 ) -> Result<()> {
     let config: Config = serde_json::from_slice(&bytes).map_err(|err| {
         anyhow!(
@@ -1112,12 +1362,46 @@ async fn configure(
         )
     })?;
 
-    let gate = Gate::from_config(&config)?;
+    let clock = std::rc::Rc::new(clock);
+    let gate = Gate::from_config_with(&config, |namespace| {
+        let storage = match namespace {
+            None => store_builder.local(NODE_LEDGER_STORE),
+            Some(namespace) => store_builder
+                .clone()
+                .shared()
+                .local(format!("aggregate-risk-gate-ledger-{namespace}")),
+        };
+        Box::new(PdkStore {
+            storage,
+            clock: clock.clone(),
+        })
+    })?;
+    if gate
+        .governed_methods
+        .iter()
+        .any(|method| method == "initialize" || method.starts_with("notifications/"))
+    {
+        logger::warn!(
+            "Aggregate Risk Gate: governedMethods includes initialize or a notifications/* \
+             method; an exhausted budget will then block the MCP handshake or cancellation"
+        );
+    }
+    if config.ledger_backend == "node" && config.scope_digest_key.is_empty() {
+        // Not refused: it is the default configuration, which must start.
+        logger::warn!(
+            "Aggregate Risk Gate: ledgerBackend is node and scopeDigestKey is empty, so \
+             node ledger keys are an unkeyed HMAC of each identity; any filter on this \
+             replica that can list shared-data keys can confirm a guessed identity. \
+             Set scopeDigestKey to a secret."
+        );
+    }
     logger::info!(
-        "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, mode={}",
+        "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, \
+         ledgerBackend={}, mode={}",
         gate.budget_scope,
         gate.aggregate_budget,
         config.contribution,
+        config.ledger_backend,
         if gate.mode == Mode::Block {
             "block"
         } else {
@@ -1151,6 +1435,8 @@ mod test {
             "identityField": "client_id",
             "scopeHeader": "x-agent-id",
             "maxScopes": 10000,
+            "ledgerBackend": "node",
+            "ledgerNamespace": "",
             "reservationTimeoutMs": 60000,
             "scopeDisclosure": "raw",
             "scopeDigestKey": "",
@@ -1159,6 +1445,7 @@ mod test {
             "windowMs": 86400000,
             "contribution": "fixed-weight",
             "fixedWeight": 800,
+            "governedMethods": ["tools/call"],
             "spendAmountField": "params.amount",
             "spendCurrency": "USD",
             "estimatedTokens": 500,
@@ -1883,10 +2170,10 @@ mod test {
         }
         // A duplicate "id" member: a parser-differential body where this
         // policy and the upstream tool could legitimately disagree about
-        // which id is "the" id. This 4th call is a genuine budget-exceeded
-        // denial, but neither id may ever be echoed — fall back to the
-        // generic empty-403, exactly as an unparseable body would (issue #36
-        // containment).
+        // which id is "the" id. This 4th call is denied (a duplicate member
+        // is unpriceable, and the budget is spent anyway), but neither id may
+        // ever be echoed — fall back to the generic empty-403, exactly as an
+        // unparseable body would (issue #36 containment).
         let ambiguous = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","id":999,"params":{}}"#;
         let response = tester.request(raw_request(ambiguous, Some("broker-7")));
         assert!(
@@ -2259,8 +2546,11 @@ mod test {
             contribution: "fixed-weight".to_string(),
             estimated_tokens: 500,
             fixed_weight: 800,
+            governed_methods: vec!["tools/call".to_string()],
             identity_field: "client_id".to_string(),
             identity_source: "authentication".to_string(),
+            ledger_backend: "node".to_string(),
+            ledger_namespace: String::new(),
             max_scopes: 10000,
             reservation_timeout_ms: 60000,
             mode: "block".to_string(),
@@ -2823,5 +3113,892 @@ mod test {
     fn dot_path_value_returns_none_for_an_empty_path_segment() {
         let value = json!({"params": {"amount": 1}});
         assert_eq!(dot_path_value(&value, "params..amount"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Governed methods (P4A review #47): only `governedMethods` are priced;
+    // the rest of the MCP protocol passes through without touching the ledger.
+    // -----------------------------------------------------------------------
+
+    const PASS: &str = "pass;reason=ungoverned-method";
+
+    /// A property store with nothing in it, so `decide` can be driven
+    /// directly against a `Gate` whose ledger the test can then inspect.
+    struct NoProperties;
+    impl PropertyAccessor for NoProperties {
+        fn read_property(&self, _path: &[&str]) -> Option<Vec<u8>> {
+            None
+        }
+        fn set_property(&self, _path: &[&str], _value: Option<&[u8]>) {}
+    }
+
+    fn violations() -> PolicyViolations {
+        PolicyViolations::new(NoProperties, String::new())
+    }
+
+    fn mcp(body: Value) -> UnitHttpRequest {
+        jsonrpc_request(body, Some("broker-7"))
+    }
+
+    /// A client's JSON-RPC response to a server-initiated request.
+    fn elicitation_response() -> Value {
+        json!({"jsonrpc": "2.0", "id": "srv-1", "result": {"action": "accept"}})
+    }
+
+    #[test]
+    fn a_full_mcp_session_runs_on_an_exhausted_spend_budget_and_only_tools_call_is_denied() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({
+                "contribution": "spend-amount",
+                "aggregateBudget": 1000,
+            })))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // Spend the whole budget with one governed call.
+        let spent = tester.request(rpc_request_with_amount(0, "broker-7", 1000));
+        assert_eq!(response_error_code(&spent), None);
+        assert!(backend.next().is_some());
+
+        let session = vec![
+            mcp(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})),
+            mcp(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
+            mcp(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})),
+            mcp(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})),
+            UnitHttpRequest::get()
+                .with_header("accept", "text/event-stream")
+                .with_header("x-agent-id", "broker-7"),
+            mcp(elicitation_response()),
+            UnitHttpRequest::delete()
+                .with_header("mcp-session-id", "session-1")
+                .with_header("x-agent-id", "broker-7"),
+        ];
+        for (step, request) in session.into_iter().enumerate() {
+            let response = tester.request(request);
+            assert_eq!(response.status_code(), 200, "step {step}");
+            assert_eq!(response_error_code(&response), None, "step {step}");
+            assert_eq!(
+                response.header("x-aggregate-risk-gate"),
+                Some(PASS),
+                "step {step}"
+            );
+            assert!(
+                backend.next().is_some(),
+                "step {} must reach upstream",
+                step
+            );
+        }
+
+        let over = tester.request(rpc_request_with_amount(4, "broker-7", 1));
+        assert_eq!(response_error_code(&over), Some(MCP_BLOCKED_CODE));
+        assert!(over
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .contains("would-be-total=1001;budget=1000"));
+        // #18 still holds: a tools/call with no amount is unpriceable.
+        let unpriced = tester.request(rpc_request(5, "broker-7"));
+        assert_eq!(response_error_code(&unpriced), Some(MCP_BLOCKED_CODE));
+        assert_eq!(
+            unpriced.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent:broker-7;reason=unpriceable")
+        );
+        assert!(
+            backend.next().is_none(),
+            "denied calls never reach upstream"
+        );
+    }
+
+    #[test]
+    fn ungoverned_traffic_creates_no_scope_reservation_or_ledger_change() {
+        let gate = gate_with(json!({"contribution": "spend-amount"}));
+        let bodies: Vec<Value> = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 9}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+            elicitation_response(),
+            json!({"jsonrpc": "2.0", "id": "srv-2", "error": {"code": -1, "message": "no"}}),
+            json!([
+                {"jsonrpc": "2.0", "id": 4, "method": "resources/list"},
+                {"jsonrpc": "2.0", "method": "notifications/roots/list_changed"},
+            ]),
+        ];
+        let identities = [
+            Identity::Scope("agent:broker-7".to_string()),
+            Identity::Missing,
+            Identity::Invalid,
+        ];
+        let flows = bodies
+            .iter()
+            .map(|body| body.to_string().into_bytes())
+            .flat_map(|bytes| {
+                identities
+                    .iter()
+                    .map(move |identity| (identity.clone(), bytes.clone()))
+            })
+            .map(|(identity, bytes)| {
+                decide(identity, 0, &gate, RawBody::Present(&bytes), &violations())
+            })
+            .chain(std::iter::once(decide(
+                Identity::Missing,
+                0,
+                &gate,
+                RawBody::NoBody,
+                &violations(),
+            )));
+        for flow in flows {
+            assert!(
+                matches!(flow, Flow::Continue(Ticket::None(ref stamp)) if stamp == PASS),
+                "{:?}",
+                match flow {
+                    Flow::Continue(ticket) => format!("{ticket:?}"),
+                    Flow::Break(_) => "denied".to_string(),
+                }
+            );
+        }
+        assert_eq!(gate.ledger.scope_count(), 0, "no scope entry");
+        assert_eq!(
+            gate.ledger.stats(),
+            LedgerStats::default(),
+            "no ledger change"
+        );
+        assert_eq!(gate.ledger.snapshot("agent:broker-7").total(), 0);
+    }
+
+    #[test]
+    fn ungoverned_traffic_never_takes_a_scope_slot() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"maxScopes": 1})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for agent in ["broker-1", "broker-2", "broker-3"] {
+            let response = tester.request(jsonrpc_request(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+                Some(agent),
+            ));
+            assert_eq!(response.header("x-aggregate-risk-gate"), Some(PASS));
+        }
+        // Had any initialize created a scope, this new identity would hit
+        // the 1-scope cap and be refused with reason=scope-capacity.
+        let response = tester.request(rpc_request(2, "broker-9"));
+        assert_eq!(response_error_code(&response), None);
+        assert!(response
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .starts_with("allowed;scope=agent:broker-9;contribution=800;total=800/3000"));
+    }
+
+    #[test]
+    fn an_exhausted_fixed_weight_budget_still_forwards_initialize_ping_and_cancellation() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for i in 0..3 {
+            assert_eq!(
+                response_error_code(&tester.request(rpc_request(i, "broker-7"))),
+                None
+            );
+        }
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(3, "broker-7"))),
+            Some(MCP_BLOCKED_CODE),
+            "the budget is exhausted"
+        );
+        for body in [
+            json!({"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 11, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}),
+        ] {
+            let response = tester.request(mcp(body.clone()));
+            assert_eq!(response.status_code(), 200, "{body}");
+            assert_eq!(response_error_code(&response), None, "{body}");
+            assert_eq!(
+                response.header("x-aggregate-risk-gate"),
+                Some(PASS),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(4, "broker-7"))),
+            Some(MCP_BLOCKED_CODE),
+            "tools/call is still denied"
+        );
+    }
+
+    #[test]
+    fn an_all_ungoverned_batch_passes_and_is_charged_nothing() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"contribution": "spend-amount"})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            elicitation_response(),
+        ]);
+        let response = tester.request(mcp(batch));
+        assert_eq!(response_error_code(&response), None);
+        assert_eq!(response.header("x-aggregate-risk-gate"), Some(PASS));
+        // The whole budget is still there.
+        let full = tester.request(rpc_request_with_amount(2, "broker-7", 3000));
+        assert_eq!(response_error_code(&full), None);
+        assert!(full
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .contains("contribution=3000;total=3000/3000"));
+    }
+
+    #[test]
+    fn a_mixed_batch_is_charged_only_its_governed_items() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            elicitation_response(),
+        ]);
+        let response = tester.request(mcp(batch));
+        assert_eq!(response_error_code(&response), None);
+        assert!(
+            response
+                .header("x-aggregate-risk-gate")
+                .unwrap()
+                .contains("contribution=1600;total=1600/3000"),
+            "two governed items at 800 each, nothing for the other three"
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_with_an_unpriceable_governed_item_is_denied_with_an_error_per_request_id() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"contribution": "spend-amount"})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 100}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            elicitation_response(),
+        ]);
+        let response = tester.request(mcp(batch));
+        assert!(backend.next().is_none(), "the whole batch is refused");
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent:broker-7;reason=unpriceable")
+        );
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        let errors = body.as_array().expect("batch denial echoes a JSON array");
+        // Every request id, governed or not; never the server's response id.
+        let ids: Vec<&Value> = errors.iter().map(|error| &error["id"]).collect();
+        assert_eq!(ids, [&json!(1), &json!(2), &json!(3)]);
+        for error in errors {
+            assert_eq!(error["error"]["code"], MCP_BLOCKED_CODE);
+        }
+    }
+
+    #[test]
+    fn a_duplicate_method_member_fails_closed() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // Read first-wins this is a ping, last-wins a tools/call. A fresh,
+        // unspent budget: the denial is for the ambiguity alone.
+        let ambiguous =
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","params":{}}"#;
+        let response = tester.request(raw_request(ambiguous, Some("broker-7")));
+        assert!(backend.next().is_none());
+        assert_eq!(response.status_code(), 403, "no id is echoed");
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent:broker-7;reason=unpriceable")
+        );
+        // The same body in a batch fails closed the same way.
+        let batch = format!(r#"[{{"jsonrpc":"2.0","id":2,"method":"tools/list"}},{ambiguous}]"#);
+        let response = tester.request(raw_request(&batch, Some("broker-7")));
+        assert!(backend.next().is_none());
+        assert_eq!(response.status_code(), 403);
+    }
+
+    #[test]
+    fn method_matching_is_exact_and_case_sensitive() {
+        let gate = gate_with(json!({"governedMethods": ["tools/call", "resources/read"]}));
+        let outcome = |body: Value| {
+            let bytes = body.to_string().into_bytes();
+            match compute_contribution(&gate, RawBody::Present(&bytes)) {
+                ContributionOutcome::Known(amount) => Some(amount),
+                ContributionOutcome::Ungoverned => None,
+                _ => panic!("unexpected outcome for {}", body),
+            }
+        };
+        let call = |method: &str| json!({"jsonrpc": "2.0", "id": 1, "method": method});
+        assert_eq!(outcome(call("tools/call")), Some(800));
+        assert_eq!(outcome(call("resources/read")), Some(800));
+        for other in ["Tools/Call", "tools/call ", "tools/", "resources/list", "*"] {
+            assert_eq!(outcome(call(other)), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn an_item_that_cannot_be_classified_stays_governed() {
+        let gate = gate_with(json!({}));
+        for body in [
+            json!({"not": "rpc"}),
+            json!({"id": 1, "method": "initialize"}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": 7}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}, "error": {}}),
+            json!({"jsonrpc": "2.0", "result": {}}),
+            json!([]),
+            json!("tools/call"),
+            // A governed method sent as a notification is still governed.
+            json!({"jsonrpc": "2.0", "method": "tools/call", "params": {}}),
+        ] {
+            let bytes = body.to_string().into_bytes();
+            assert!(
+                matches!(
+                    compute_contribution(&gate, RawBody::Present(&bytes)),
+                    ContributionOutcome::Known(800)
+                ),
+                "{}",
+                body
+            );
+        }
+        // A body this parser rejects may still parse upstream, possibly as a
+        // batch, so it is never priced as one call: it fails closed.
+        let mut lone_surrogate =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"x":""#.to_vec();
+        lone_surrogate.extend_from_slice(br#"\ud800"}}"#);
+        let mut bom = b"\xEF\xBB\xBF".to_vec();
+        bom.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#);
+        for bytes in [b"not json".to_vec(), lone_surrogate, bom] {
+            assert!(
+                matches!(
+                    compute_contribution(&gate, RawBody::Present(&bytes)),
+                    ContributionOutcome::Unpriceable
+                ),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        assert!(matches!(
+            compute_contribution(&gate, RawBody::Uninspectable),
+            ContributionOutcome::Unpriceable
+        ));
+    }
+
+    /// A batch whose item nests past serde's 128-level limit fails to parse
+    /// here, but a parser without that limit could run every item. It must
+    /// fail closed, not be charged as a single call.
+    #[test]
+    fn a_batch_nested_past_the_parser_limit_fails_closed() {
+        let deep = format!("{}0{}", "[".repeat(200), "]".repeat(200));
+        let item = |id: u64| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{"x":{}}}}}"#,
+                id, deep
+            )
+        };
+        let body = format!("[{},{},{}]", item(1), item(2), item(3));
+        assert!(serde_json::from_str::<Value>(&body).is_err());
+
+        let gate = gate_with(json!({}));
+        assert!(matches!(
+            compute_contribution(&gate, RawBody::Present(body.as_bytes())),
+            ContributionOutcome::Unpriceable
+        ));
+
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let response = tester.request(raw_request(&body, Some("broker-7")));
+        assert!(backend.next().is_none(), "must never reach upstream");
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(header.contains("reason=unpriceable"), "{}", header);
+    }
+
+    fn charset_request(content_type: &str, body: &str) -> UnitHttpRequest {
+        UnitHttpRequest::post()
+            .with_header("content-type", content_type)
+            .with_header("content-length", body.len().to_string())
+            .with_header("x-agent-id", "broker-7")
+            .with_body(body.as_bytes().to_vec())
+    }
+
+    /// Under UTF-7, `tools+AC8-call` decodes to `tools/call`. Read as UTF-8 it
+    /// is an unlisted method, so a body in any charset but UTF-8 must not be
+    /// classified at all: it is uninspectable and fails closed.
+    const UTF7_TOOLS_CALL: &str =
+        r#"{"jsonrpc":"2.0","id":9,"method":"tools+AC8-call","params":{"name":"place_order"}}"#;
+
+    #[test]
+    fn a_non_utf8_charset_is_uninspectable_and_denied_in_block_mode() {
+        for content_type in [
+            "application/json; charset=utf-7",
+            "application/json;charset=UTF-7",
+            "application/json; charset=\"utf-7\"",
+            "application/json; charset=utf-16",
+            "application/json; charset=iso-8859-1",
+            "application/json; charset=",
+            "application/json; charset",
+            "application/json; charset=utf-8; charset=utf-7",
+            "application/vnd.api+json; charset=utf-7",
+        ] {
+            let backend = Rc::new(TraceBackend::new(ok_backend));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            let response = tester.request(charset_request(content_type, UTF7_TOOLS_CALL));
+            assert!(
+                backend.next().is_none(),
+                "{} must never reach upstream",
+                content_type
+            );
+            assert_eq!(response.status_code(), 403, "{}", content_type);
+            let header = response.header("x-aggregate-risk-gate").unwrap();
+            assert!(
+                header.contains("reason=unpriceable"),
+                "{}: {}",
+                content_type,
+                header
+            );
+            assert_ne!(header, PASS, "{}", content_type);
+        }
+    }
+
+    #[test]
+    fn a_non_utf8_charset_is_flagged_unpriceable_in_monitor_mode() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"mode": "monitor"})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let response = tester.request(charset_request(
+            "application/json; charset=utf-7",
+            UTF7_TOOLS_CALL,
+        ));
+        assert!(backend.next().is_some(), "monitor mode forwards");
+        let header = response.header("x-aggregate-risk-gate").unwrap();
+        assert!(
+            header.starts_with("monitor;") && header.contains("reason=unpriceable"),
+            "{}",
+            header
+        );
+    }
+
+    #[test]
+    fn a_utf8_or_absent_charset_is_still_inspected() {
+        let tools_call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
+        let tools_list = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "application/json; charset=UTF-8",
+            "application/json;charset = \"Utf-8\" ",
+            "application/json; profile=x; charset=utf-8",
+            "application/vnd.api+json; charset=utf-8",
+        ] {
+            let backend = Rc::new(TraceBackend::new(ok_backend));
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(Rc::clone(&backend))
+                .with_entrypoint(super::configure);
+            let admitted = tester.request(charset_request(content_type, tools_call));
+            assert!(backend.next().is_some(), "{}", content_type);
+            let header = admitted.header("x-aggregate-risk-gate").unwrap();
+            assert!(
+                header.starts_with("allowed;") && header.contains("contribution=800"),
+                "{}: {}",
+                content_type,
+                header
+            );
+            let passed = tester.request(charset_request(content_type, tools_list));
+            assert!(backend.next().is_some(), "{}", content_type);
+            assert_eq!(
+                passed.header("x-aggregate-risk-gate"),
+                Some(PASS),
+                "{}",
+                content_type
+            );
+        }
+    }
+
+    #[test]
+    fn governed_methods_rejects_empty_blank_padded_duplicate_and_wildcard_lists() {
+        for bad in [
+            vec![],
+            vec![""],
+            vec!["   "],
+            vec![" tools/call"],
+            vec!["tools/call", "tools/call"],
+            vec!["*"],
+            vec!["tools/call", "*"],
+        ] {
+            let mut cfg = valid_config_struct();
+            cfg.governed_methods = bad.iter().map(|m| m.to_string()).collect();
+            assert!(
+                Gate::from_config(&cfg).is_err(),
+                "governedMethods {:?}",
+                bad
+            );
+        }
+        for good in [vec!["tools/call"], vec!["tools/call", "resources/read"]] {
+            let mut cfg = valid_config_struct();
+            cfg.governed_methods = good.iter().map(|m| m.to_string()).collect();
+            assert!(
+                Gate::from_config(&cfg).is_ok(),
+                "governedMethods {:?}",
+                good
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Settlement is by HTTP status only (P4A review #49, finding B).
+    // -----------------------------------------------------------------------
+
+    fn status_backend(
+        status: u32,
+        body: &'static str,
+    ) -> impl Fn(UnitHttpRequest) -> UnitHttpResponse {
+        move |_req| {
+            UnitHttpResponse::new(status)
+                .with_header("content-type", "application/json")
+                .with_header("content-length", body.len().to_string())
+                .with_body(body.as_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn settlement_commits_2xx_and_3xx_and_releases_4xx_and_5xx() {
+        for (status, settlement) in [
+            (200, "committed"),
+            (202, "committed"),
+            (302, "committed"),
+            (404, "released"),
+            (500, "released"),
+            (504, "released"),
+        ] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(status_backend(status, ""))
+                .with_entrypoint(super::configure);
+            let first = tester.request(rpc_request(1, "broker-7"));
+            assert!(
+                first
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .ends_with(&format!(";settlement={settlement}")),
+                "{status}: {:?}",
+                first.header("x-aggregate-risk-gate")
+            );
+            // The next call's running total shows whether 800 was charged.
+            let charged = if settlement == "committed" { 1600 } else { 800 };
+            let second = tester.request(rpc_request(2, "broker-7"));
+            assert!(
+                second
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .contains(&format!("total={charged}/3000")),
+                "{status}: {:?}",
+                second.header("x-aggregate-risk-gate")
+            );
+        }
+    }
+
+    #[test]
+    fn a_jsonrpc_error_or_is_error_result_inside_an_http_200_is_charged() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"tool failed"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[],"isError":true}}"#,
+        ] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(status_backend(200, body))
+                .with_entrypoint(super::configure);
+            let first = tester.request(rpc_request(1, "broker-7"));
+            assert!(
+                first
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .ends_with(";settlement=committed"),
+                "{}",
+                body
+            );
+            let second = tester.request(rpc_request(2, "broker-7"));
+            assert!(
+                second
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .contains("total=1600/3000"),
+                "the failed tool call was charged: {}",
+                body
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ledger backends (P4A review #48).
+    // -----------------------------------------------------------------------
+
+    /// A node-backend gate whose fake shared store the test can steer.
+    fn node_gate(overrides: Value) -> (Gate, node_ledger::fake::FakeStore) {
+        let store = node_ledger::fake::FakeStore::default();
+        let cfg: Config = serde_json::from_str(&config(overrides)).unwrap();
+        let handle = store.clone();
+        let gate = Gate::from_config_with(&cfg, move |_| Box::new(handle)).unwrap();
+        (gate, store)
+    }
+
+    fn tools_call() -> Vec<u8> {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}})
+            .to_string()
+            .into_bytes()
+    }
+
+    fn scope_of(agent: &str) -> Identity {
+        Identity::Scope(format!("agent:{agent}"))
+    }
+
+    #[test]
+    fn a_contended_node_ledger_fails_closed_in_block_mode() {
+        let (gate, store) = node_gate(json!({}));
+        store.force_mismatches(u32::MAX);
+        let body = tools_call();
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(matches!(flow, Flow::Break(_)));
+        store.force_mismatches(0);
+        assert_eq!(gate.ledger.snapshot("agent:b7").total(), 0);
+        assert_eq!(gate.ledger.stats().contended, 1);
+        assert_eq!(
+            DenyReason::LedgerContention.stamp("agent:b7", "points"),
+            "denied;scope=agent:b7;reason=ledger-contention"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_node_ledger_fails_closed_in_block_mode() {
+        let (gate, store) = node_gate(json!({}));
+        store.set_failing(true);
+        let body = tools_call();
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(matches!(flow, Flow::Break(_)));
+        store.set_failing(false);
+        assert_eq!(gate.ledger.snapshot("agent:b7").total(), 0);
+    }
+
+    #[test]
+    fn a_contended_or_unavailable_node_ledger_is_forwarded_and_flagged_in_monitor_mode() {
+        let (gate, store) = node_gate(json!({"mode": "monitor"}));
+        let body = tools_call();
+        store.force_mismatches(u32::MAX);
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(
+            matches!(flow, Flow::Continue(Ticket::None(ref stamp))
+                if stamp == "monitor;scope=agent:b7;reason=ledger-contention"),
+            "{:?}",
+            flow
+        );
+        store.force_mismatches(0);
+        store.set_failing(true);
+        let flow = decide(
+            scope_of("b7"),
+            0,
+            &gate,
+            RawBody::Present(&body),
+            &violations(),
+        );
+        assert!(
+            matches!(flow, Flow::Continue(Ticket::None(ref stamp))
+                if stamp == "monitor;scope=agent:b7;reason=ledger-unavailable"),
+            "{:?}",
+            flow
+        );
+    }
+
+    #[test]
+    fn a_saturated_scope_fails_closed_in_block_mode_and_is_flagged_in_monitor_mode() {
+        // P4A review M1: a scope record holds at most MAX_HELD in-flight
+        // reservations; past that a call is refused, never grown into.
+        for mode in ["block", "monitor"] {
+            let (gate, _store) = node_gate(json!({
+                "mode": mode, "fixedWeight": 1, "aggregateBudget": 1_000_000
+            }));
+            let body = tools_call();
+            for _ in 0..crate::ledger::MAX_HELD {
+                let flow = decide(
+                    scope_of("b7"),
+                    0,
+                    &gate,
+                    RawBody::Present(&body),
+                    &violations(),
+                );
+                assert!(
+                    matches!(flow, Flow::Continue(Ticket::Reserved(..))),
+                    "{}",
+                    mode
+                );
+            }
+            let flow = decide(
+                scope_of("b7"),
+                0,
+                &gate,
+                RawBody::Present(&body),
+                &violations(),
+            );
+            if mode == "block" {
+                assert!(matches!(flow, Flow::Break(_)));
+            } else {
+                assert!(
+                    matches!(flow, Flow::Continue(Ticket::None(ref stamp))
+                        if stamp == "monitor;scope=agent:b7;reason=scope-saturated"),
+                    "{:?}",
+                    flow
+                );
+            }
+            assert_eq!(
+                gate.ledger.snapshot("agent:b7").reserved,
+                crate::ledger::MAX_HELD as u64
+            );
+        }
+        assert_eq!(
+            DenyReason::ScopeSaturated.stamp("agent:b7", "points"),
+            "denied;scope=agent:b7;reason=scope-saturated"
+        );
+    }
+
+    #[test]
+    fn two_node_gates_on_one_store_share_one_budget() {
+        let (a, store) = node_gate(json!({}));
+        let cfg: Config = serde_json::from_str(&config(json!({}))).unwrap();
+        let handle = store.clone();
+        let b = Gate::from_config_with(&cfg, move |_| Box::new(handle)).unwrap();
+        let body = tools_call();
+        let admitted = (0..10)
+            .filter(|i| {
+                let gate = if i % 2 == 0 { &a } else { &b };
+                matches!(
+                    decide(
+                        scope_of("b7"),
+                        0,
+                        gate,
+                        RawBody::Present(&body),
+                        &violations()
+                    ),
+                    Flow::Continue(Ticket::Reserved(..))
+                )
+            })
+            .count();
+        assert_eq!(admitted, 3, "budget 3000 at weight 800 across both workers");
+    }
+
+    #[test]
+    fn the_worker_backend_keeps_one_ledger_per_gate() {
+        let a = gate_with(json!({"ledgerBackend": "worker"}));
+        let b = gate_with(json!({"ledgerBackend": "worker"}));
+        let body = tools_call();
+        let admitted = (0..10)
+            .filter(|i| {
+                let gate = if i % 2 == 0 { &a } else { &b };
+                matches!(
+                    decide(
+                        scope_of("b7"),
+                        0,
+                        gate,
+                        RawBody::Present(&body),
+                        &violations()
+                    ),
+                    Flow::Continue(Ticket::Reserved(..))
+                )
+            })
+            .count();
+        assert_eq!(admitted, 6, "each worker admits the full budget");
+    }
+
+    #[test]
+    fn the_worker_backend_runs_through_the_filter() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"ledgerBackend": "worker"})))
+            .with_backend(Rc::new(TraceBackend::new(ok_backend)))
+            .with_entrypoint(super::configure);
+        let errors: Vec<Option<i64>> = (0..4)
+            .map(|i| response_error_code(&tester.request(rpc_request(i, "broker-7"))))
+            .collect();
+        assert_eq!(errors, vec![None, None, None, Some(-32008)]);
+    }
+
+    #[test]
+    fn a_cluster_ledger_is_rejected_as_not_implemented() {
+        let mut cfg = valid_config_struct();
+        cfg.ledger_backend = "cluster".to_string();
+        let err = Gate::from_config(&cfg).err().unwrap().to_string();
+        assert!(err.contains("not implemented"), "{}", err);
+        cfg.ledger_backend = "redis".to_string();
+        assert!(Gate::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn the_ledger_namespace_is_validated() {
+        for ok in ["", "team-a", "fabric.v1_2", &"n".repeat(64)] {
+            let mut cfg = valid_config_struct();
+            cfg.ledger_namespace = ok.to_string();
+            assert!(Gate::from_config(&cfg).is_ok(), "{:?}", ok);
+        }
+        for bad in ["a b", "a:b", "a/b", &"n".repeat(65), "é"] {
+            let mut cfg = valid_config_struct();
+            cfg.ledger_namespace = bad.to_string();
+            assert!(Gate::from_config(&cfg).is_err(), "{:?}", bad);
+        }
+        let mut cfg = valid_config_struct();
+        cfg.ledger_backend = "worker".to_string();
+        cfg.ledger_namespace = "team-a".to_string();
+        assert!(Gate::from_config(&cfg).is_err(), "namespace needs node");
+    }
+
+    #[test]
+    fn the_node_ledger_store_is_opened_in_the_configured_namespace() {
+        let mut cfg = valid_config_struct();
+        let seen = std::cell::RefCell::new(Vec::new());
+        for namespace in ["", "team-a"] {
+            cfg.ledger_namespace = namespace.to_string();
+            Gate::from_config_with(&cfg, |ns| {
+                seen.borrow_mut().push(ns.map(str::to_string));
+                Box::new(node_ledger::fake::FakeStore::default())
+            })
+            .unwrap();
+        }
+        assert_eq!(*seen.borrow(), vec![None, Some("team-a".to_string())]);
     }
 }

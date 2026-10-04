@@ -58,7 +58,7 @@ Exchange deployment.
 | Policy | The problem it answers | What it does |
 | --- | --- | --- |
 | [Approval-to-Execution Binding](approval-execution-binding/README.md) | "The agent got approval for one action and executed a different one." | On MCP `tools/call` only (other methods pass through), checks five ABV v0.1 predicates against the approval record: **P1** action, **P2** canonical argument bytes, **P4** valid at execution, **P5** separate attester, and opt-in **P6** single use. Denies with JSON-RPC `-32008` or an empty `403`, in block or monitor mode. |
-| [Cross-Session Aggregate-Risk Gate](aggregate-risk-gate/README.md) | "Every call passed its per-session cap, but together they blew past our exposure budget." | Reserves each call's contribution against a shared budget before forwarding it, and refuses the call that would push the total over. The budget is keyed on a verified identity and counted as exact integers, and it uses a fixed accounting window. Reservations whose responses never arrive are reclaimed. Block or monitor mode. |
+| [Cross-Session Aggregate-Risk Gate](aggregate-risk-gate/README.md) | "Every call passed its per-session cap, but together they blew past our exposure budget." | On MCP `tools/call` only by default (`governedMethods`; the handshake, pings, notifications and transport requests pass through uncharged), reserves each call's contribution against a shared budget before forwarding it, and refuses the call that would push the total over. The budget is keyed on a verified identity and counted as exact integers, and it uses a fixed accounting window. Reservations whose responses never arrive are reclaimed. Block or monitor mode. |
 
 Each policy README covers that policy's configuration, admission rules, protocol
 behavior, framework mapping and honesty boundaries. The two are **independent**
@@ -154,11 +154,12 @@ Every pull request and every push to `main` runs the
 | `policies` | For each policy: `rustfmt --check`, strict Clippy (`-D warnings`), library tests, integration-test compilation and a release WASM build, all against the committed lockfile |
 | `exchange-assets` | The full PDK packaging path (`make build`) from a clean checkout. It fails if the generated config drifts from `gcl.yaml`, and it validates the Exchange metadata with `scripts/check_exchange_metadata.py`. |
 | `runtime-e2e` | Builds the aggregate-risk gate and runs its `#[pdk_test]` suites against a **real Flex Gateway 1.14.0 container**, using a disposable local-mode identity held in a repository secret. It then scans the evidence for identifiers. |
+| `runtime-e2e-approval` | The same for Approval-to-Execution Binding: its `#[pdk_test]` suite on a real Flex Gateway 1.14.0 container, including the check that the `rpc-param` envelope is stripped before the upstream with a correct `content-length`. Both runtime jobs share a `flex-registration` concurrency group, so the one registration is never used by two runners at once, and their full test output goes only to identifier-scanned log files. |
 
 The packaging and runtime jobs need repository secrets, so pull requests from
 forks skip them.
 
-Current library test counts: **46** for Approval-to-Execution Binding and **140**
+Current library test counts: **97** for Approval-to-Execution Binding and **205**
 for the aggregate-risk gate.
 
 To run the CI's `policies` checks locally, from a policy directory:
@@ -193,15 +194,20 @@ The [docs index](docs/README.md) lists every report with its evidence file.
   domain-separated `mcp-v1` payload, so it gives separation of duties, not
   non-repudiation. The executor identity P5 checks comes from verified
   authentication data, not from a header the caller sets.
-- **P6 single use is per replica.** The nonce store is gateway `local()` storage, so
-  a replay can succeed on a second replica or after a restart. A shared store would
-  make single use global.
-- **The aggregate budget is per worker.** Each gateway worker holds its own ledger
-  with the full budget, so `N` workers can admit up to `N × aggregateBudget`. Setting
-  `FLEX_SERVICE_ENVOY_CONCURRENCY=1` gives one budget per replica. A restart resets
-  the ledger, and so does a config apply that rebuilds the listener (the gateway
-  does this once at startup). A UI Save & Apply with no config change was tested and
-  did not reset it. A shared, durable ledger is planned v2 work.
+- **P6 single use is per gateway replica, until restart.** The nonce store is gateway
+  `local()` storage, so a replay can succeed on a second replica or after a restart.
+  Run P6 flows on a single replica. The store is capped at a fixed number of nonces
+  per replica (see the policy README). A shared store with a TTL would make single
+  use global.
+- **The aggregate budget is per gateway replica, and a restart resets it.** By default
+  (`ledgerBackend: node`) every worker of a replica shares one ledger in the gateway's
+  node-local data, with compare-and-swap writes, so more connections don't multiply the
+  budget. Replicas are still independent: with `R` replicas a scope can reach
+  `R × aggregateBudget`, so divide by `R` or run one. The ledger is not durable, so a
+  gateway process restart resets it. The opt-in `ledgerBackend: worker` keeps one ledger
+  per worker, which a caller *can* multiply across `N` workers: divide by `N` or set
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1`. A ledger shared across replicas
+  (`ledgerBackend: cluster`) is not implemented and is rejected.
 - **Bounded inspection.** Both policies inspect admitted JSON-RPC envelopes and
   bodies. They do not inspect URL paths, query strings or arbitrary headers, and
   they never treat a header as trusted provenance.

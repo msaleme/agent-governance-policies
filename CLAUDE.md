@@ -37,8 +37,8 @@ cargo +1.89.0 test --tests --no-run --locked --offline      # integration tests 
 cargo +1.89.0 build --release --target wasm32-wasip1 --locked
 ```
 
-The `--lib` test suite is the authoritative gate, at 46 tests for approval binding
-and 140 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
+The `--lib` test suite is the authoritative gate, at 97 tests for approval binding
+and 205 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
 those counts. CI's `runtime-e2e` job runs the aggregate-risk `#[pdk_test]` suites
 on a real Flex Gateway 1.14.0 container. Its `case2c` is run by hand. Regenerate config assets with the
 Makefile (`make build-asset-files`) after changing `definition/gcl.yaml`.
@@ -51,7 +51,8 @@ Makefile (`make build-asset-files`) after changing `definition/gcl.yaml`.
   untracked. Scan before any push.
 - **Honesty over polish.** Framework references (NIST/OWASP/MITRE/EU AI Act/AIUC-1)
   are design and supporting-measure context, never certification claims. State
-  every limitation plainly: the per-worker ledger, which a restart resets; HMAC-only
+  every limitation plainly: the aggregate ledger is per replica (per worker with
+  `ledgerBackend: worker`) and a restart resets it; HMAC-only
   attestation; and P6 single use being per replica on `local()`. Do not weaken a
   test to make a gate pass; do not invent framework IDs, benchmarks, or counts.
 - **The repo is PUBLIC.** Never commit org, environment or client ids, hostnames,

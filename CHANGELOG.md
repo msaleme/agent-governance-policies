@@ -2,7 +2,113 @@
 
 ## Unreleased
 
-Nothing yet.
+Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
+
+### Aggregate-Risk Gate
+
+- **Breaking: only governed methods are priced (#47).** The new `governedMethods` property
+  (default `["tools/call"]`) lists the JSON-RPC methods that are priced and reserved. Other
+  methods, notifications, client responses and bodyless requests (the SSE `GET`, the session
+  `DELETE`) pass through with no contribution and no ledger or scope entry, stamped
+  `pass;reason=ungoverned-method`. Under `spend-amount` in block mode, an MCP client can now
+  complete the handshake. An exhausted budget no longer blocks `initialize`, `ping`,
+  cancellation or teardown. Batches are priced on their governed items only. A duplicate
+  `method` member, or any duplicate member in a priced body, fails closed. Empty, blank,
+  duplicate and `"*"` entries are rejected at configure time.
+- **Ledger hardening (P4A review of #53).** A scope record is capped at 512 held reservations
+  plus tombstones on both backends; past that a call is refused with the new
+  `reason=scope-saturated` (block fails closed, monitor forwards and flags). A zero contribution
+  creates no entry and settles as a no-op. On the node backend, a commit that cannot be written to
+  its record is persisted to a per-reservation commit marker, and no worker reclaims a reservation
+  or drops its tombstone without claiming that marker by compare-and-swap, so a deferred commit
+  is no longer under-counted when its worker goes idle or its VM restarts. A raw empty host value
+  (fixint `Eof`) now reads as absent instead of failing. Ledger keys sit under a fingerprint of
+  `scopeDigestKey`, `window` and `windowMs`, so a reconfiguration starts a fresh ledger instead
+  of leaving old records holding `maxScopes` slots; the reconfigure effects (a key rotation is a
+  budget reset for every identity) and the worker-lifetime slot behaviour are documented. An empty
+  `scopeDigestKey` with the node backend (the default) logs a startup warning; it is not refused,
+  because that would stop the default configuration from starting.
+- **Settlement documented (#49, finding B).** Settlement is by HTTP status only: 2xx and 3xx
+  commit, 4xx and 5xx release. A JSON-RPC error or `isError` result inside an HTTP 200 is
+  charged. Tests pin the mapping.
+- **Node-wide ledger, now the default (#48).** The new `ledgerBackend` property selects where the
+  ledger lives. `node` (the default) keeps it in the gateway's node-local shared data (PDK
+  `LocalDataStorage`, through the `experimental_storage_sync` feature), so every Envoy worker of a
+  replica checks and reserves against one budget and opening more connections no longer multiplies
+  it. Every write is a compare-and-swap inside a bounded retry loop (12 attempts, no sleep), with
+  no read-then-write fallback and no unconditional overwrite. When retries run out, block mode
+  denies with `reason=ledger-contention`; a storage error denies with `reason=ledger-unavailable`;
+  monitor mode forwards both and flags them. Settlement keeps the #17 rules across workers and is
+  safe by direction: an unwritable commit is queued and retried (`settlement=deferred`, and a
+  long queue refuses new reservations) and is charged even after its reservation is reclaimed; a
+  commit whose record reads as missing within the reservation's lifetime is charged, not dropped;
+  and an unwritable release stays held until reclaimed. Only the cleanup pass that marks a
+  tombstone deletes it, timed on the gateway clock. A zero-length stored value reads as absent,
+  so an empty record never wedges a scope closed. A refused call still saves its reclaim, so a
+  touch past two timeouts drops a tombstone on the node backend exactly as on the worker one. Remaining known edges are listed in the policy
+  README.
+  Keys are an HMAC of the scope, never the raw identity, private to the policy instance unless the
+  new `ledgerNamespace` is set. Stale keys are deleted, and `maxScopes` is enforced per replica
+  without evicting live state. `worker` keeps the old per-worker ledger, whose multiplier and
+  `FLEX_SERVICE_ENVOY_CONCURRENCY=1` workaround are still disclosed. `cluster` is rejected as not
+  implemented. The node budget is per replica and resets when the gateway process restarts.
+- **A refusal at the scope cap is cheap (#49, finding A).** The worker ledger keeps scopes ordered
+  by when each becomes idle, so a new scope at the cap examines at most one candidate instead of
+  scanning every live scope; a test refuses 1,000 new scopes against 100,000 live ones. On the
+  node ledger a refusal at the cap reads two small records, and only one worker per replica
+  rescans, at most once a second.
+- **Charset and unparseable bodies fail closed.** A body is inspected only when its
+  `Content-Type` has no `charset` or `charset=utf-8`. Any other charset makes it
+  uninspectable, so a `tools/call` can't be hidden by an encoding the upstream decodes
+  differently, such as `utf-7`. A body the JSON parser rejects (nesting too deep, a lone
+  surrogate, a BOM) is now unpriceable instead of being charged as a single call.
+- Library tests: 192 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
+  under `spend-amount` in block mode. New real-gateway cases: `case8n` asserts exactly 3 of 200
+  admitted across four Envoy workers with the node ledger, and `case8nb` records whether the node
+  ledger survives the startup config apply.
+
+### Approval-to-Execution Binding
+
+- **Only POST is bound (#50).** In both modes, bodyless `GET`, `DELETE`, `OPTIONS` and `HEAD`
+  requests are forwarded untouched, stamped `out-of-scope`. A POST without a valid
+  `content-length` is still denied, now stamped `denied;framing=content-length`.
+- **P6 claim narrowed, nonce store capped (#51).** Every P6 description now says single use
+  holds per gateway replica, until restart. The nonce store has a fixed per-replica cap. At the
+  cap, nonces of approvals already expired under P4 are swept, and if the store is still full
+  the call is denied.
+- **Canonical form hardened (#52).** Integers outside ±(2^53−1), and objects whose keys sort
+  differently by UTF-8 bytes and UTF-16 code units, now fail closed.
+- **Maximum approval lifetime (#52).** The new optional `maxApprovalLifetimeSeconds` (default
+  `0`, off; range 1–31536000) bounds an approval's remaining lifetime under P4: an approval whose
+  `not_after` is later than now + the maximum + `clockSkewSeconds`, on the gateway clock, is
+  denied `predicate=P4`. Setting it without P4 in `requiredPredicates` fails at startup. It
+  checks `not_after` rather than adding an `iat` claim, so the `mcp-v1` payload and the ABV
+  corpus are unchanged. `not_after` is authenticated only when P5 is required.
+- **`rpc-param` envelope removed before upstream (#52).** With `approvalSource: rpc-param`, the
+  top-level `approvalRpcField` member is now cut out of every forwarded body (an allowed call, or
+  a monitor-mode forward), byte-for-byte with one adjoining comma; the rest of the body is not
+  re-serialized. The result is re-parsed and must equal the original minus that member, or block
+  mode denies the call as malformed. `content-length` is set to the new length, because PDK 1.10's
+  `set_body` does not update it. The new `stripApprovalEnvelope` (default `true`) turns this off.
+  Header mode is unchanged.
+- **CI** runs the approval-binding `#[pdk_test]` suite on a real Flex Gateway 1.14.0 container
+  (new `runtime-e2e-approval` job). It asserts that the upstream receives the exact stripped
+  bytes and the rewritten `content-length`. Both runtime jobs share one `flex-registration`
+  concurrency group, and their full test output goes only to scanned log files.
+- **Breaking: `clockSkewSeconds` is bounded to 0–3600.** Before, a negative value was treated as
+  `0` and there was no upper limit, so a very large skew overflowed the P4 deadline and silently
+  disabled expiry and the lifetime bound; it could also wrap a P6 nonce's stored expiry into the
+  past, so the cap sweep could delete a live nonce. Out-of-range values are now rejected at
+  startup, P4 fails closed if the deadline can't be computed, and a nonce expiry that can't be
+  represented is never swept.
+- **Charset and unparseable bodies fail closed.** A body with a `charset` other than
+  `utf-8` is treated as malformed (denied in block mode, flagged in monitor mode). Before,
+  `charset=utf-7` could carry a `tools/call` the policy read as an unknown method and
+  forwarded unchecked. Bodies the JSON parser rejects already failed closed; tests now pin it.
+- The P6 cap sweep runs only when the per-worker reservation count reaches the cap, so the
+  normal path makes the same single atomic store call as before. The cap is approximate and
+  the sweep's key listing is not yet verified on a real gateway.
+- Library tests: 97 (was 46).
 
 ## 0.1.0-rc.1 — 2026-10-03
 

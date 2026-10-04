@@ -17,13 +17,19 @@ implementation_asset_id = "aggregate-risk-gate-flex"
 [dependencies]
 # enable_stop_iteration exposes into_headers_body_state, so a single filter can
 # both inspect the body and stamp/modify headers on the same request/response.
-pdk = { version = "=1.10.0", features = ["enable_stop_iteration"] }
+# experimental_storage_sync exposes the synchronous shared-data handle the
+# node ledger (ledgerBackend: node) uses inside one filter callback.
+pdk = { version = "=1.10.0", features = ["enable_stop_iteration", "experimental_storage_sync"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 anyhow = "1.0"
 # HMAC-SHA256 digest of the scope key for client-visible headers (issue #14).
 sha2 = { version = "0.10", default-features = false }
 hmac = { version = "0.12", default-features = false }
+# The encoding PDK local storage reads values with: named only to tell a raw
+# empty host value (`Error::Eof`) from other read errors. Pinned to the
+# version pdk-data-storage-lib already resolves, so no new code is pulled in.
+serde_fixint = { package = "pdk-serde-fixint", version = "=1.11.0" }
 
 [dev-dependencies]
 pdk-test = { version = "=1.10.0" }

@@ -11,10 +11,16 @@ pub struct Config {
     pub estimated_tokens: i64,
     #[serde(alias = "fixedWeight")]
     pub fixed_weight: i64,
+    #[serde(alias = "governedMethods")]
+    pub governed_methods: Vec<String>,
     #[serde(alias = "identityField")]
     pub identity_field: String,
     #[serde(alias = "identitySource")]
     pub identity_source: String,
+    #[serde(alias = "ledgerBackend")]
+    pub ledger_backend: String,
+    #[serde(alias = "ledgerNamespace")]
+    pub ledger_namespace: String,
     #[serde(alias = "maxScopes")]
     pub max_scopes: i64,
     #[serde(alias = "mode")]
