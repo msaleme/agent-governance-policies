@@ -13,8 +13,9 @@
 // `pdk_unit` harness. This file adds only what a unit-test harness cannot
 // exercise: the request actually traveling through a real Flex Gateway
 // container to a real upstream, end to end, in an allow (P1+P2) and a block-mode
-// P1-deny path. It intentionally does not repeat the unit tests' predicate-by-
-// predicate coverage.
+// P1-deny path, plus the #50 transport pass-through (GET SSE stream and DELETE
+// session forwarded `out-of-scope`; an unapproved tools/call still denied). It
+// intentionally does not repeat the unit tests' predicate-by-predicate coverage.
 //
 // SCOPE: these two e2e tests exercise ONLY P1 (action) and P2 (canonical
 // argument match) — the predicates that need no external prerequisite. P5
@@ -260,7 +261,118 @@ async fn action_mismatch_is_denied_end_to_end_and_never_reaches_upstream() -> an
     Ok(())
 }
 
-// Connected extension; the original two composites above remain unchanged.
+/// #50: in block mode the MCP Streamable-HTTP transport requests that are not
+/// JSON-RPC calls — the `GET` that opens the SSE stream and the `DELETE` that
+/// ends a session — reach upstream stamped `out-of-scope`, while a `tools/call`
+/// POST with no approval is still denied and never reaches upstream.
+#[pdk_test]
+async fn transport_get_and_delete_pass_through_while_unapproved_call_is_denied(
+) -> anyhow::Result<()> {
+    let httpmock_config = HttpMockConfig::builder()
+        .port(80)
+        .version("latest")
+        .hostname("backend")
+        .build();
+    let policy_config = PolicyConfig::builder()
+        .name(POLICY_NAME)
+        .configuration(approval_policy_config(&["P1", "P2"]))
+        .build();
+    let api_config = ApiConfig::builder()
+        .name("myApi")
+        .upstream(&httpmock_config)
+        .path("/mcp/")
+        .port(FLEX_PORT)
+        .policies([policy_config])
+        .build();
+    let flex_config = FlexConfig::builder()
+        .version("1.14.0")
+        .hostname("local-flex")
+        .with_api(api_config)
+        .config_mounts([
+            (POLICY_DIR, "custom-policies"),
+            (COMMON_CONFIG_DIR, "common"),
+        ])
+        .build();
+    let composite = TestComposite::builder()
+        .with_service(flex_config)
+        .with_service(httpmock_config)
+        .build()
+        .await?;
+
+    let flex: Flex = composite.service()?;
+    let flex_url = flex.external_url(FLEX_PORT).unwrap();
+    let httpmock: HttpMock = composite.service()?;
+    let mock_server = MockServer::connect_async(httpmock.socket()).await;
+    let sse = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::GET)
+                .header("x-approval-binding", "out-of-scope");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(": stream open\n\n");
+        })
+        .await;
+    let teardown = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .header("x-approval-binding", "out-of-scope");
+            then.status(200);
+        })
+        .await;
+    let calls = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body("{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{}}");
+        })
+        .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let get = client
+        .get(&flex_url)
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", "e2e-session")
+        .send()
+        .await?;
+    assert_eq!(get.status(), 200, "GET SSE stream must not be denied");
+    sse.assert_async().await;
+
+    let delete = client
+        .delete(&flex_url)
+        .header("mcp-session-id", "e2e-session")
+        .send()
+        .await?;
+    assert_eq!(delete.status(), 200, "DELETE session must not be denied");
+    teardown.assert_async().await;
+
+    let unapproved = client
+        .post(&flex_url)
+        .header("content-type", "application/json")
+        .header("client_id", "executor.example")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": {"name": "deploy.apply", "arguments": {"confirm": true}}
+            })
+            .to_string(),
+        )
+        .send()
+        .await?;
+    assert_eq!(unapproved.status(), 200);
+    let body: serde_json::Value = serde_json::from_str(&unapproved.text().await?)?;
+    assert_eq!(body["error"]["code"], -32008);
+    assert_eq!(
+        calls.hits_async().await,
+        0,
+        "an unapproved tools/call must never reach upstream"
+    );
+    Ok(())
+}
+
+// Connected extension; the original composites above remain unchanged.
 // Use a dedicated authorized Docker daemon: pdk-test purges its own labels.
 // The fixture is private, contains fresh credentials, and must never be logged.
 #[derive(serde::Deserialize)]

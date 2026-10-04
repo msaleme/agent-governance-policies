@@ -9,8 +9,14 @@
 //!   * P5 authenticates the versioned, domain-separated `mcp-v1` payload; the
 //!     executor `sub` is taken from VERIFIED `AuthenticationData`, never a
 //!     caller-asserted header (findings #4, #6).
-//!   * P6 single-use is enforced atomically through DataStorage in block mode
-//!     only; monitor mode never consumes a nonce (finding #3).
+//!   * P6 single-use is enforced atomically through LOCAL DataStorage in block
+//!     mode only — per gateway replica, until restart — with a bounded store;
+//!     monitor mode never consumes a nonce (findings #3, #51).
+//!   * Only HTTP POST is bound; bodyless GET/DELETE/OPTIONS/HEAD transport
+//!     requests forward out-of-scope, and a POST without a valid declared
+//!     content-length is a framing denial (finding #50).
+//!   * Integers beyond ±(2^53 − 1) and UTF-8/UTF-16 key-order disagreements
+//!     fail closed in canonicalization (finding #52).
 //!
 //! The ABV corpus (`tests/fixtures/abv/*.json`) is exercised at FUNCTION LEVEL
 //! only, as an interop conformance harness for `canonical_json`/`digest_value`/
@@ -443,6 +449,47 @@ fn integer_outside_i64_u64_is_not_canonicalizable() {
 }
 
 #[test]
+fn integers_beyond_double_precision_fail_closed() {
+    // #52: RFC 8785 serializes numbers as IEEE-754 doubles, so 2^53 and beyond
+    // would canonicalize differently in a conforming JCS implementation.
+    for safe in ["9007199254740991", "-9007199254740991", "0"] {
+        let value: Value = serde_json::from_str(safe).expect("valid json number");
+        assert!(
+            super::digest_value(&value).is_ok(),
+            "{} is inside ±(2^53 − 1) and must canonicalize",
+            safe
+        );
+    }
+    for unsafe_int in [
+        "9007199254740992",
+        "9007199254740993",
+        "-9007199254740992",
+        "18446744073709551615",
+    ] {
+        let value: Value = serde_json::from_str(unsafe_int).expect("valid json number");
+        assert!(
+            super::digest_value(&json!({ "n": value })).is_err(),
+            "{} is outside ±(2^53 − 1) and must fail closed",
+            unsafe_int
+        );
+    }
+}
+
+#[test]
+fn key_order_that_differs_between_utf8_and_utf16_fails_closed() {
+    // #52: U+FF61 sorts before U+1F600 by UTF-8 bytes (EF.. < F0..) but after it
+    // by UTF-16 code units (FF61 > D83D), so the ABV reference form and JCS
+    // disagree on this object's member order.
+    let mixed = json!({"\u{FF61}": 1, "\u{1F600}": 2});
+    assert!(super::digest_value(&mixed).is_err());
+    let nested = json!({"outer": [{"\u{FF61}": 1, "\u{1F600}": 2}]});
+    assert!(super::digest_value(&nested).is_err());
+    // Orders that agree under both sortings still canonicalize.
+    assert!(super::digest_value(&json!({"a": 1, "\u{1F600}": 2})).is_ok());
+    assert!(super::digest_value(&json!({"\u{FF61}": 1, "\u{4E00}": 2})).is_ok());
+}
+
+#[test]
 fn null_object_array_and_scalar_have_distinct_digests() {
     let digests = [
         super::digest_value(&Value::Null).unwrap(),
@@ -682,6 +729,10 @@ fn forged_short_content_length_fails_closed() {
         .with_authentication_data(auth_of(EXECUTOR));
     let response = tester.request(request);
     assert_eq!(response.status_code(), 403);
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;framing=content-length")
+    );
     assert!(backend.next().is_none());
 }
 
@@ -699,13 +750,31 @@ fn oversized_declared_length_fails_closed() {
         .with_authentication_data(auth_of(EXECUTOR));
     let response = tester.request(request);
     assert_eq!(response.status_code(), 403);
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;framing=content-length")
+    );
     assert!(backend.next().is_none());
 }
 
 #[test]
 fn no_body_at_all_fails_closed() {
+    // A bodyless POST is the method a tools/call rides on, so it still fails
+    // closed. (A bodyless GET is MCP transport traffic — see section L, #50.)
     let (backend, mut tester) = harness!(block_config());
-    let response = tester.request(UnitHttpRequest::get());
+    let response = tester.request(UnitHttpRequest::post());
+    assert_eq!(response.status_code(), 403);
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;predicate=malformed")
+    );
+    assert!(backend.next().is_none());
+}
+
+#[test]
+fn bodyless_lowercase_post_still_fails_closed() {
+    let (backend, mut tester) = harness!(block_config());
+    let response = tester.request(UnitHttpRequest::custom("post"));
     assert_eq!(response.status_code(), 403);
     assert!(backend.next().is_none());
 }
@@ -830,6 +899,182 @@ fn empty_403_deny_never_echoes_the_request_id() {
     let response = tester.request(request_with(&envelope, EXECUTOR, &body));
     assert_eq!(response.status_code(), 403);
     assert!(response.body().is_empty(), "empty-403 must not echo the id");
+}
+
+// ===========================================================================
+// L. #50 — only POST is bound; MCP transport requests pass through
+// ===========================================================================
+
+#[test]
+fn get_sse_stream_is_forwarded_out_of_scope_in_block_mode() {
+    let (backend, mut tester) = harness!(block_config());
+    let request = UnitHttpRequest::get()
+        .with_header("accept", "text/event-stream")
+        .with_header("mcp-session-id", "session-1")
+        .with_authentication_data(auth_of(EXECUTOR));
+    let response = tester.request(request);
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("GET SSE stream must reach upstream");
+    assert_eq!(forwarded.header("x-approval-binding"), Some("out-of-scope"));
+}
+
+#[test]
+fn delete_session_is_forwarded_out_of_scope_in_block_mode() {
+    let (backend, mut tester) = harness!(block_config());
+    let request = UnitHttpRequest::delete()
+        .with_header("mcp-session-id", "session-1")
+        .with_authentication_data(auth_of(EXECUTOR));
+    let response = tester.request(request);
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("DELETE session must reach upstream");
+    assert_eq!(forwarded.header("x-approval-binding"), Some("out-of-scope"));
+}
+
+#[test]
+fn options_and_head_are_forwarded_out_of_scope_in_block_mode() {
+    for request in [UnitHttpRequest::options(), UnitHttpRequest::head()] {
+        let (backend, mut tester) = harness!(block_config());
+        let response = tester.request(request);
+        assert_eq!(response.status_code(), 200);
+        let forwarded = backend
+            .next()
+            .expect("bodyless non-POST must reach upstream");
+        assert_eq!(forwarded.header("x-approval-binding"), Some("out-of-scope"));
+    }
+}
+
+#[test]
+fn get_sse_stream_is_out_of_scope_not_malformed_in_monitor_mode() {
+    let (backend, mut tester) = harness!(monitor_config());
+    let response =
+        tester.request(UnitHttpRequest::get().with_header("accept", "text/event-stream"));
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("monitor mode forwards");
+    assert_eq!(forwarded.header("x-approval-binding"), Some("out-of-scope"));
+}
+
+#[test]
+fn non_post_carrying_a_tools_call_body_is_still_bound() {
+    // A non-POST that carries a body is inspected like a POST: if it is a
+    // tools/call with no approval, it is still denied (fail closed).
+    let (backend, mut tester) = harness!(block_config());
+    let body_text = jsonrpc_call(1, "deploy.apply", json!({"replicas": 3})).to_string();
+    let request = UnitHttpRequest::put()
+        .with_header("content-type", "application/json")
+        .with_header("content-length", body_text.len().to_string())
+        .with_header("client_id", EXECUTOR)
+        .with_body(body_text)
+        .with_authentication_data(auth_of(EXECUTOR));
+    let response = tester.request(request);
+    assert!(response
+        .header("x-approval-binding")
+        .unwrap_or_default()
+        .starts_with("denied"));
+    assert!(backend.next().is_none());
+}
+
+#[test]
+fn post_without_content_length_is_a_framing_denial() {
+    // Chunked / HTTP/2 POST with no declared length: not buffered, so denied —
+    // stamped as framing, not as a malformed or non-tools/call request.
+    let (backend, mut tester) = harness!(block_config());
+    let args = json!({"replicas": 3});
+    let envelope = sound_approval("deploy.apply", &args, "n-nocl", &far_future());
+    let request = UnitHttpRequest::post()
+        .with_header("content-type", "application/json")
+        .with_header("x-approval", envelope.to_string())
+        .with_header("client_id", EXECUTOR)
+        .with_body(jsonrpc_call(1, "deploy.apply", args).to_string())
+        .with_authentication_data(auth_of(EXECUTOR));
+    let response = tester.request(request);
+    assert_eq!(response.status_code(), 403);
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;framing=content-length")
+    );
+    assert!(backend.next().is_none());
+}
+
+#[test]
+fn post_without_content_length_is_stamped_framing_in_monitor_mode() {
+    let (backend, mut tester) = harness!(monitor_config());
+    let request = UnitHttpRequest::post()
+        .with_header("content-type", "application/json")
+        .with_body(jsonrpc_call(1, "deploy.apply", json!({})).to_string())
+        .with_authentication_data(auth_of(EXECUTOR));
+    let response = tester.request(request);
+    assert_eq!(response.status_code(), 200);
+    let forwarded = backend.next().expect("monitor mode forwards");
+    assert_eq!(
+        forwarded.header("x-approval-binding"),
+        Some("monitor;framing=content-length")
+    );
+}
+
+// ===========================================================================
+// M. #51 — P6 nonce storage is bounded (cap = 3 under cfg(test))
+// ===========================================================================
+
+#[test]
+fn nonce_store_at_capacity_fails_closed_for_p6() {
+    // block_config has no P4, so no reserved nonce is ever sweepable: once the
+    // cap is reached, a fresh nonce is refused rather than growing the store.
+    let (backend, mut tester) = harness!(block_config());
+    let args = json!({"replicas": 3});
+    let body = jsonrpc_call(1, "deploy.apply", args.clone());
+    for i in 0..super::MAX_RESERVED_NONCES {
+        let envelope = sound_approval("deploy.apply", &args, &format!("n-cap-{i}"), &far_future());
+        let response = tester.request(request_with(&envelope, EXECUTOR, &body));
+        assert_eq!(response.body(), OK_BODY, "reservation {i} is under the cap");
+        assert!(backend.next().is_some());
+    }
+    let envelope = sound_approval("deploy.apply", &args, "n-cap-over", &far_future());
+    let response = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;predicate=P6")
+    );
+    assert!(
+        backend.next().is_none(),
+        "a full nonce store must fail closed"
+    );
+}
+
+#[test]
+fn expired_nonces_are_swept_at_capacity() {
+    // With P4 required, a nonce whose approval has expired under P4 may be
+    // forgotten (replaying it is still a P4 denial), freeing room at the cap.
+    let (backend, mut tester) = harness!(config_with(json!({
+        "requiredPredicates": ["P1", "P2", "P4", "P5", "P6"],
+        "clockSkewSeconds": 0
+    })));
+    let args = json!({"replicas": 3});
+    let body = jsonrpc_call(1, "deploy.apply", args.clone());
+    let short_lived = (chrono::Utc::now() + chrono::Duration::seconds(2))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut expiring = Vec::new();
+    for i in 0..super::MAX_RESERVED_NONCES {
+        let envelope = sound_approval("deploy.apply", &args, &format!("n-sweep-{i}"), &short_lived);
+        let response = tester.request(request_with(&envelope, EXECUTOR, &body));
+        assert_eq!(response.body(), OK_BODY, "short-lived reservation {i}");
+        assert!(backend.next().is_some());
+        expiring.push(envelope);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(3100));
+
+    let fresh = sound_approval("deploy.apply", &args, "n-sweep-fresh", &far_future());
+    let response = tester.request(request_with(&fresh, EXECUTOR, &body));
+    assert_eq!(response.body(), OK_BODY, "expired nonces were swept");
+    assert!(backend.next().is_some());
+
+    // A swept nonce's approval is past its deadline, so replaying it is denied
+    // under P4 — the sweep never reopens a replay.
+    let replay = tester.request(request_with(&expiring[0], EXECUTOR, &body));
+    assert_eq!(
+        replay.header("x-approval-binding"),
+        Some("denied;predicate=P4")
+    );
+    assert!(backend.next().is_none());
 }
 
 // ===========================================================================

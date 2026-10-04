@@ -6,10 +6,10 @@ metadata:
     title: Approval-to-Execution Binding
     category: Security
     description: >-
-      Binds an MCP tools/call to its approval: same action (P1), same canonical
-      arguments (P2), still fresh (P4), separately attested over a versioned
-      mcp-v1 payload (P5), single-use (P6). Non-tools/call methods pass through
-      untouched.
+      Binds an MCP tools/call to its approval: same action (P1), canonical
+      arguments (P2), fresh (P4), separately attested mcp-v1 payload (P5),
+      single use per replica until restart (P6). Other methods and bodyless
+      GET/DELETE pass through.
     metadata/capabilities/injectionPoint: inbound
     metadata/capabilities/assetTypes: mcp
     metadata/interfaceScope: api,resource
@@ -83,9 +83,13 @@ spec:
         monitor mode). P1 action match; P2 canonical argument-byte match
         ($ref-shaped arguments are rejected, not dereferenced); P4 freshness;
         P5 a separate attester's HMAC over the versioned mcp-v1 payload; P6
-        (opt-in) single use, enforced atomically via gateway data storage in
-        block mode only. P6 is a profile choice, not a universal rule — reusable
-        approvals are legitimate in some flows — so it defaults out of the
+        (opt-in) single use PER GATEWAY REPLICA, UNTIL RESTART, enforced
+        atomically via local gateway data storage in block mode only — a replay
+        on another replica or after a restart is not caught, so deploy a single
+        replica for flows that need P6, and require P4 with P6 (reserved nonces
+        are capped at 10,000 per replica; only P4-expired ones are reclaimed, and
+        a full store fails closed). P6 is a profile choice, not a universal rule —
+        reusable approvals are legitimate in some flows — so it defaults out of the
         required set; opt in only when the customer's flow is single-use. An
         empty list is rejected at startup: a binding that requires nothing is
         not a binding.
@@ -177,16 +181,22 @@ spec:
         cannot confidently parse as a single, non-batch JSON-RPC call with an
         echoable id always falls back to empty-403 — echoing an id we cannot
         trust risks exposing a protected value, mirroring the decoy-coordinator's
-        containment rule. A JSON-RPC notification (no id) always gets an empty
-        HTTP 202, since JSON-RPC forbids a response to a notification either way.
+        containment rule; that includes a POST refused for framing (no valid
+        declared content-length of at most 64 KiB, e.g. chunked or HTTP/2),
+        stamped "denied;framing=content-length". A JSON-RPC notification (no id)
+        always gets an empty HTTP 202, since JSON-RPC forbids a response to a
+        notification either way. A bodyless non-POST request (the MCP GET SSE
+        stream, a DELETE session teardown, OPTIONS, HEAD) is never denied: it is
+        forwarded untouched, stamped "out-of-scope", in both modes.
     resultHeader:
       type: string
       default: x-approval-binding
       description: >-
         Header stamped on the request forwarded upstream (monitor mode, or an
         allowed request in block mode) or on the denial response (block mode)
-        recording the verdict, e.g. "allowed", "would-deny;predicate=P2", or
-        "denied;predicate=P5". Never carries the approval or argument values
+        recording the verdict, e.g. "allowed", "out-of-scope",
+        "would-deny;predicate=P2", "denied;predicate=P5", or
+        "denied;framing=content-length". Never carries the approval or argument values
         themselves — only the predicate code — so it is safe to forward to
         downstream logging, SIEM, or a Kill Switch without a further redaction
         pass.

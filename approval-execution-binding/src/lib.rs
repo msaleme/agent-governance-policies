@@ -7,7 +7,10 @@
 // Scope: this policy governs **MCP `tools/call`** JSON-RPC requests only. Every
 // other JSON-RPC method is out of scope and is forwarded untouched (stamped
 // `out-of-scope` on the result header) — this filter never attempts to bind an
-// approval to a non-`tools/call` method.
+// approval to a non-`tools/call` method. At the HTTP layer only `POST` can carry
+// a Streamable-HTTP `tools/call`, so a bodyless non-POST request (the MCP `GET`
+// SSE stream, a `DELETE` session teardown, `OPTIONS`, `HEAD`) is likewise
+// forwarded `out-of-scope` in both modes (#50).
 //
 // An MCP approval and its execution are almost always separated by time and by
 // hops: a supervising broker approves; a downstream broker executes several calls
@@ -28,7 +31,9 @@
 //                       recognized, and it authenticates the reconstructed
 //                       `mcp-v1` payload (see `check_separate_attester`).
 //   P6  Single use     (opt-in profile choice) the approval's nonce has not been
-//                       consumed by a prior execution (atomic, via DataStorage).
+//                       consumed by a prior execution — atomic via LOCAL
+//                       DataStorage, so single use holds PER GATEWAY REPLICA,
+//                       UNTIL RESTART only (#51). Deploy one replica for P6 flows.
 //
 // Referenced-argument (`$ref`) handling: a prior build resolved `$ref` argument
 // values against a caller-supplied `dereferenced` map (former "P3"). That gave the
@@ -99,6 +104,24 @@ const PAYLOAD_VERSION: &str = "mcp-v1";
 
 /// DataStorage store name for the atomic single-use (P6) nonce reservations.
 const NONCE_STORE_NAME: &str = "approval-nonces";
+
+/// Cap on reserved P6 nonces held in local storage (#51). At the cap, entries
+/// whose approval has provably expired under P4 are swept; if the store is still
+/// full, the reservation fails closed (P6 deny) rather than growing without
+/// bound. Kept small under `cfg(test)` so the unit suite exercises the cap.
+#[cfg(not(test))]
+const MAX_RESERVED_NONCES: usize = 10_000;
+#[cfg(test)]
+const MAX_RESERVED_NONCES: usize = 3;
+
+/// Stored expiry for a nonce whose approval is not P4-bounded. Never swept:
+/// without P4 an expired approval would still be accepted, so forgetting its
+/// nonce would reopen a replay.
+const NONCE_NEVER_EXPIRES: i64 = i64::MAX;
+
+/// Largest integer magnitude that survives an IEEE-754 double round-trip
+/// exactly (2^53 − 1). RFC 8785 serializes numbers as doubles.
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
 // ---------------------------------------------------------------------------
 // Predicates
@@ -185,11 +208,27 @@ impl PredicateSet {
 /// silently break byte-equality — the whole guarantee P2/P5 rest on), any
 /// non-integer number FAILS CLOSED with an error. Callers propagate that error
 /// into a malformed/denied verdict.
+///
+/// Two further places where the ABV reference form (Python `json.dumps(...,
+/// sort_keys=True)`) and RFC 8785 disagree also fail closed (#52), so every
+/// digest this function emits is one both would produce:
+///   * an integer outside ±(2^53 − 1) — JCS would round it through a double;
+///   * an object whose keys sort differently by UTF-8 bytes (Python, this code)
+///     than by UTF-16 code units (JCS) — only possible when keys mix
+///     supplementary-plane characters with U+E000–U+FFFF.
 fn canonical_json(value: &Value) -> Result<String, String> {
     match value {
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
+            let mut utf16_order = keys.clone();
+            utf16_order.sort_by(|a, b| a.encode_utf16().cmp(b.encode_utf16()));
+            if utf16_order != keys {
+                return Err(
+                    "object key order differs between UTF-8 and UTF-16 sorting (fail closed)"
+                        .to_string(),
+                );
+            }
             let mut members: Vec<String> = Vec::with_capacity(keys.len());
             for key in keys {
                 members.push(format!(
@@ -208,10 +247,17 @@ fn canonical_json(value: &Value) -> Result<String, String> {
             Ok(format!("[{}]", members.join(",")))
         }
         Value::Number(n) => {
-            if n.is_i64() || n.is_u64() {
-                Ok(n.to_string())
-            } else {
-                Err("non-integer JSON number is not canonicalizable (fail closed)".to_string())
+            let magnitude = n
+                .as_u64()
+                .or_else(|| n.as_i64().map(|value| value.unsigned_abs()));
+            match magnitude {
+                Some(magnitude) if magnitude <= MAX_SAFE_INTEGER => Ok(n.to_string()),
+                Some(_) => Err(
+                    "integer outside ±(2^53 − 1) is not canonicalizable (fail closed)".to_string(),
+                ),
+                None => {
+                    Err("non-integer JSON number is not canonicalizable (fail closed)".to_string())
+                }
             }
         }
         Value::String(_) | Value::Bool(_) | Value::Null => {
@@ -975,6 +1021,92 @@ fn render_denial(binding: &Binding, id: Option<Value>, label: &str) -> Response 
 }
 
 // ---------------------------------------------------------------------------
+// P6 nonce reservation (bounded local storage)
+// ---------------------------------------------------------------------------
+
+enum ReserveRefusal {
+    /// The nonce is already reserved on this replica: a single-use replay.
+    Replay,
+    /// The store holds `MAX_RESERVED_NONCES` unexpired nonces.
+    AtCapacity,
+    /// Storage errored; single use cannot be proven.
+    Unavailable,
+}
+
+/// The instant after which a stored nonce may be forgotten: the P4 deadline
+/// (`not_after + clockSkewSeconds`, whole seconds) when P4 is required and
+/// `not_after` parses, else `NONCE_NEVER_EXPIRES`. Only a P4-rejected approval
+/// is safe to forget — replaying it after the sweep is still denied under P4.
+fn nonce_expiry(binding: &Binding, not_after: Option<&str>) -> i64 {
+    if !binding.required.contains(Predicate::P4) {
+        return NONCE_NEVER_EXPIRES;
+    }
+    not_after
+        .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|deadline| deadline.timestamp() + binding.clock_skew_seconds.max(0))
+        .unwrap_or(NONCE_NEVER_EXPIRES)
+}
+
+/// Reserves `nonce` with `StoreMode::Absent` (the atomic single-use check),
+/// keeping the store at or below `MAX_RESERVED_NONCES`: at the cap, nonces whose
+/// stored expiry is strictly in the past are deleted first; if the store is
+/// still full the reservation is refused (fail closed). The cap is approximate
+/// under concurrency — two workers may each pass the count check at cap − 1.
+async fn reserve_nonce<S: DataStorage>(
+    store: &S,
+    nonce: &str,
+    expiry: i64,
+) -> Result<(), ReserveRefusal> {
+    let keys = store
+        .get_keys()
+        .await
+        .map_err(|_| ReserveRefusal::Unavailable)?;
+    if keys.len() >= MAX_RESERVED_NONCES {
+        let now = chrono::Utc::now().timestamp();
+        for key in &keys {
+            if let Ok(Some((stored_expiry, _))) = store.get::<i64>(key).await {
+                if now > stored_expiry {
+                    store
+                        .delete(key)
+                        .await
+                        .map_err(|_| ReserveRefusal::Unavailable)?;
+                }
+            }
+        }
+        let remaining = store
+            .get_keys()
+            .await
+            .map_err(|_| ReserveRefusal::Unavailable)?;
+        if remaining.len() >= MAX_RESERVED_NONCES {
+            return Err(ReserveRefusal::AtCapacity);
+        }
+    }
+    match store.store(nonce, &StoreMode::Absent, &expiry).await {
+        Ok(()) => Ok(()),
+        Err(DataStorageError::CasMismatch) => Err(ReserveRefusal::Replay),
+        Err(_) => Err(ReserveRefusal::Unavailable),
+    }
+}
+
+/// Header-phase framing refusal (#50): a POST this policy cannot admit for
+/// inspection because its body is not bounded by a valid declared
+/// `content-length` (chunked or HTTP/2 without one, oversized, or a body that
+/// disagrees with its declared length). It is denied — it could be a
+/// `tools/call` — but stamped as framing, not as a malformed JSON-RPC call.
+fn framing_refusal(binding: &Binding, handler: &dyn HeadersHandler, reason: &str) -> Flow<()> {
+    log_verdict("deny", None, reason);
+    if binding.block {
+        Flow::Break(empty_denial(
+            &binding.result_header,
+            "denied;framing=content-length",
+        ))
+    } else {
+        handler.set_header(&binding.result_header, "monitor;framing=content-length");
+        Flow::Continue(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Request filter
 // ---------------------------------------------------------------------------
 
@@ -987,6 +1119,27 @@ async fn request_filter<S: DataStorage>(
 ) -> Flow<()> {
     let headers_state = request_state.into_headers_state().await;
     let handler = headers_state.handler();
+
+    // HTTP-method scope (#50). On MCP Streamable HTTP a `tools/call` is only ever
+    // a POST body, so a bodyless non-POST request — the `GET` that opens the SSE
+    // stream, a `DELETE` ending an `Mcp-Session-Id`, `OPTIONS`, `HEAD` — cannot
+    // be one and is forwarded untouched in BOTH modes. Fail closed on the edges:
+    // the method is compared case-insensitively, a missing method is treated as
+    // POST, and a non-POST that DOES carry a body is still inspected below.
+    let method = headers_state.method();
+    if !method.is_empty() && !method.eq_ignore_ascii_case("POST") && !headers_state.contains_body()
+    {
+        logger::info!(
+            "{}",
+            json!({
+                "event": "approval_execution_binding",
+                "action": "out-of-scope",
+                "http_method": method,
+            })
+        );
+        handler.set_header(&binding.result_header, "out-of-scope");
+        return Flow::Continue(());
+    }
 
     // Executor identity: prefer VERIFIED authentication data (client_id, then
     // principal) established by an upstream authentication policy. Only when no
@@ -1054,20 +1207,20 @@ async fn request_filter<S: DataStorage>(
         };
     }
 
+    // A body without a valid declared content-length (chunked, or HTTP/2, where
+    // the header is optional) is NOT buffered: `into_headers_body_state` buffers
+    // the whole body with no cap, and streaming it in under a running
+    // MAX_BODY_BYTES cap is a follow-up, not this build. It could still be a
+    // tools/call, so it is denied
+    // — stamped as a framing refusal, not as a malformed JSON-RPC call (#50).
     let declared_length = declared_body_length(handler.header("content-length"));
     let admissible = declared_length.is_some_and(|length| length <= MAX_BODY_BYTES);
     if !admissible {
-        let reason = "request body has no valid, admissible declared content-length";
-        log_verdict("deny", None, reason);
-        return if binding.block {
-            Flow::Break(empty_denial(
-                &binding.result_header,
-                "denied;predicate=malformed",
-            ))
-        } else {
-            handler.set_header(&binding.result_header, "monitor;predicate=malformed");
-            Flow::Continue(())
-        };
+        return framing_refusal(
+            binding,
+            handler,
+            "request body has no valid, admissible declared content-length",
+        );
     }
     let declared_length = declared_length.expect("admissible implies present");
 
@@ -1075,20 +1228,11 @@ async fn request_filter<S: DataStorage>(
     let handler = state.handler();
     let body = handler.body();
     if body.len() != declared_length {
-        log_verdict(
-            "deny",
-            None,
+        return framing_refusal(
+            binding,
+            handler,
             "request body length does not match its declared content-length",
         );
-        return if binding.block {
-            Flow::Break(empty_denial(
-                &binding.result_header,
-                "denied;predicate=malformed",
-            ))
-        } else {
-            handler.set_header(&binding.result_header, "monitor;predicate=malformed");
-            Flow::Continue(())
-        };
     }
 
     let call = match parse_single_jsonrpc(&body) {
@@ -1123,44 +1267,49 @@ async fn request_filter<S: DataStorage>(
     };
 
     let envelope = extract_envelope(binding, header_value, &call);
-    // Capture the signed nonce (if any) BEFORE the envelope is moved into
-    // `evaluate`; it is the DataStorage reservation key on the allowed path.
+    // Capture the signed nonce (if any) and its sweep expiry BEFORE the envelope
+    // is moved into `evaluate`; the nonce is the DataStorage reservation key on
+    // the allowed path.
     let reserved_nonce = envelope
         .as_ref()
         .ok()
         .and_then(|env| env.approval.nonce.clone())
         .filter(|nonce| !nonce.is_empty());
+    let nonce_expiry = nonce_expiry(
+        binding,
+        envelope
+            .as_ref()
+            .ok()
+            .and_then(|env| env.approval.not_after.as_deref()),
+    );
     let verdict = evaluate(binding, &call, envelope, &executor, executor_verified);
 
     match verdict {
         Verdict::Allow => {
-            // Atomic single-use (P6): reserve the nonce key in DataStorage with
-            // Absent semantics, but ONLY in block mode and ONLY once the request
-            // is actually being forwarded. Monitor mode never consumes a nonce.
+            // Atomic single-use (P6): reserve the nonce key in local DataStorage
+            // with Absent semantics, but ONLY in block mode and ONLY once the
+            // request is actually being forwarded. Monitor mode never consumes a
+            // nonce. Local storage scopes single use to this replica, until
+            // restart (#51).
             if binding.block && binding.required.contains(Predicate::P6) {
                 if let Some(nonce) = reserved_nonce {
-                    match store.store(&nonce, &StoreMode::Absent, &1u8).await {
-                        Ok(()) => {}
-                        Err(DataStorageError::CasMismatch) => {
-                            log_verdict(
-                                "deny",
-                                Some(Predicate::P6),
-                                "approval nonce already reserved (single-use replay)",
-                            );
-                            violations.generate_policy_violation();
-                            return Flow::Break(render_denial(binding, call.id.clone(), "P6"));
-                        }
-                        Err(_) => {
-                            // Storage unavailable or any other error → fail closed:
-                            // we cannot prove single use, so we do not forward.
-                            log_verdict(
-                                "deny",
-                                Some(Predicate::P6),
-                                "single-use nonce store unavailable; failing closed",
-                            );
-                            violations.generate_policy_violation();
-                            return Flow::Break(render_denial(binding, call.id.clone(), "P6"));
-                        }
+                    if let Err(refusal) = reserve_nonce(store, &nonce, nonce_expiry).await {
+                        // A replay, a full store, or a storage error all fail
+                        // closed: we cannot prove single use, so we do not forward.
+                        let reason = match refusal {
+                            ReserveRefusal::Replay => {
+                                "approval nonce already reserved (single-use replay)"
+                            }
+                            ReserveRefusal::AtCapacity => {
+                                "single-use nonce store at capacity with no expired nonces; failing closed"
+                            }
+                            ReserveRefusal::Unavailable => {
+                                "single-use nonce store unavailable; failing closed"
+                            }
+                        };
+                        log_verdict("deny", Some(Predicate::P6), reason);
+                        violations.generate_policy_violation();
+                        return Flow::Break(render_denial(binding, call.id.clone(), "P6"));
                     }
                 }
             }
