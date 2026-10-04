@@ -125,12 +125,15 @@ spec:
     clockSkewSeconds:
       type: integer
       default: 60
+      minimum: 0
+      maximum: 3600
       description: >-
-        Tolerance, in seconds, applied to P4 freshness. The approval is valid
-        while now <= not_after + clockSkewSeconds, where "now" is this gateway's
-        own wall-clock time at the instant of the request — never a
+        Tolerance, in seconds (0 to 3600), applied to P4 freshness. The approval
+        is valid while now <= not_after + clockSkewSeconds, where "now" is this
+        gateway's own wall-clock time at the instant of the request — never a
         caller-supplied timestamp, since a caller-supplied execution instant
-        would let the executing party grade its own freshness check.
+        would let the executing party grade its own freshness check. A value
+        outside 0 to 3600 is rejected at startup.
     maxApprovalLifetimeSeconds:
       type: integer
       default: 0

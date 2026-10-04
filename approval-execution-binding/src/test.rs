@@ -1718,7 +1718,8 @@ fn max_lifetime_range_is_validated() {
 // ===========================================================================
 
 fn strip(body: &str) -> Option<String> {
-    strip_top_level_member(body.as_bytes(), "approvalBinding")
+    let root = parse_strict_json(body.as_bytes()).expect("test body must parse");
+    strip_top_level_member(body.as_bytes(), &root, "approvalBinding")
         .expect("strip must succeed")
         .map(|bytes| String::from_utf8(bytes).expect("utf-8"))
 }
@@ -1803,14 +1804,16 @@ fn strip_returns_none_when_the_member_is_absent() {
 
 #[test]
 fn strip_refuses_a_non_object_body() {
-    assert!(strip_top_level_member(b"[1]", "approvalBinding").is_err());
+    let root = parse_strict_json(b"[1]").unwrap();
+    assert!(strip_top_level_member(b"[1]", &root, "approvalBinding").is_err());
 }
 
 #[test]
 fn duplicate_envelope_members_fail_closed_before_strip() {
-    // parse_strict_json rejects a duplicate member, so at most one can match.
+    // parse_strict_json rejects a duplicate member, so a body with two
+    // envelopes never reaches the strip, and at most one member can match.
     let body = br#"{"approvalBinding":{},"approvalBinding":{},"id":1}"#;
-    assert!(strip_top_level_member(body, "approvalBinding").is_err());
+    assert!(parse_strict_json(body).is_err());
 }
 
 fn rpc_param_request(body_text: &str) -> UnitHttpRequest {
@@ -1890,4 +1893,89 @@ fn header_mode_body_is_forwarded_unchanged() {
     tester.request(raw_request(&envelope, EXECUTOR, &body));
     let forwarded = backend.next().expect("allowed call forwards");
     assert_eq!(forwarded.body(), body.as_bytes());
+}
+
+// ===========================================================================
+// O. clockSkewSeconds bounded; deadlines cannot wrap; monitor strip stamp
+// ===========================================================================
+
+#[test]
+fn clock_skew_outside_zero_to_one_hour_is_rejected_at_startup() {
+    for bad in [-1_i64, 3_601, i64::MAX, i64::MIN] {
+        let config = parse_config(base_config_json(json!({ "clockSkewSeconds": bad }))).unwrap();
+        assert!(
+            Binding::from_config(&config).is_err(),
+            "{} must be rejected",
+            bad
+        );
+    }
+    for good in [0_i64, 1, 3_600] {
+        let config = parse_config(base_config_json(json!({ "clockSkewSeconds": good }))).unwrap();
+        assert_eq!(
+            Binding::from_config(&config).unwrap().clock_skew_seconds,
+            good
+        );
+    }
+}
+
+#[test]
+fn clock_skew_of_one_hour_is_the_widest_p4_window() {
+    let approval = approval_with_not_after("2026-10-04T12:00:00Z");
+    assert!(check_freshness_at(&approval, 3_600, None, at("2026-10-04T13:00:00Z")).is_ok());
+    assert!(check_freshness_at(&approval, 3_600, None, at("2026-10-04T13:00:01Z")).is_err());
+}
+
+#[test]
+fn out_of_range_skew_fails_p4_closed_instead_of_disabling_it() {
+    // Unreachable through from_config; pins that the arithmetic cannot be
+    // pushed into "no limit" by a skew that slips past validation.
+    let expired = approval_with_not_after("2000-01-01T00:00:00Z");
+    for bad in [-1_i64, 3_601, i64::MAX] {
+        assert!(check_freshness_at(&expired, bad, None, at("2026-10-04T12:00:00Z")).is_err());
+        assert!(check_freshness_at(&expired, bad, Some(60), at("2026-10-04T12:00:00Z")).is_err());
+    }
+}
+
+#[test]
+fn nonce_expiry_is_not_after_plus_skew() {
+    let config = parse_config(base_config_json(json!({
+        "clockSkewSeconds": 60, "requiredPredicates": ["P1", "P4"]
+    })))
+    .unwrap();
+    let binding = Binding::from_config(&config).unwrap();
+    let not_after = "2026-10-04T12:00:00Z";
+    assert_eq!(
+        nonce_expiry(&binding, Some(not_after)),
+        at(not_after).timestamp() + 60
+    );
+}
+
+#[test]
+fn nonce_expiry_never_wraps_into_the_past() {
+    // A wrapped (negative) expiry would let the cap sweep delete a live nonce
+    // and reopen a P6 replay. An unrepresentable deadline is never swept.
+    let config = parse_config(base_config_json(
+        json!({ "requiredPredicates": ["P1", "P4"] }),
+    ))
+    .unwrap();
+    let mut binding = Binding::from_config(&config).unwrap();
+    binding.clock_skew_seconds = i64::MAX;
+    assert_eq!(
+        nonce_expiry(&binding, Some("2026-10-04T12:00:00Z")),
+        NONCE_NEVER_EXPIRES
+    );
+}
+
+#[test]
+fn monitor_strip_failure_never_claims_allowed() {
+    assert_eq!(forwarded_result(None, false), "allowed");
+    assert_eq!(forwarded_result(None, true), "monitor;envelope=unstripped");
+    assert_eq!(
+        forwarded_result(Some("P2"), false),
+        "would-deny;predicate=P2"
+    );
+    assert_eq!(
+        forwarded_result(Some("P2"), true),
+        "would-deny;predicate=P2;envelope=unstripped"
+    );
 }

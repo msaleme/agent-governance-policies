@@ -157,7 +157,7 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `executorHeader` | string | `client_id` | **Fallback** header naming the executor. The executor identity is taken FIRST from the **verified** authentication data (`client_id`, then `principal`) established by an upstream authentication policy; this header is used only when no verified subject is present, and when P5 is required and no verified subject exists the call **fails closed** rather than trusting the header. Used only for P5. |
 | `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. (There is no P3.) |
 | `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
-| `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. |
+| `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. `0`–`3600`; anything else is rejected at startup (**breaking**: a negative value used to be treated as `0`, and there was no upper limit). |
 | `maxApprovalLifetimeSeconds` | integer | `0` (off) | Upper bound on an approval's **remaining** lifetime, checked under P4 against the gateway clock: an approval with `not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds` is denied `predicate=P4`. `1`–`31536000` when set; anything else, or setting it without P4 in `requiredPredicates`, is rejected at startup. See [Approval lifetime bound](#approval-lifetime-bound). |
 | `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new length. Ignored for `approvalSource: header`. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
 | `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
@@ -165,7 +165,7 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `expectedEnvironment` | string | `""` | The environment this gateway serves, bound as `env`. **Required (non-empty) whenever P5 is required.** |
 | `mode` | `monitor`\|`block` | `monitor` | Evaluate and log only, vs. actually deny on a failed required predicate. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a block-mode denial is rendered. A request that can't be confidently parsed as a single, non-batch JSON-RPC call with an echoable id always falls back to `empty-403` regardless of this setting — echoing an untrustworthy id risks exposing a protected value. This includes a `POST` refused for framing (no valid declared `content-length` ≤ 64 KiB), stamped `denied;framing=content-length`. A notification (no id) always gets an empty HTTP 202. Never applies to a bodyless non-`POST` request (`GET` SSE stream, `DELETE` session, `OPTIONS`, `HEAD`), which is forwarded `out-of-scope` and never denied. |
-| `resultHeader` | string | `x-approval-binding` | Header stamped with the verdict (`allowed`, `out-of-scope`, `would-deny;predicate=P2`, `denied;predicate=P5`, `denied;predicate=malformed`, `denied;framing=content-length`, and the `monitor;…` forms of the last two) — never the approval or argument values themselves. |
+| `resultHeader` | string | `x-approval-binding` | Header stamped with the verdict (`allowed`, `out-of-scope`, `would-deny;predicate=P2`, `denied;predicate=P5`, `denied;predicate=malformed`, `denied;framing=content-length`, the `monitor;…` forms of the last two, and `monitor;envelope=unstripped` or a `;envelope=unstripped` suffix when monitor mode forwards an rpc-param body whose envelope could not be removed) — never the approval or argument values themselves. |
 
 The approval envelope shape (header or rpc-param, identical either way):
 ```json
@@ -285,8 +285,10 @@ header` are left as they are.
   escapes counts as the same member.
 - **Checked before forwarding.** The strict parse has already rejected duplicate members at any
   depth, so at most one member can match. The stripped body is parsed again and must equal the
-  original minus that member. If it doesn't, block mode denies the call as `malformed` and monitor
-  mode forwards it unchanged and logs why. The removal runs before the P6 reservation, so a failure
+  original minus that member. If it doesn't, block mode denies the call as `malformed`. Monitor
+  mode forwards it unchanged, records a policy violation, logs why, and stamps
+  `monitor;envelope=unstripped` (or adds `;envelope=unstripped` to a would-deny) instead of
+  `allowed`. The removal runs before the P6 reservation, so a failure
   never uses up a nonce.
 - **`content-length` is rewritten.** PDK 1.10's `BodyHandler::set_body` writes only the body buffer
   (`pdk-classy` `hl/headers_body.rs`); nothing in the PDK or `proxy-wasm` 0.2.5 adjusts
@@ -295,7 +297,7 @@ header` are left as they are.
   request to read its body. The `#[pdk_test]`
   `rpc_param_envelope_is_stripped_before_the_real_upstream` checks this on a real Flex Gateway
   1.14.0: the upstream mock accepts only the exact stripped bytes with the new `content-length`.
-  It runs in CI (`runtime-e2e`).
+  It runs in CI (`runtime-e2e-approval`).
 
 On a denial the log carries a structured event, e.g.
 `{"event":"approval_execution_binding","action":"deny","predicate":"P1","reason":"approved action 'deploy.apply', executed 'deploy.destroy'"}`
@@ -410,7 +412,7 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **91 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **97 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
@@ -438,7 +440,10 @@ when unset, never relaxes expiry; range and requires-P4 validated at startup), *
 removal** (first, middle, last and only member; whitespace and escapes kept byte-exact; an escaped
 key matched; a nested same-name member kept; duplicates fail closed; forwarded body and
 `content-length` checked on allow and on monitor would-deny; header mode and `stripApprovalEnvelope:
-false` untouched), PDK policy-violation registration on both block-mode denials and
+false` untouched; a monitor-mode strip failure never stamped `allowed`), **bounded clock skew**
+(`clockSkewSeconds` outside `0`–`3600` rejected at startup, an out-of-range skew fails P4 closed
+rather than disabling it, and a nonce expiry that can't be represented is never swept instead of
+wrapping into the past), PDK policy-violation registration on both block-mode denials and
 monitor-mode would-deny detections (and its absence on a clean allow), atomic (never partial) denial
 of a batch containing an unauthorized call, the content-type/content-encoding header-phase admission
 gate, bounded-depth JSON parsing (deeply nested bodies fail closed without panicking, in both the

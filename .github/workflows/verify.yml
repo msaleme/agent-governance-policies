@@ -165,6 +165,12 @@ jobs:
     if: needs.exchange-availability.outputs.runtime == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # One disposable Flex registration serves every runtime job in the repo, so
+    # no two of them may hold it at once, across refs too. Never cancel one
+    # mid-run: its cleanup step must remove the registration.
+    concurrency:
+      group: flex-registration
+      cancel-in-progress: false
     defaults:
       run:
         shell: bash
@@ -187,6 +193,10 @@ jobs:
           ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
         run: |
           set -euo pipefail
+          if [[ ! "${ANYPOINT_GROUP_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::Repository secret ANYPOINT_GROUP_ID must be the owning Anypoint org UUID"
+            exit 1
+          fi
           trap 'git checkout -- Cargo.toml' EXIT
           sed -i "s/REPLACE_WITH_YOUR_ANYPOINT_ORG_ID/${ANYPOINT_GROUP_ID}/" Cargo.toml
           make build
@@ -200,17 +210,43 @@ jobs:
           printf '%s\n' "$FLEX_REGISTRATION_YAML" > tests/config/registration.yaml
           # Flex runs as uid 65532; keep the file 600 but readable by the gateway.
           sudo chown 65532 tests/config/registration.yaml
+      # Full test output (gateway logs included) goes only to files under
+      # E2E_LOGS, which are scanned before upload; the public step log gets the
+      # per-test result lines.
       - name: Committed pdk_test cases (tests/requests.rs)
-        run: cargo +1.89.0 test --test requests --locked -- --test-threads=1
+        env:
+          E2E_LOGS: ${{ runner.temp }}/aggregate-e2e-logs
+        run: |
+          set -uo pipefail
+          LOG="$E2E_LOGS/requests.log"
+          mkdir -p "$E2E_LOGS"
+          status=0
+          cargo +1.89.0 test --test requests --locked -- --test-threads=1 > "$LOG" 2>&1 || status=$?
+          grep -E '^test .+ \.\.\. |^test result:' "$LOG" || true
+          exit "$status"
       - name: Connected cases 2-4 and 6-8 (default workers)
         env:
           AGP_E2E_EVIDENCE: ${{ runner.temp }}/cases.jsonl
-        run: cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 --skip case5 --skip case2c
+          E2E_LOGS: ${{ runner.temp }}/aggregate-e2e-logs
+        run: |
+          set -uo pipefail
+          LOG="$E2E_LOGS/connected.log"
+          status=0
+          cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 --skip case5 --skip case2c > "$LOG" 2>&1 || status=$?
+          grep -E '^test .+ \.\.\. |^test result:' "$LOG" || true
+          exit "$status"
       - name: Connected case 5 (one Envoy worker)
         env:
           AGP_E2E_EVIDENCE: ${{ runner.temp }}/cases.jsonl
+          E2E_LOGS: ${{ runner.temp }}/aggregate-e2e-logs
           PDK_TEST_FLEX_ENV_FLEX_SERVICE_ENVOY_CONCURRENCY: "1"
-        run: cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 case5
+        run: |
+          set -uo pipefail
+          LOG="$E2E_LOGS/connected-case5.log"
+          status=0
+          cargo +1.89.0 test --test connected_e2e --locked -- --ignored --test-threads=1 case5 > "$LOG" 2>&1 || status=$?
+          grep -E '^test .+ \.\.\. |^test result:' "$LOG" || true
+          exit "$status"
       - name: Remove the Flex registration
         if: always()
         run: |
@@ -222,36 +258,50 @@ jobs:
         env:
           ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
           EVIDENCE: ${{ runner.temp }}/cases.jsonl
+          E2E_LOGS: ${{ runner.temp }}/aggregate-e2e-logs
         shell: python
         run: |
           import os, re
           from pathlib import Path
 
+          uuid = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+          ipv4 = re.compile(r"\b(?!127\.0\.0\.1\b)(?!0\.0\.0\.0\b)\d{1,3}(\.\d{1,3}){3}\b")
+
+          def clean(text):
+              return not (os.environ["ANYPOINT_GROUP_ID"] in text or uuid.search(text) or ipv4.search(text))
+
           path = Path(os.environ["EVIDENCE"])
           if not path.exists():
               raise SystemExit("::error::No evidence was recorded")
           text = path.read_text()
-          uuid = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-          ipv4 = re.compile(r"\b(?!127\.0\.0\.1\b)(?!0\.0\.0\.0\b)\d{1,3}(\.\d{1,3}){3}\b")
-          if os.environ["ANYPOINT_GROUP_ID"] in text or uuid.search(text) or ipv4.search(text):
-              raise SystemExit("::error::Evidence contains an identifier; not uploading it")
-          print(f"{len(text.splitlines())} evidence lines, no identifiers")
+          logs = sorted(Path(os.environ["E2E_LOGS"]).glob("*.log"))
+          if not clean(text) or not all(clean(log.read_text()) for log in logs):
+              raise SystemExit("::error::Evidence or a test log contains an identifier; not uploading them")
+          print(f"{len(text.splitlines())} evidence lines and {len(logs)} test logs, no identifiers")
       - uses: actions/upload-artifact@v4
         if: always() && steps.scan.outcome == 'success'
         with:
           name: runtime-e2e-evidence
           if-no-files-found: error
-          path: ${{ runner.temp }}/cases.jsonl
+          path: |
+            ${{ runner.temp }}/cases.jsonl
+            ${{ runner.temp }}/aggregate-e2e-logs/
 
   # Approval binding's #[pdk_test] suite on a real Flex Gateway, with the same
-  # disposable registration as runtime-e2e. It runs after that job, not beside
-  # it, so the one gateway identity is never used by two runners at once, and it
-  # still runs when that job fails.
+  # disposable registration as runtime-e2e. The shared flex-registration
+  # concurrency group keeps the two jobs (and other refs' runs) from using the
+  # one gateway identity at once; it still runs when runtime-e2e fails.
   runtime-e2e-approval:
     needs: [exchange-availability, runtime-e2e]
     if: ${{ !cancelled() && needs.exchange-availability.outputs.runtime == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # One disposable Flex registration serves every runtime job in the repo, so
+    # no two of them may hold it at once, across refs too. Never cancel one
+    # mid-run: its cleanup step must remove the registration.
+    concurrency:
+      group: flex-registration
+      cancel-in-progress: false
     defaults:
       run:
         shell: bash
@@ -274,6 +324,10 @@ jobs:
           ANYPOINT_GROUP_ID: ${{ secrets.ANYPOINT_GROUP_ID }}
         run: |
           set -euo pipefail
+          if [[ ! "${ANYPOINT_GROUP_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::Repository secret ANYPOINT_GROUP_ID must be the owning Anypoint org UUID"
+            exit 1
+          fi
           trap 'git checkout -- Cargo.toml' EXIT
           sed -i "s/REPLACE_WITH_YOUR_ANYPOINT_ORG_ID/${ANYPOINT_GROUP_ID}/" Cargo.toml
           make build
@@ -292,9 +346,14 @@ jobs:
       - name: Committed pdk_test cases (tests/requests.rs)
         env:
           E2E_LOG: ${{ runner.temp }}/approval-e2e.log
+        # Full output goes only to E2E_LOG (scanned before upload); the public
+        # step log gets the per-test result lines.
         run: |
-          set -euo pipefail
-          cargo +1.89.0 test --test requests --locked -- --test-threads=1 2>&1 | tee "$E2E_LOG"
+          set -uo pipefail
+          status=0
+          cargo +1.89.0 test --test requests --locked -- --test-threads=1 > "$E2E_LOG" 2>&1 || status=$?
+          grep -E '^test .+ \.\.\. |^test result:' "$E2E_LOG" || true
+          exit "$status"
       - name: Remove the Flex registration
         if: always()
         run: |

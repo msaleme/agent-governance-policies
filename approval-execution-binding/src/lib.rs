@@ -129,6 +129,12 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// not a meaningful bound, and the limit keeps the deadline arithmetic in range.
 const MAX_APPROVAL_LIFETIME_LIMIT_SECONDS: i64 = 31_536_000;
 
+/// Upper limit for `clockSkewSeconds` (one hour). Skew is a tolerance for clock
+/// drift between the approver and this gateway; anything larger widens every
+/// approval's validity, and the limit keeps the P4 and nonce-expiry arithmetic
+/// in range.
+const MAX_CLOCK_SKEW_SECONDS: i64 = 3_600;
+
 // ---------------------------------------------------------------------------
 // Predicates
 // ---------------------------------------------------------------------------
@@ -398,20 +404,30 @@ fn check_freshness_at(
     let not_after = chrono::DateTime::parse_from_rfc3339(not_after_raw)
         .map_err(|err| format!("malformed not_after '{not_after_raw}': {err}"))?
         .with_timezone(&chrono::Utc);
-    let skew =
-        chrono::Duration::try_seconds(clock_skew_seconds.max(0)).unwrap_or(chrono::Duration::MAX);
-    // An out-of-range deadline saturates: a skew that large means "no limit".
-    let deadline = not_after.checked_add_signed(skew);
-    if deadline.is_some_and(|deadline| now > deadline) {
-        return Err(format!(
-            "executed at {now} after approval expired {not_after} (+{clock_skew_seconds}s skew)"
-        ));
+    // Configure time bounds the skew to 0..=MAX_CLOCK_SKEW_SECONDS; anything
+    // else reaching here fails closed rather than widening the window.
+    let skew = (0..=MAX_CLOCK_SKEW_SECONDS)
+        .contains(&clock_skew_seconds)
+        .then(|| chrono::Duration::try_seconds(clock_skew_seconds))
+        .flatten()
+        .ok_or_else(|| format!("clockSkewSeconds {clock_skew_seconds} is out of range"))?;
+    // Only a not_after within an hour of chrono's maximum date overflows here,
+    // and that approval cannot have expired yet.
+    if let Some(deadline) = not_after.checked_add_signed(skew) {
+        if now > deadline {
+            return Err(format!(
+                "executed at {now} after approval expired {not_after} (+{clock_skew_seconds}s skew)"
+            ));
+        }
     }
     if let Some(max_lifetime) = max_lifetime_seconds {
-        let latest = chrono::Duration::try_seconds(max_lifetime)
+        // An uncomputable bound fails closed: the approval is not shown to be
+        // inside it.
+        let within = chrono::Duration::try_seconds(max_lifetime)
             .and_then(|lifetime| now.checked_add_signed(lifetime))
-            .and_then(|latest| latest.checked_add_signed(skew));
-        if latest.is_some_and(|latest| not_after > latest) {
+            .and_then(|latest| latest.checked_add_signed(skew))
+            .is_some_and(|latest| not_after <= latest);
+        if !within {
             return Err(format!(
                 "approval not_after {not_after} exceeds the maximum lifetime \
                  ({max_lifetime}s +{clock_skew_seconds}s skew from {now})"
@@ -803,11 +819,19 @@ fn skip_json_value(body: &[u8], at: usize) -> Result<usize, String> {
 /// cutting its bytes out, comma included; every other byte is kept as sent, so
 /// the forwarded arguments are exactly the bytes P2 checked. Keys are compared
 /// after JSON unescaping, so an escaped spelling of `field` is the same member.
-/// Returns `Ok(None)` when the member is absent. `body` must already have passed
-/// `parse_strict_json` (no duplicate members, so at most one match); the result
-/// is re-parsed and checked to equal the original minus `field`, and any
-/// mismatch is an `Err` for the caller to fail closed on.
-fn strip_top_level_member(body: &[u8], field: &str) -> Result<Option<Vec<u8>>, String> {
+/// Returns `Ok(None)` when the member is absent. `root` is `body` as already
+/// parsed by `parse_strict_json` (no duplicate members, so at most one match);
+/// the result is parsed once and checked to equal `root` minus `field`, and
+/// any mismatch is an `Err` for the caller to fail closed on.
+fn strip_top_level_member(
+    body: &[u8],
+    root: &Value,
+    field: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let mut expected = root
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "request body is not a JSON object".to_string())?;
     let mut at = skip_json_whitespace(body, 0);
     if body.get(at) != Some(&b'{') {
         return Err("request body is not a JSON object".to_string());
@@ -858,11 +882,10 @@ fn strip_top_level_member(body: &[u8], field: &str) -> Result<Option<Vec<u8>>, S
     stripped.extend_from_slice(&body[..cut_start]);
     stripped.extend_from_slice(&body[cut_end..]);
 
-    let mut expected = parse_strict_json(body)?;
-    if let Some(object) = expected.as_object_mut() {
-        object.remove(field);
-    }
-    if parse_strict_json(&stripped)? != expected {
+    expected.remove(field);
+    let reparsed: Value = serde_json::from_slice(&stripped)
+        .map_err(|err| format!("stripped body is not valid JSON: {err}"))?;
+    if reparsed != Value::Object(expected) {
         return Err(
             "stripped body does not re-parse to the original minus the envelope".to_string(),
         );
@@ -972,6 +995,15 @@ impl Binding {
                     ));
                 }
             }
+        }
+
+        // A skew outside 0..=MAX_CLOCK_SKEW_SECONDS would widen every approval's
+        // validity and overflow the P4 and nonce-expiry deadlines.
+        if !(0..=MAX_CLOCK_SKEW_SECONDS).contains(&config.clock_skew_seconds) {
+            return Err(anyhow!(
+                "clockSkewSeconds must be 0..={MAX_CLOCK_SKEW_SECONDS}, got {}",
+                config.clock_skew_seconds
+            ));
         }
 
         // #52: an optional bound on the approval's remaining lifetime. It is a P4
@@ -1246,13 +1278,19 @@ enum ReserveRefusal {
 /// (`not_after + clockSkewSeconds`, whole seconds) when P4 is required and
 /// `not_after` parses, else `NONCE_NEVER_EXPIRES`. Only a P4-rejected approval
 /// is safe to forget — replaying it after the sweep is still denied under P4.
+/// The sum is checked: a deadline that cannot be represented is never swept,
+/// since a wrapped (past) expiry would let the sweep delete a live nonce.
 fn nonce_expiry(binding: &Binding, not_after: Option<&str>) -> i64 {
     if !binding.required.contains(Predicate::P4) {
         return NONCE_NEVER_EXPIRES;
     }
     not_after
         .and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-        .map(|deadline| deadline.timestamp() + binding.clock_skew_seconds.max(0))
+        .and_then(|deadline| {
+            deadline
+                .timestamp()
+                .checked_add(binding.clock_skew_seconds.max(0))
+        })
         .unwrap_or(NONCE_NEVER_EXPIRES)
 }
 
@@ -1334,6 +1372,19 @@ fn content_type_is_utf8_json(value: &str) -> bool {
             }
             _ => true,
         })
+}
+
+/// The result header for a forwarded `tools/call`: `allowed`, or in monitor
+/// mode `would-deny;predicate=<label>`. When the rpc-param envelope could not be
+/// stripped (monitor mode only), an allowed call is stamped
+/// `monitor;envelope=unstripped` and a would-deny gains `;envelope=unstripped`.
+fn forwarded_result(denied_predicate: Option<&str>, envelope_unstripped: bool) -> String {
+    match (denied_predicate, envelope_unstripped) {
+        (None, false) => "allowed".to_string(),
+        (None, true) => "monitor;envelope=unstripped".to_string(),
+        (Some(label), false) => format!("would-deny;predicate={label}"),
+        (Some(label), true) => format!("would-deny;predicate={label};envelope=unstripped"),
+    }
 }
 
 /// Replaces the body forwarded upstream and sets `content-length` to match.
@@ -1541,18 +1592,18 @@ async fn request_filter<S: DataStorage>(
     // #52: an rpc-param envelope is cut out of any body that is forwarded (an
     // allowed call, or a monitor-mode forward) before the P6 reservation, so a
     // failure here never burns a nonce. The splice fails closed in block mode;
-    // monitor mode forwards the body unchanged and logs why.
+    // monitor mode forwards the body unchanged, records a violation, and stamps
+    // the result header with `envelope=unstripped` instead of claiming allowed.
     let forwards = !binding.block || matches!(verdict, Verdict::Allow);
+    let mut envelope_unstripped = false;
     if forwards
         && binding.approval_source == ApprovalSource::RpcParam
         && binding.strip_approval_envelope
     {
-        let rewritten =
-            strip_top_level_member(&body, &binding.approval_rpc_field).and_then(|stripped| {
-                match stripped {
-                    Some(stripped) => replace_forwarded_body(handler, &stripped),
-                    None => Ok(()),
-                }
+        let rewritten = strip_top_level_member(&body, &call.root, &binding.approval_rpc_field)
+            .and_then(|stripped| match stripped {
+                Some(stripped) => replace_forwarded_body(handler, &stripped),
+                None => Ok(()),
             });
         if let Err(reason) = rewritten {
             let reason = format!("cannot remove the rpc-param approval envelope: {reason}");
@@ -1561,6 +1612,7 @@ async fn request_filter<S: DataStorage>(
                 violations.generate_policy_violation();
                 return Flow::Break(render_denial(binding, call.id.clone(), "malformed"));
             }
+            envelope_unstripped = true;
         }
     }
 
@@ -1595,8 +1647,17 @@ async fn request_filter<S: DataStorage>(
                     }
                 }
             }
-            log_verdict("allow", None, "all required predicates hold");
-            handler.set_header(&binding.result_header, "allowed");
+            if envelope_unstripped {
+                // Only reachable in monitor mode: the predicates hold, but the
+                // forwarded body still carries the envelope, so it is a violation.
+                violations.generate_policy_violation();
+            } else {
+                log_verdict("allow", None, "all required predicates hold");
+            }
+            handler.set_header(
+                &binding.result_header,
+                &forwarded_result(None, envelope_unstripped),
+            );
             Flow::Continue(())
         }
         Verdict::Deny { predicate, reason } => {
@@ -1612,7 +1673,7 @@ async fn request_filter<S: DataStorage>(
             if !binding.block {
                 handler.set_header(
                     &binding.result_header,
-                    &format!("would-deny;predicate={label}"),
+                    &forwarded_result(Some(label), envelope_unstripped),
                 );
                 return Flow::Continue(());
             }
