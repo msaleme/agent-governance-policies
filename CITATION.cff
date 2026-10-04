@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: >-
   If you use these policies, please cite this software at the anchor tag
-  v0.1.0-rc.1. The Cross-Session Aggregate-Risk Gate implements the model in the
+  v0.1.0-rc.2. The Cross-Session Aggregate-Risk Gate implements the model in the
   "Authorized but Composed" position paper listed under references; please cite it
   too when you use that policy.
 title: "Agent Governance Policies"
@@ -22,8 +22,8 @@ authors:
     orcid: "https://orcid.org/0009-0003-6736-1900"
 repository-code: "https://github.com/msaleme/agent-governance-policies"
 license: MIT
-version: "0.1.0-rc.1"
-date-released: "2026-10-03"
+version: "0.1.0-rc.2"
+date-released: "2026-10-04"
 keywords:
   - agent-governance
   - ai-security

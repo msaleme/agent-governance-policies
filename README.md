@@ -44,7 +44,7 @@ corpus defines what a correct check means, and the policy performs it at runtime
 
 | | |
 | --- | --- |
-| Repository release | [`v0.1.0-rc.1`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
+| Repository release | [`v0.1.0-rc.2`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
 | Policy versions | Both policies are `1.0.0` in their `Cargo.toml`. The repository version is separate from them. |
 | Exchange | Both policies have been dev-published to Exchange under disposable ids and deleted again. No ready-for-production Exchange asset is published from this repository. |
 | P4A marketplace | Reviewer findings on both policies are resolved and merged. No marketplace acceptance or listing is claimed here. See the [P4A submission pack](P4A-SUBMISSION.md). |
