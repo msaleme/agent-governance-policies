@@ -20,6 +20,14 @@
 > denial nor a passing test run establishes compliance on its own. Design context, not a compliance
 > claim; see also the [MuleSoft PDK overview](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview).
 
+> **The budget is per gateway worker.** Each Envoy worker keeps its own in-memory ledger with the
+> full `aggregateBudget`, and a caller usually cannot be pinned to one worker. A caller that opens
+> more connections can be spread across `N` workers (times replicas) and spend up to
+> `N × aggregateBudget`. For an exact budget, run the gateway with one worker
+> (`FLEX_SERVICE_ENVOY_CONCURRENCY=1`) and one replica. Otherwise set `aggregateBudget` to the
+> intended total divided by `N`, the number of workers across all replicas. See Scope of the
+> guarantee below.
+
 ## The customer need
 
 A regulated or financial-flavored customer runs an Agent Fabric where brokers hold delegated
@@ -47,7 +55,9 @@ writes. Only **reserve-then-authorize against a serialized ledger** holds the bu
 
 ## What the policy enforces
 
-On each governed call the policy:
+A **governed call** is a JSON-RPC request whose `method` is listed in `governedMethods` (default
+`["tools/call"]`). Everything else passes untouched (see Applicability below). On each governed
+call the policy:
 
 1. **Computes** the call's exposure contribution as an exact integer — an estimated-token weight,
    a spend amount in currency minor units read from the request body, or a fixed per-call weight
@@ -60,9 +70,13 @@ On each governed call the policy:
    so composition can be characterized with zero enforcement risk (`mode: monitor`).
 4. **Commits** the reservation into the ledger's running total on a successful upstream response;
    **releases** it on an upstream failure, so a call that never completed does not consume
-   exposure it never spent. Settlement is by reservation id and happens at most once. A
-   reservation whose response never arrives is reclaimed after `reservationTimeoutMs` (see
-   Reservation lifecycle below).
+   exposure it never spent. Success and failure are decided by the HTTP status alone: **2xx and
+   3xx commit, 4xx and 5xx release.** The response body is never read, so a JSON-RPC `error`
+   response or a tool result with `"isError": true` that arrives inside an HTTP 200 **is
+   charged**. Size budgets on the assumption that a failed tool call can still cost its full
+   contribution. Settlement is by reservation id and happens at most once. A reservation whose
+   response never arrives is reclaimed after `reservationTimeoutMs` (see Reservation lifecycle
+   below).
 
 The reserve-then-authorize *order* is the whole point, and it is why this policy exists rather
 than a cheaper read-then-write counter: under concurrency, a read-then-write counter lets every
@@ -88,8 +102,31 @@ filter test drives JSON-RPC 2.0 request bodies, and denials render as JSON-RPC `
 earlier draft also claimed agent-to-agent and model-proxy instances. Neither was ever tested, so
 neither is declared. Adding either one back needs its own test coverage first.
 
-On an MCP instance this policy prices **every** JSON-RPC request it sees, not only `tools/call`.
-That includes `initialize` and `tools/list`, so size `aggregateBudget` with that in mind.
+On an MCP instance this policy prices only the methods listed in `governedMethods`, by default
+`tools/call`. Every other message is **ungoverned**: it is forwarded with no ledger or scope change
+and its response is stamped `pass;reason=ungoverned-method`. Ungoverned means any of:
+
+- a request or notification whose `method` is not listed, such as `initialize`,
+  `notifications/initialized`, `ping`, `tools/list` or `notifications/cancelled`;
+- a JSON-RPC response sent by the client, such as an elicitation or sampling reply;
+- a request with no body, such as the `GET` that opens a server stream or the `DELETE` that ends
+  a session.
+
+So **an exhausted budget never blocks session setup, discovery, keep-alive, cancellation or
+teardown.** It only refuses further `tools/call` requests. Ungoverned traffic is classified before
+identity is read, so it passes even without an identity.
+
+Matching is exact and case-sensitive: `Tools/Call` is not `tools/call`. A message that cannot be
+classified stays governed and fails closed in `block` mode. That covers a body over the inspection
+limit, a non-JSON body, a batch item that is not an object, an item without `"jsonrpc": "2.0"`, a
+non-string `method`, and a body with a duplicate `method` (or any other duplicate) member, where
+this policy and the upstream could disagree about which method is the real one. A governed method
+sent as a notification is still governed.
+
+`governedMethods` must be a non-empty list with no blank, whitespace-padded or duplicate entries.
+There is no wildcard: `"*"` is rejected at configure time, so pricing every method means listing
+each one. Listing `initialize` or a `notifications/*` method is allowed but logs a warning at
+configure time, because it lets an exhausted budget block session setup or cancellation.
 
 `scripts/check_exchange_metadata.py` (repo root) enforces all of this. It rejects a description
 over 256 characters, placeholder text, an undeclared or untested asset type, and a
@@ -99,15 +136,16 @@ checks the files `make build` generates: a real org UUID in `exchange.json`, `mi
 
 ## Inspection boundary
 
-**What this policy reads.** On the request, exactly two things, both from the JSON-RPC body: the
-envelope's `id`(s) (to echo the caller's own id on a `rpc-error` denial) and, when
-`contribution=spend-amount`, the integer value at `spendAmountField`. Alongside those, for
+**What this policy reads.** On the request, exactly three things, all from the JSON-RPC body: the
+envelope's `method` (to decide whether the call is governed), its `id`(s) (to echo the caller's own
+id on a `rpc-error` denial) and, when `contribution=spend-amount`, the integer value at
+`spendAmountField`. Alongside those, for
 `agent`/`tenant` budget scope, it reads the call's identity: by default the verified
 `AuthenticationData` an upstream authentication policy attached (see Identity below), or, only when
 `identitySource=trusted-header`, the one header named by `scopeHeader`. It never reads any other
 header, the query string, or the request/response path. **On the response, it reads
-nothing but headers** — the status code (to decide commit vs. release) — and never the response
-body; see the `contribution` and Scope of the guarantee sections below for why an
+nothing but headers** — the status code (2xx/3xx commit, 4xx/5xx release) — and never the
+response body, so a JSON-RPC error inside an HTTP 200 is charged; see the `contribution` and Scope of the guarantee sections below for why an
 `estimated-token-weight` reservation settles at its own pre-flight estimate rather than a real usage figure.
 
 **Inspection exclusions.** A request body is inspected only if ALL of the following hold, checked
@@ -127,19 +165,23 @@ at the HEADER phase, before this policy ever buffers the body:
   so a **non-UTF-8** body is excluded the same way an oversized one is, even though this specific
   case cannot be caught at the header phase.
 
-A body excluded on any of these grounds is never buffered or read; it is treated as unpriceable —
+A body excluded on any of these grounds is never buffered or read, so its method is unknown; it is
+treated as governed and unpriceable —
 fail-closed in `block` mode (denied, `onDeny` applies), recorded as zero contribution with the gap
 flagged on the header in `monitor` mode (see the Configuration table below). None of this is a
 security containment boundary the way a tripwire's would be — a call this policy cannot price has
 an explicit, safe fallback, not a risk of missing a hidden secret — and none of it substitutes for
 Flex/Gateway's own framing and buffering limits.
 
-**Batch (array) requests.** A JSON-RPC batch is never priced as if it were a single call: under
-`fixed-weight`/`estimated-token-weight` its per-item weight/estimate is multiplied by the number of items in the
-array; under `spend-amount` every item's amount is read and summed, and the whole batch fails closed
-if any single item is unpriceable. A batch denied for exceeding budget is refused atomically — never
-split so that some items land while others don't — and, in `rpc-error` mode, gets back a JSON array
-with one `-32008` error per id, echoing every id in the batch.
+**Batch (array) requests.** A JSON-RPC batch is never priced as if it were a single call, and only
+its governed items are priced: under `fixed-weight`/`estimated-token-weight` the per-item
+weight/estimate is multiplied by the number of governed items; under `spend-amount` every governed
+item's amount is read and summed, and the whole batch fails closed if any governed item is
+unpriceable. A batch with no governed items is ungoverned and passes uncharged. A batch denied for
+exceeding budget is refused atomically — never split so that some items land while others don't —
+and, in `rpc-error` mode, gets back a JSON array with one `-32008` error per request id in the
+batch, ungoverned requests included, since none of the batch is forwarded. Response items in a
+batch have no request id to answer and are not echoed.
 
 ## Configuration
 
@@ -156,14 +198,15 @@ with one `-32008` error per id, echoing every id in the batch.
 | `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
 | `window` | `fixed-period`\|`worker-lifetime` | `fixed-period` | How long committed exposure counts. `fixed-period` resets every scope's committed total at each `windowMs` boundary, counted from the Unix epoch, so 24-hour windows start at 00:00 UTC. `worker-lifetime` never resets. See Accounting window below. The old value `rolling-24h` never rolled and is now rejected at configure time. |
 | `windowMs` | integer, `60000`–`31622400000` | `86400000` | Window length in ms for `fixed-period` (1 minute to 366 days). Ignored for `worker-lifetime`. |
-| `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Scope of the guarantee below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every item, never priced as a single call. |
+| `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Scope of the guarantee below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every governed item, never priced as a single call. |
 | `fixedWeight` | integer, `0`–`9007199254740991` | `1` | Per-call contribution when `contribution=fixed-weight`. |
-| `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and recorded as zero in `monitor` mode. |
+| `governedMethods` | list of strings | `["tools/call"]` | The JSON-RPC methods this policy prices and enforces, matched exactly and case-sensitively. All other traffic is forwarded uncharged and stamped `pass;reason=ungoverned-method` (see Applicability above). Must be non-empty with no blank, padded or duplicate entries; `"*"` is rejected. |
+| `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. Only governed requests are read. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and recorded as zero in `monitor` mode. |
 | `spendCurrency` | string, ISO 4217 | `USD` | Currency of `spend-amount` values: three uppercase letters, with amounts in that currency's ISO 4217 minor unit. Stamped into `resultHeader` as `unit=<code>-minor`. The policy does no currency conversion. |
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
-| `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. |
+| `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. In both modes a reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
-| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `unpriceable`, or `out-of-range`. Never carries other sessions' call content, and by default never the raw identity. |
+| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
 
 ```yaml
 - policyRef:
@@ -182,6 +225,8 @@ with one `-32008` error per id, echoing every id in the batch.
     windowMs: 86400000
     contribution: fixed-weight
     fixedWeight: 800
+    governedMethods:
+      - tools/call
     spendAmountField: params.amount
     spendCurrency: USD
     estimatedTokens: 500
@@ -345,7 +390,9 @@ holding the budget under contention where a naive read-then-write counter breach
 
 - **The budget is per worker, not per fleet.** Each gateway worker, and each replica's workers,
   holds its own ledger with the full `aggregateBudget`. With `N` workers in total behind the same
-  API, a scope can be admitted up to `N × aggregateBudget` in a window. To make `aggregateBudget`
+  API, a scope can be admitted up to `N × aggregateBudget` in a window, and a caller can push
+  toward that by opening more connections. The ledger's mutex serializes callers within one
+  worker only; it gives no protection across workers. To make `aggregateBudget`
   an upper bound for the whole deployment, divide the intended budget by `N`. That bound is safe
   but loose: a scope whose traffic lands on one worker gets only `1/N` of the intended budget.
 - **Single-worker configuration gives one budget per replica.** Setting
@@ -379,7 +426,7 @@ The earlier `ledgerEndpoint` placeholder for it has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 140 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 153 tests, none of which touch the network or
 Docker:
 
 - **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 51 tests): correctness of
@@ -408,7 +455,7 @@ Docker:
   periods are aligned to the epoch, not first use; an in-flight reservation carries across a
   boundary and settles in the new period; a clock stepping backwards never resets a total;
   without a window nothing resets; and a scope from an earlier period can be evicted.
-- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (47 tests,
+- **`src/lib.rs` — the PDK filter**, exercised end to end through the `pdk-unit` harness (59 tests,
   from `sequential_composition_through_the_real_filter_refuses_the_fourth_call` on): per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the
@@ -441,6 +488,20 @@ Docker:
     (`estimated_token_weight_ignores_over_and_malformed_usage_figures`).
   - **Settlement** — a successful response is stamped `settlement=committed` and a failure
     `settlement=released`, and a worker restart (`tester.restart()`) resets every total to zero.
+    Upstream statuses 200, 202 and 302 commit and 404, 500 and 504 release
+    (`settlement_commits_2xx_and_3xx_and_releases_4xx_and_5xx`), and a JSON-RPC `error` or an
+    `isError: true` result inside an HTTP 200 is charged
+    (`a_jsonrpc_error_or_is_error_result_inside_an_http_200_is_charged`).
+  - **Governed methods** — a full MCP session (`initialize`, `notifications/initialized`,
+    `tools/list`, `ping`, an elicitation response, bodyless `GET` and `DELETE`) runs on an
+    exhausted budget and only `tools/call` is denied
+    (`a_full_mcp_session_runs_on_an_exhausted_spend_budget_and_only_tools_call_is_denied`), and
+    `initialize`, `ping` and `notifications/cancelled` still pass on an exhausted fixed-weight
+    budget;
+    ungoverned traffic creates no scope and changes no ledger counter; mixed batches charge only
+    their governed items, and a denied mixed batch returns `-32008` for every request id; a
+    duplicate `method` member fails closed; matching is case-sensitive; and an item that cannot be
+    classified stays governed.
   - **Window** — with `windowMs: 60000` a spent budget is still denied at 59 s on the gateway
     clock (`tester.sleep`) and available again at 60 s; with `worker-lifetime` it is still denied
     400 days later.
@@ -453,19 +514,22 @@ Docker:
   rules in `canonical_identity`; duplicate and mixed-case trusted headers; `client_id`,
   `principal` and `properties.<path>` selection (a non-string property is invalid); and
   `digest` (keyed and unkeyed), `none` and `raw` display.
-- **Direct `Gate::from_config` validation tests** (28): every config-validation rejection path
+- **Direct `Gate::from_config` validation tests** (29): every config-validation rejection path
   (invalid enum values including `window`, the retired `rolling-24h` rejected with its replacements named, `windowMs` outside `60000`–`31622400000`, negative or above-2^53 − 1 amounts, a fractional
   amount refused by deserialization, the retired `token-cost` name rejected with its replacement
   named, a malformed `spendCurrency`, blank required strings, an unknown `identitySource`,
-  `identityField` or `scopeDisclosure`, and `maxScopes` outside `1`–`1000000`, `reservationTimeoutMs` outside `1000`–`86400000`) and the corresponding accepted
+  `identityField` or `scopeDisclosure`, an empty, blank, padded, duplicated or `"*"`
+  `governedMethods` list, and `maxScopes` outside `1`–`1000000`, `reservationTimeoutMs` outside `1000`–`86400000`) and the corresponding accepted
   cases.
 - **`dot_path_value` unit tests** (4): the dotted-path body reader used for `spend-amount`.
 
 Two Docker suites run the policy through a real, containerized Flex Gateway 1.14.0 with a real
 HTTP mock upstream:
 
-- **`tests/requests.rs`** has two `pdk_test` cases: sequential composition refuses the fourth
-  call, and a different agent has an independent budget.
+- **`tests/requests.rs`** has three `pdk_test` cases: sequential composition refuses the fourth
+  call, a different agent has an independent budget, and an MCP handshake (`initialize`,
+  `notifications/initialized`, `tools/list`) passes under `spend-amount` + `block` while only
+  `tools/call` is budgeted.
 - **`tests/connected_e2e.rs`** has the real-gateway validation cases from
   `docs/ASTRA-TASK-aggregate-risk-connected.md`. They are `#[ignore]` and are run explicitly.
   They cover:

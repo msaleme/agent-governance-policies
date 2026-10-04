@@ -23,6 +23,15 @@
 // cryptographic attestation of its decisions. A shared, durable ledger is
 // future work (v2); nothing here should be read as a claim of durability,
 // multi-worker sharing, or non-repudiation.
+//
+// The Mutex is NOT cross-worker protection. The concurrency tests below prove
+// atomicity between threads that share one `Ledger`; on the gateway each Envoy
+// worker holds its own `Ledger`, so the lock never sees another worker's
+// callers. A caller spread across N workers (e.g. by opening more connections)
+// faces N independent budgets and can spend up to N times the configured
+// budget. The deployment answer is one worker (`FLEX_SERVICE_ENVOY_CONCURRENCY=1`)
+// and one replica, or a per-worker budget of the intended total divided by N;
+// see the README.
 
 // Units: every amount here is an exact, non-negative integer (`u64`) in the
 // policy's configured unit (fixed-weight points, estimated tokens, or a

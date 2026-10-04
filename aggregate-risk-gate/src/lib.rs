@@ -7,6 +7,13 @@
 // cap are all structurally blind to the SUM; this policy is a control that sees
 // it.
 //
+// Governed calls: only JSON-RPC messages whose `method` is in `governedMethods`
+// (default `["tools/call"]`) are priced. The rest of the MCP protocol
+// (`initialize`, `tools/list`, `ping`, `notifications/*`, client responses to
+// server requests, and bodyless requests such as the SSE GET and the session
+// DELETE) passes through with no contribution and no ledger mutation (P4A
+// review #47). See `compute_contribution`.
+//
 // Mechanism: reserve-then-authorize. On each governed call this policy computes
 // the call's exposure contribution as an exact integer (an estimated-token
 // weight, a spend amount in currency minor units read from the request body, or
@@ -275,7 +282,13 @@ fn parse_jsonrpc_request(body: &[u8]) -> Option<ParsedJsonRpcRequest> {
     let root: Value = serde_json::from_slice(body).ok()?;
     let is_batch = matches!(root, Value::Array(_));
     let items: Vec<&Value> = match &root {
-        Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        // A client's JSON-RPC responses (to server-initiated requests) can
+        // share a batch with its requests. They carry the SERVER's ids, so
+        // they are skipped: only request ids are echoed on deny.
+        Value::Array(items) if !items.is_empty() => items
+            .iter()
+            .filter(|item| !is_jsonrpc_response(item))
+            .collect(),
         Value::Object(_) => vec![&root],
         _ => return None,
     };
@@ -382,6 +395,35 @@ fn config_units(name: &str, value: i64) -> Result<u64> {
         .ok_or_else(|| anyhow!("{name} must be an integer between 0 and {MAX_UNITS}"))
 }
 
+/// Validates `governedMethods`. An empty list would silently disable the
+/// policy, so it is rejected, as are blank or space-padded entries (which
+/// could never match, since matching is exact) and duplicates. `"*"` is not a
+/// wildcard in this build and is rejected rather than matched literally.
+fn governed_methods(methods: &[String]) -> Result<Vec<String>> {
+    if methods.is_empty() {
+        return Err(anyhow!(
+            "governedMethods must list at least one JSON-RPC method, e.g. [\"tools/call\"]"
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for method in methods {
+        if method.trim().is_empty() || method.trim() != method {
+            return Err(anyhow!(
+                "governedMethods entries must be non-blank with no surrounding whitespace, got {method:?}"
+            ));
+        }
+        if method == "*" {
+            return Err(anyhow!(
+                "governedMethods does not support \"*\": list each JSON-RPC method to price"
+            ));
+        }
+        if !seen.insert(method.as_str()) {
+            return Err(anyhow!("governedMethods lists {method:?} more than once"));
+        }
+    }
+    Ok(methods.to_vec())
+}
+
 /// Compiled, validated policy state, built once at configuration time and
 /// shared (by reference) across every exchange this instance governs. Owns the
 /// per-worker ledger described in the module doc comment.
@@ -395,6 +437,8 @@ struct Gate {
     /// downstream reader never has to guess what "800" means.
     unit: String,
     fixed_weight: u64,
+    /// The JSON-RPC methods that are priced. Matched case-sensitively.
+    governed_methods: Vec<String>,
     spend_amount_field: String,
     estimated_tokens: u64,
     mode: Mode,
@@ -547,6 +591,8 @@ impl Gate {
             return Err(anyhow!("resultHeader must not be blank"));
         }
 
+        let governed_methods = governed_methods(&config.governed_methods)?;
+
         Ok(Self {
             budget_scope,
             identity_source,
@@ -555,6 +601,7 @@ impl Gate {
             contribution,
             unit,
             fixed_weight,
+            governed_methods,
             spend_amount_field,
             estimated_tokens,
             mode,
@@ -679,6 +726,9 @@ enum ContributionOutcome {
     /// The amount was a valid integer, but it (or the batch total) exceeds
     /// `MAX_UNITS`, so it cannot be charged exactly.
     OutOfRange,
+    /// Nothing in the request is a governed call: pass it through with no
+    /// contribution, no reservation and no scope entry.
+    Ungoverned,
 }
 
 /// Reads a spend amount as an exact count of minor units. Only a JSON integer
@@ -704,55 +754,95 @@ fn per_item_total(per_item: u64, items: usize) -> ContributionOutcome {
         .map_or(ContributionOutcome::OutOfRange, ContributionOutcome::Known)
 }
 
-/// How many JSON-RPC calls `body` represents, for contribution accounting. A
-/// batch (JSON array) body must never be priced as if it were a single call —
-/// that would fail-open the aggregate-risk check by letting a batch of N
-/// calls each escape at 1/N of their real weight. `body` is assumed already
-/// size-checked (`RawBody::Present` only, never `Uninspectable`).
-fn body_item_count(body: &[u8]) -> usize {
-    match serde_json::from_slice::<Value>(body) {
-        Ok(Value::Array(items)) if !items.is_empty() => items.len(),
-        _ => 1,
+/// A JSON-RPC response object: `"jsonrpc": "2.0"`, no `method`, an `id`, and
+/// exactly one of `result`/`error`. An MCP client POSTs these to answer
+/// server-initiated requests such as `sampling/createMessage` or
+/// `elicitation/create`.
+fn is_jsonrpc_response(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && !object.contains_key("method")
+        && object.contains_key("id")
+        && object.contains_key("result") != object.contains_key("error")
+}
+
+/// Whether one JSON-RPC item is a governed call. Only an item this policy can
+/// positively classify is ungoverned: a JSON-RPC 2.0 message whose string
+/// `method` is not in `governedMethods` (a request or a notification), or a
+/// JSON-RPC response. Anything it cannot classify (not an object, no
+/// `"jsonrpc": "2.0"`, a non-string `method`, no `method` and not a response)
+/// is governed, so it is priced or fails closed rather than slipping through.
+/// A governed method sent as a notification (no `id`) is still governed: the
+/// upstream may run it anyway.
+fn is_governed(methods: &[String], item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return true;
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return true;
+    }
+    match object.get("method") {
+        Some(Value::String(method)) => methods.iter().any(|governed| governed == method),
+        Some(_) => true,
+        None => !is_jsonrpc_response(item),
     }
 }
 
+/// Prices a request. A batch (JSON array) is never priced as if it were a
+/// single call — that would fail-open the aggregate-risk check by letting a
+/// batch of N calls each escape at 1/N of their real weight. Only governed
+/// items are priced; a request with none is `Ungoverned`.
 fn compute_contribution(gate: &Gate, raw_body: RawBody) -> ContributionOutcome {
     let body = match raw_body {
         // An uninspectable-but-present body might be a batch of any size —
         // fail closed rather than guess it is worth exactly one call.
         RawBody::Uninspectable => return ContributionOutcome::Unpriceable,
-        RawBody::NoBody => None,
-        RawBody::Present(bytes) => Some(bytes),
+        // No body means no JSON-RPC message, so no governed call: the SSE
+        // stream GET and the session DELETE. It cannot hide a batch.
+        RawBody::NoBody => return ContributionOutcome::Ungoverned,
+        RawBody::Present(bytes) => bytes,
     };
+    let Ok(root) = serde_json::from_slice::<Value>(body) else {
+        // Not JSON: one call this policy cannot classify, so it is governed.
+        return price(gate, &[&Value::Null]);
+    };
+    // A duplicate member (e.g. two `method`s) means this policy and the
+    // upstream could classify the same bytes differently. Fail closed.
+    if serde_json::from_slice::<NoDuplicateMembers>(body).is_err() {
+        return ContributionOutcome::Unpriceable;
+    }
+    let items: Vec<&Value> = match &root {
+        Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        _ => vec![&root],
+    };
+    let governed: Vec<&Value> = items
+        .into_iter()
+        .filter(|item| is_governed(&gate.governed_methods, item))
+        .collect();
+    price(gate, &governed)
+}
+
+/// Prices the governed items of a request.
+fn price(gate: &Gate, governed: &[&Value]) -> ContributionOutcome {
+    if governed.is_empty() {
+        return ContributionOutcome::Ungoverned;
+    }
     match gate.contribution {
-        Contribution::FixedWeight => {
-            per_item_total(gate.fixed_weight, body.map(body_item_count).unwrap_or(1))
-        }
-        Contribution::EstimatedTokenWeight => per_item_total(
-            gate.estimated_tokens,
-            body.map(body_item_count).unwrap_or(1),
-        ),
+        Contribution::FixedWeight => per_item_total(gate.fixed_weight, governed.len()),
+        Contribution::EstimatedTokenWeight => per_item_total(gate.estimated_tokens, governed.len()),
         Contribution::SpendAmount => {
-            let Some(body) = body else {
-                return ContributionOutcome::Unpriceable;
-            };
-            let Ok(value) = serde_json::from_slice::<Value>(body) else {
-                return ContributionOutcome::Unpriceable;
-            };
-            let items: Vec<&Value> = match &value {
-                Value::Array(items) if !items.is_empty() => items.iter().collect(),
-                _ => vec![&value],
-            };
             let mut total: u64 = 0;
-            for item in &items {
+            for item in governed {
                 match dot_path_value(item, &gate.spend_amount_field).and_then(exact_minor_units) {
                     Some(Ok(amount)) => match total.checked_add(amount) {
                         Some(sum) if sum <= MAX_UNITS => total = sum,
                         _ => return ContributionOutcome::OutOfRange,
                     },
                     Some(Err(())) => return ContributionOutcome::OutOfRange,
-                    // Fail closed on the WHOLE batch if any one item is
-                    // unpriceable — never silently price the batch at only
+                    // Fail closed on the WHOLE batch if any one governed item
+                    // is unpriceable — never silently price the batch at only
                     // the items that happened to parse.
                     None => return ContributionOutcome::Unpriceable,
                 }
@@ -843,8 +933,9 @@ fn refuse(gate: &Gate, reason: DenyReason, scope: &str, echo_bytes: Option<&[u8]
 /// request to the upstream, not the response the caller sees.
 #[derive(Clone, Debug)]
 enum Ticket {
-    /// Nothing was reserved (a monitor-mode unpriceable or out-of-range
-    /// call) — the response filter only needs to stamp the header.
+    /// Nothing was reserved (an ungoverned request, or a monitor-mode
+    /// unpriceable or out-of-range call) — the response filter only needs to
+    /// stamp the header.
     None(String),
     /// A reservation for the call's exact contribution: commit on a
     /// successful response, release otherwise. Every contribution mode,
@@ -854,6 +945,10 @@ enum Ticket {
     Reserved(String, Reservation),
 }
 
+/// Settlement is by HTTP status alone: 2xx and 3xx commit, everything else
+/// (4xx, 5xx) releases. The response body is never read, so a JSON-RPC error
+/// or an `isError` tool result inside an HTTP 200 is committed (charged), and
+/// a 202 whose result arrives later over SSE is committed at the 202.
 fn is_success(status: u32) -> bool {
     (200..400).contains(&status)
 }
@@ -941,6 +1036,15 @@ fn decide(
     // still needs the original bytes to attempt an in-band id-echo.
     let echo_bytes = raw_body.as_bytes();
 
+    // Classified before identity: ungoverned traffic (the MCP handshake,
+    // listings, pings, notifications, client responses, bodyless requests) is
+    // never refused, even with no identity or an exhausted budget, and never
+    // touches the ledger.
+    let outcome = compute_contribution(gate, raw_body);
+    if matches!(outcome, ContributionOutcome::Ungoverned) {
+        return Flow::Continue(Ticket::None("pass;reason=ungoverned-method".to_string()));
+    }
+
     let scope = match identity {
         Identity::Scope(key) => key,
         unidentified => {
@@ -959,12 +1063,13 @@ fn decide(
         }
     };
 
-    let reason = match compute_contribution(gate, raw_body) {
+    let reason = match outcome {
         ContributionOutcome::Known(amount) => {
             return admit(gate, &scope, amount, now, echo_bytes, violations)
         }
         ContributionOutcome::Unpriceable => DenyReason::Unpriceable,
         ContributionOutcome::OutOfRange => DenyReason::OutOfRange,
+        ContributionOutcome::Ungoverned => unreachable!("returned above"),
     };
     let display = gate.display_scope(&scope);
     if gate.mode == Mode::Block {
@@ -1113,6 +1218,16 @@ async fn configure(
     })?;
 
     let gate = Gate::from_config(&config)?;
+    if gate
+        .governed_methods
+        .iter()
+        .any(|method| method == "initialize" || method.starts_with("notifications/"))
+    {
+        logger::warn!(
+            "Aggregate Risk Gate: governedMethods includes initialize or a notifications/* \
+             method; an exhausted budget will then block the MCP handshake or cancellation"
+        );
+    }
     logger::info!(
         "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, mode={}",
         gate.budget_scope,
@@ -1159,6 +1274,7 @@ mod test {
             "windowMs": 86400000,
             "contribution": "fixed-weight",
             "fixedWeight": 800,
+            "governedMethods": ["tools/call"],
             "spendAmountField": "params.amount",
             "spendCurrency": "USD",
             "estimatedTokens": 500,
@@ -1883,10 +1999,10 @@ mod test {
         }
         // A duplicate "id" member: a parser-differential body where this
         // policy and the upstream tool could legitimately disagree about
-        // which id is "the" id. This 4th call is a genuine budget-exceeded
-        // denial, but neither id may ever be echoed — fall back to the
-        // generic empty-403, exactly as an unparseable body would (issue #36
-        // containment).
+        // which id is "the" id. This 4th call is denied (a duplicate member
+        // is unpriceable, and the budget is spent anyway), but neither id may
+        // ever be echoed — fall back to the generic empty-403, exactly as an
+        // unparseable body would (issue #36 containment).
         let ambiguous = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","id":999,"params":{}}"#;
         let response = tester.request(raw_request(ambiguous, Some("broker-7")));
         assert!(
@@ -2259,6 +2375,7 @@ mod test {
             contribution: "fixed-weight".to_string(),
             estimated_tokens: 500,
             fixed_weight: 800,
+            governed_methods: vec!["tools/call".to_string()],
             identity_field: "client_id".to_string(),
             identity_source: "authentication".to_string(),
             max_scopes: 10000,
@@ -2823,5 +2940,489 @@ mod test {
     fn dot_path_value_returns_none_for_an_empty_path_segment() {
         let value = json!({"params": {"amount": 1}});
         assert_eq!(dot_path_value(&value, "params..amount"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Governed methods (P4A review #47): only `governedMethods` are priced;
+    // the rest of the MCP protocol passes through without touching the ledger.
+    // -----------------------------------------------------------------------
+
+    const PASS: &str = "pass;reason=ungoverned-method";
+
+    /// A property store with nothing in it, so `decide` can be driven
+    /// directly against a `Gate` whose ledger the test can then inspect.
+    struct NoProperties;
+    impl PropertyAccessor for NoProperties {
+        fn read_property(&self, _path: &[&str]) -> Option<Vec<u8>> {
+            None
+        }
+        fn set_property(&self, _path: &[&str], _value: Option<&[u8]>) {}
+    }
+
+    fn violations() -> PolicyViolations {
+        PolicyViolations::new(NoProperties, String::new())
+    }
+
+    fn mcp(body: Value) -> UnitHttpRequest {
+        jsonrpc_request(body, Some("broker-7"))
+    }
+
+    /// A client's JSON-RPC response to a server-initiated request.
+    fn elicitation_response() -> Value {
+        json!({"jsonrpc": "2.0", "id": "srv-1", "result": {"action": "accept"}})
+    }
+
+    #[test]
+    fn a_full_mcp_session_runs_on_an_exhausted_spend_budget_and_only_tools_call_is_denied() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({
+                "contribution": "spend-amount",
+                "aggregateBudget": 1000,
+            })))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // Spend the whole budget with one governed call.
+        let spent = tester.request(rpc_request_with_amount(0, "broker-7", 1000));
+        assert_eq!(response_error_code(&spent), None);
+        assert!(backend.next().is_some());
+
+        let session = vec![
+            mcp(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})),
+            mcp(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
+            mcp(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})),
+            mcp(json!({"jsonrpc": "2.0", "id": 3, "method": "ping"})),
+            UnitHttpRequest::get()
+                .with_header("accept", "text/event-stream")
+                .with_header("x-agent-id", "broker-7"),
+            mcp(elicitation_response()),
+            UnitHttpRequest::delete()
+                .with_header("mcp-session-id", "session-1")
+                .with_header("x-agent-id", "broker-7"),
+        ];
+        for (step, request) in session.into_iter().enumerate() {
+            let response = tester.request(request);
+            assert_eq!(response.status_code(), 200, "step {step}");
+            assert_eq!(response_error_code(&response), None, "step {step}");
+            assert_eq!(
+                response.header("x-aggregate-risk-gate"),
+                Some(PASS),
+                "step {step}"
+            );
+            assert!(
+                backend.next().is_some(),
+                "step {} must reach upstream",
+                step
+            );
+        }
+
+        let over = tester.request(rpc_request_with_amount(4, "broker-7", 1));
+        assert_eq!(response_error_code(&over), Some(MCP_BLOCKED_CODE));
+        assert!(over
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .contains("would-be-total=1001;budget=1000"));
+        // #18 still holds: a tools/call with no amount is unpriceable.
+        let unpriced = tester.request(rpc_request(5, "broker-7"));
+        assert_eq!(response_error_code(&unpriced), Some(MCP_BLOCKED_CODE));
+        assert_eq!(
+            unpriced.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent:broker-7;reason=unpriceable")
+        );
+        assert!(
+            backend.next().is_none(),
+            "denied calls never reach upstream"
+        );
+    }
+
+    #[test]
+    fn ungoverned_traffic_creates_no_scope_reservation_or_ledger_change() {
+        let gate = gate_with(json!({"contribution": "spend-amount"}));
+        let bodies: Vec<Value> = vec![
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 9}}),
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}),
+            elicitation_response(),
+            json!({"jsonrpc": "2.0", "id": "srv-2", "error": {"code": -1, "message": "no"}}),
+            json!([
+                {"jsonrpc": "2.0", "id": 4, "method": "resources/list"},
+                {"jsonrpc": "2.0", "method": "notifications/roots/list_changed"},
+            ]),
+        ];
+        let identities = [
+            Identity::Scope("agent:broker-7".to_string()),
+            Identity::Missing,
+            Identity::Invalid,
+        ];
+        let flows = bodies
+            .iter()
+            .map(|body| body.to_string().into_bytes())
+            .flat_map(|bytes| {
+                identities
+                    .iter()
+                    .map(move |identity| (identity.clone(), bytes.clone()))
+            })
+            .map(|(identity, bytes)| {
+                decide(identity, 0, &gate, RawBody::Present(&bytes), &violations())
+            })
+            .chain(std::iter::once(decide(
+                Identity::Missing,
+                0,
+                &gate,
+                RawBody::NoBody,
+                &violations(),
+            )));
+        for flow in flows {
+            assert!(
+                matches!(flow, Flow::Continue(Ticket::None(ref stamp)) if stamp == PASS),
+                "{:?}",
+                match flow {
+                    Flow::Continue(ticket) => format!("{ticket:?}"),
+                    Flow::Break(_) => "denied".to_string(),
+                }
+            );
+        }
+        assert_eq!(gate.ledger.scope_count(), 0, "no scope entry");
+        assert_eq!(
+            gate.ledger.stats(),
+            LedgerStats::default(),
+            "no ledger change"
+        );
+        assert_eq!(gate.ledger.snapshot("agent:broker-7").total(), 0);
+    }
+
+    #[test]
+    fn ungoverned_traffic_never_takes_a_scope_slot() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"maxScopes": 1})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for agent in ["broker-1", "broker-2", "broker-3"] {
+            let response = tester.request(jsonrpc_request(
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}),
+                Some(agent),
+            ));
+            assert_eq!(response.header("x-aggregate-risk-gate"), Some(PASS));
+        }
+        // Had any initialize created a scope, this new identity would hit
+        // the 1-scope cap and be refused with reason=scope-capacity.
+        let response = tester.request(rpc_request(2, "broker-9"));
+        assert_eq!(response_error_code(&response), None);
+        assert!(response
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .starts_with("allowed;scope=agent:broker-9;contribution=800;total=800/3000"));
+    }
+
+    #[test]
+    fn an_exhausted_fixed_weight_budget_still_forwards_initialize_ping_and_cancellation() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        for i in 0..3 {
+            assert_eq!(
+                response_error_code(&tester.request(rpc_request(i, "broker-7"))),
+                None
+            );
+        }
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(3, "broker-7"))),
+            Some(MCP_BLOCKED_CODE),
+            "the budget is exhausted"
+        );
+        for body in [
+            json!({"jsonrpc": "2.0", "id": 10, "method": "initialize", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 11, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}}),
+        ] {
+            let response = tester.request(mcp(body.clone()));
+            assert_eq!(response.status_code(), 200, "{body}");
+            assert_eq!(response_error_code(&response), None, "{body}");
+            assert_eq!(
+                response.header("x-aggregate-risk-gate"),
+                Some(PASS),
+                "{body}"
+            );
+        }
+        assert_eq!(
+            response_error_code(&tester.request(rpc_request(4, "broker-7"))),
+            Some(MCP_BLOCKED_CODE),
+            "tools/call is still denied"
+        );
+    }
+
+    #[test]
+    fn an_all_ungoverned_batch_passes_and_is_charged_nothing() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"contribution": "spend-amount"})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            elicitation_response(),
+        ]);
+        let response = tester.request(mcp(batch));
+        assert_eq!(response_error_code(&response), None);
+        assert_eq!(response.header("x-aggregate-risk-gate"), Some(PASS));
+        // The whole budget is still there.
+        let full = tester.request(rpc_request_with_amount(2, "broker-7", 3000));
+        assert_eq!(response_error_code(&full), None);
+        assert!(full
+            .header("x-aggregate-risk-gate")
+            .unwrap()
+            .contains("contribution=3000;total=3000/3000"));
+    }
+
+    #[test]
+    fn a_mixed_batch_is_charged_only_its_governed_items() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            elicitation_response(),
+        ]);
+        let response = tester.request(mcp(batch));
+        assert_eq!(response_error_code(&response), None);
+        assert!(
+            response
+                .header("x-aggregate-risk-gate")
+                .unwrap()
+                .contains("contribution=1600;total=1600/3000"),
+            "two governed items at 800 each, nothing for the other three"
+        );
+    }
+
+    #[test]
+    fn a_mixed_batch_with_an_unpriceable_governed_item_is_denied_with_an_error_per_request_id() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({"contribution": "spend-amount"})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"amount": 100}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}},
+            {"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            elicitation_response(),
+        ]);
+        let response = tester.request(mcp(batch));
+        assert!(backend.next().is_none(), "the whole batch is refused");
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent:broker-7;reason=unpriceable")
+        );
+        let body: Value = serde_json::from_slice(response.body()).unwrap();
+        let errors = body.as_array().expect("batch denial echoes a JSON array");
+        // Every request id, governed or not; never the server's response id.
+        let ids: Vec<&Value> = errors.iter().map(|error| &error["id"]).collect();
+        assert_eq!(ids, [&json!(1), &json!(2), &json!(3)]);
+        for error in errors {
+            assert_eq!(error["error"]["code"], MCP_BLOCKED_CODE);
+        }
+    }
+
+    #[test]
+    fn a_duplicate_method_member_fails_closed() {
+        let backend = Rc::new(TraceBackend::new(ok_backend));
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(json!({})))
+            .with_backend(Rc::clone(&backend))
+            .with_entrypoint(super::configure);
+        // Read first-wins this is a ping, last-wins a tools/call. A fresh,
+        // unspent budget: the denial is for the ambiguity alone.
+        let ambiguous =
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","params":{}}"#;
+        let response = tester.request(raw_request(ambiguous, Some("broker-7")));
+        assert!(backend.next().is_none());
+        assert_eq!(response.status_code(), 403, "no id is echoed");
+        assert_eq!(
+            response.header("x-aggregate-risk-gate"),
+            Some("denied;scope=agent:broker-7;reason=unpriceable")
+        );
+        // The same body in a batch fails closed the same way.
+        let batch = format!(r#"[{{"jsonrpc":"2.0","id":2,"method":"tools/list"}},{ambiguous}]"#);
+        let response = tester.request(raw_request(&batch, Some("broker-7")));
+        assert!(backend.next().is_none());
+        assert_eq!(response.status_code(), 403);
+    }
+
+    #[test]
+    fn method_matching_is_exact_and_case_sensitive() {
+        let gate = gate_with(json!({"governedMethods": ["tools/call", "resources/read"]}));
+        let outcome = |body: Value| {
+            let bytes = body.to_string().into_bytes();
+            match compute_contribution(&gate, RawBody::Present(&bytes)) {
+                ContributionOutcome::Known(amount) => Some(amount),
+                ContributionOutcome::Ungoverned => None,
+                _ => panic!("unexpected outcome for {}", body),
+            }
+        };
+        let call = |method: &str| json!({"jsonrpc": "2.0", "id": 1, "method": method});
+        assert_eq!(outcome(call("tools/call")), Some(800));
+        assert_eq!(outcome(call("resources/read")), Some(800));
+        for other in ["Tools/Call", "tools/call ", "tools/", "resources/list", "*"] {
+            assert_eq!(outcome(call(other)), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn an_item_that_cannot_be_classified_stays_governed() {
+        let gate = gate_with(json!({}));
+        for body in [
+            json!({"not": "rpc"}),
+            json!({"id": 1, "method": "initialize"}),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "initialize"}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": 7}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}, "error": {}}),
+            json!({"jsonrpc": "2.0", "result": {}}),
+            json!([]),
+            json!("tools/call"),
+            // A governed method sent as a notification is still governed.
+            json!({"jsonrpc": "2.0", "method": "tools/call", "params": {}}),
+        ] {
+            let bytes = body.to_string().into_bytes();
+            assert!(
+                matches!(
+                    compute_contribution(&gate, RawBody::Present(&bytes)),
+                    ContributionOutcome::Known(800)
+                ),
+                "{}",
+                body
+            );
+        }
+        assert!(matches!(
+            compute_contribution(&gate, RawBody::Present(b"not json")),
+            ContributionOutcome::Known(800)
+        ));
+        assert!(matches!(
+            compute_contribution(&gate, RawBody::Uninspectable),
+            ContributionOutcome::Unpriceable
+        ));
+    }
+
+    #[test]
+    fn governed_methods_rejects_empty_blank_padded_duplicate_and_wildcard_lists() {
+        for bad in [
+            vec![],
+            vec![""],
+            vec!["   "],
+            vec![" tools/call"],
+            vec!["tools/call", "tools/call"],
+            vec!["*"],
+            vec!["tools/call", "*"],
+        ] {
+            let mut cfg = valid_config_struct();
+            cfg.governed_methods = bad.iter().map(|m| m.to_string()).collect();
+            assert!(
+                Gate::from_config(&cfg).is_err(),
+                "governedMethods {:?}",
+                bad
+            );
+        }
+        for good in [vec!["tools/call"], vec!["tools/call", "resources/read"]] {
+            let mut cfg = valid_config_struct();
+            cfg.governed_methods = good.iter().map(|m| m.to_string()).collect();
+            assert!(
+                Gate::from_config(&cfg).is_ok(),
+                "governedMethods {:?}",
+                good
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Settlement is by HTTP status only (P4A review #49, finding B).
+    // -----------------------------------------------------------------------
+
+    fn status_backend(
+        status: u32,
+        body: &'static str,
+    ) -> impl Fn(UnitHttpRequest) -> UnitHttpResponse {
+        move |_req| {
+            UnitHttpResponse::new(status)
+                .with_header("content-type", "application/json")
+                .with_header("content-length", body.len().to_string())
+                .with_body(body.as_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn settlement_commits_2xx_and_3xx_and_releases_4xx_and_5xx() {
+        for (status, settlement) in [
+            (200, "committed"),
+            (202, "committed"),
+            (302, "committed"),
+            (404, "released"),
+            (500, "released"),
+            (504, "released"),
+        ] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(status_backend(status, ""))
+                .with_entrypoint(super::configure);
+            let first = tester.request(rpc_request(1, "broker-7"));
+            assert!(
+                first
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .ends_with(&format!(";settlement={settlement}")),
+                "{status}: {:?}",
+                first.header("x-aggregate-risk-gate")
+            );
+            // The next call's running total shows whether 800 was charged.
+            let charged = if settlement == "committed" { 1600 } else { 800 };
+            let second = tester.request(rpc_request(2, "broker-7"));
+            assert!(
+                second
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .contains(&format!("total={charged}/3000")),
+                "{status}: {:?}",
+                second.header("x-aggregate-risk-gate")
+            );
+        }
+    }
+
+    #[test]
+    fn a_jsonrpc_error_or_is_error_result_inside_an_http_200_is_charged() {
+        for body in [
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"tool failed"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"content":[],"isError":true}}"#,
+        ] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({})))
+                .with_backend(status_backend(200, body))
+                .with_entrypoint(super::configure);
+            let first = tester.request(rpc_request(1, "broker-7"));
+            assert!(
+                first
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .ends_with(";settlement=committed"),
+                "{}",
+                body
+            );
+            let second = tester.request(rpc_request(2, "broker-7"));
+            assert!(
+                second
+                    .header("x-aggregate-risk-gate")
+                    .unwrap()
+                    .contains("total=1600/3000"),
+                "the failed tool call was charged: {}",
+                body
+            );
+        }
     }
 }

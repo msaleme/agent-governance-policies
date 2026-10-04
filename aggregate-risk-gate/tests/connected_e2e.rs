@@ -48,6 +48,7 @@ fn gate(overrides: Value) -> PolicyConfig {
         "windowMs": 86400000,
         "contribution": "fixed-weight",
         "fixedWeight": 800,
+        "governedMethods": ["tools/call"],
         "spendAmountField": "params.amount",
         "spendCurrency": "USD",
         "estimatedTokens": 500,

@@ -18,14 +18,26 @@ spec:
         name: aggregate-risk-gate-v1-0-impl # Generated implementation extension name
       config:
         budgetScope: agent
+        # The playground has no authentication policy in front of the gate, so
+        # it reads a trusted header. A production chain must strip and re-inject
+        # that header (see the README's identity section).
+        identitySource: trusted-header
+        identityField: client_id
         scopeHeader: x-agent-id
+        maxScopes: 10000
+        reservationTimeoutMs: 60000
+        scopeDisclosure: raw
+        scopeDigestKey: ""
         aggregateBudget: 3000
-        window: rolling-24h
+        window: fixed-period
+        windowMs: 86400000
         contribution: fixed-weight
         fixedWeight: 800
+        governedMethods:
+          - tools/call
         spendAmountField: params.amount
+        spendCurrency: USD
         estimatedTokens: 500
-        ledgerEndpoint: ""
         mode: block
         onDeny: rpc-error
         resultHeader: x-aggregate-risk-gate
