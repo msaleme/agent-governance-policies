@@ -2,7 +2,55 @@
 
 ## Unreleased
 
-Nothing yet.
+Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
+
+### Aggregate-Risk Gate
+
+- **Breaking: only governed methods are priced (#47).** The new `governedMethods` property
+  (default `["tools/call"]`) lists the JSON-RPC methods that are priced and reserved. Other
+  methods, notifications, client responses and bodyless requests (the SSE `GET`, the session
+  `DELETE`) pass through with no contribution and no ledger or scope entry, stamped
+  `pass;reason=ungoverned-method`. Under `spend-amount` in block mode, an MCP client can now
+  complete the handshake. An exhausted budget no longer blocks `initialize`, `ping`,
+  cancellation or teardown. Batches are priced on their governed items only. A duplicate
+  `method` member, or any duplicate member in a priced body, fails closed. Empty, blank,
+  duplicate and `"*"` entries are rejected at configure time.
+- **Settlement documented (#49, finding B).** Settlement is by HTTP status only: 2xx and 3xx
+  commit, 4xx and 5xx release. A JSON-RPC error or `isError` result inside an HTTP 200 is
+  charged. Tests pin the mapping.
+- **Per-worker budget disclosed up front (#48).** The `gcl.yaml` description and the top of the
+  README now say the budget is per gateway worker and a caller can multiply it by opening more
+  connections, with the divide-by-N and `FLEX_SERVICE_ENVOY_CONCURRENCY=1` mitigations beside
+  it. A node-wide ledger is deferred to v2.
+- **Charset and unparseable bodies fail closed.** A body is inspected only when its
+  `Content-Type` has no `charset` or `charset=utf-8`. Any other charset makes it
+  uninspectable, so a `tools/call` can't be hidden by an encoding the upstream decodes
+  differently, such as `utf-7`. A body the JSON parser rejects (nesting too deep, a lone
+  surrogate, a BOM) is now unpriceable instead of being charged as a single call.
+- Library tests: 157 (was 140). A new `#[pdk_test]` drives a real MCP handshake through Flex
+  under `spend-amount` in block mode.
+
+### Approval-to-Execution Binding
+
+- **Only POST is bound (#50).** In both modes, bodyless `GET`, `DELETE`, `OPTIONS` and `HEAD`
+  requests are forwarded untouched, stamped `out-of-scope`. A POST without a valid
+  `content-length` is still denied, now stamped `denied;framing=content-length`.
+- **P6 claim narrowed, nonce store capped (#51).** Every P6 description now says single use
+  holds per gateway replica, until restart. The nonce store has a fixed per-replica cap. At the
+  cap, nonces of approvals already expired under P4 are swept, and if the store is still full
+  the call is denied.
+- **Canonical form hardened (#52).** Integers outside ±(2^53−1), and objects whose keys sort
+  differently by UTF-8 bytes and UTF-16 code units, now fail closed. A maximum approval
+  lifetime and stripping the `rpc-param` envelope before it reaches upstream are documented as
+  not yet implemented.
+- **Charset and unparseable bodies fail closed.** A body with a `charset` other than
+  `utf-8` is treated as malformed (denied in block mode, flagged in monitor mode). Before,
+  `charset=utf-7` could carry a `tools/call` the policy read as an unknown method and
+  forwarded unchecked. Bodies the JSON parser rejects already failed closed; tests now pin it.
+- The P6 cap sweep runs only when the per-worker reservation count reaches the cap, so the
+  normal path makes the same single atomic store call as before. The cap is approximate and
+  the sweep's key listing is not yet verified on a real gateway.
+- Library tests: 67 (was 46).
 
 ## 0.1.0-rc.1 — 2026-10-03
 
