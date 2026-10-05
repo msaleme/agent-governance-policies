@@ -1394,8 +1394,8 @@ fn nonce_expiry(binding: &Binding, not_after: Option<&str>) -> i64 {
         .unwrap_or(NONCE_NEVER_EXPIRES)
 }
 
-/// A sweep that frees fewer slots than this is "low water" (#58): the worker
-/// keeps the earliest remaining expiry as `full_until`, so it doesn't run another
+/// A sweep that leaves less headroom below the cap than this is "low water"
+/// (#58): the worker keeps the earliest remaining expiry as `full_until`, so it doesn't run another
 /// full scan after only a handful of reservations. Small under `cfg(test)`.
 #[cfg(not(test))]
 const SWEEP_LOW_WATER: usize = MAX_RESERVED_NONCES / 10;
@@ -1411,8 +1411,8 @@ const UNREADABLE_RESCAN_BACKOFF_SECONDS: i64 = 60;
 struct NonceCap {
     /// Reservations this worker made since its last sweep.
     since_sweep: Cell<usize>,
-    /// Set when a sweep left the store full, or freed less than
-    /// `SWEEP_LOW_WATER`: the earliest expiry among the nonces this worker knows
+    /// Set when a sweep left the store full, or left less than
+    /// `SWEEP_LOW_WATER` of headroom: the earliest expiry among the nonces this worker knows
     /// of (lowered by its later reservations). Until `now` passes it a rescan
     /// would free nothing this worker knows of, so at the cap it is skipped and
     /// the reservation refused (#58). `i64::MIN` means "no known bound".
@@ -1447,13 +1447,15 @@ impl NonceCap {
 /// reset to the remaining count. If the store is still full the reservation is
 /// refused (fail closed), and the earliest kept expiry is remembered in
 /// `cap.full_until`: until `now` passes it, further reservations at the cap are
-/// refused in O(1) without rescanning. A sweep that frees space but less than
-/// `SWEEP_LOW_WATER` also keeps that bound, so the next time the count reaches
+/// refused in O(1) without rescanning. A sweep that leaves less than
+/// `SWEEP_LOW_WATER` of headroom below the cap also keeps that bound, so the next time the count reaches
 /// the cap it refuses rather than rescanning for a few slots. Each reservation
 /// lowers the bound to its own expiry if earlier. An undecodable kept nonce caps
 /// the bound at `now + UNREADABLE_RESCAN_BACKOFF_SECONDS`. Without P4 every
 /// nonce is stored as `NONCE_NEVER_EXPIRES`, so a full store is never
-/// rescanned. A storage error during the sweep is `Unavailable` (fail closed).
+/// rescanned. An error listing the store or deleting an expired nonce is
+/// `Unavailable` (fail closed); a listed key whose read fails is counted as kept
+/// (a host error reads as absent and is not counted, so the count can run low).
 ///
 /// The bound is approximate: the counter and `full_until` are per worker and
 /// reset when the VM is rebuilt, while the local store is shared, so between
@@ -1482,7 +1484,6 @@ async fn reserve_nonce<S: DataStorage>(
             .await
             .map_err(|_| ReserveRefusal::Unavailable)?;
         let mut remaining = 0usize;
-        let mut freed = 0usize;
         let mut earliest = NONCE_NEVER_EXPIRES;
         for key in &keys {
             match store.get::<i64>(key).await {
@@ -1491,7 +1492,6 @@ async fn reserve_nonce<S: DataStorage>(
                         .delete(key)
                         .await
                         .map_err(|_| ReserveRefusal::Unavailable)?;
-                    freed += 1;
                 }
                 // Absent: removed concurrently, nothing to count.
                 Ok(None) => {}
@@ -1513,11 +1513,14 @@ async fn reserve_nonce<S: DataStorage>(
             cap.full_until.set(earliest);
             return Err(ReserveRefusal::AtCapacity);
         }
-        cap.full_until.set(if freed < SWEEP_LOW_WATER {
-            earliest
-        } else {
-            i64::MIN
-        });
+        // Keyed on headroom rather than on how many were freed: other
+        // workers' writes and deletes make the two differ.
+        cap.full_until
+            .set(if MAX_RESERVED_NONCES - remaining < SWEEP_LOW_WATER {
+                earliest
+            } else {
+                i64::MIN
+            });
     }
     match store.store(nonce, &StoreMode::Absent, &expiry).await {
         Ok(()) => {

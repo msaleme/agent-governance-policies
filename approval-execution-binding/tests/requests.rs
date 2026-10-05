@@ -25,8 +25,9 @@
 // (separate-attester mcp-v1 MAC over the versioned payload) requires a verified
 // AuthenticationData subject from an upstream identity policy, and P6 (atomic
 // single-use) requires gateway data storage; both are exercised by the in-
-// process unit tests, and their FULL end-to-end validation on a real Flex
-// container is handed off to Astra — see `docs/ASTRA-TASK-approval-p6-replay.md`.
+// process unit tests. A separate connected-gateway run of P6's same-replica
+// replay rejection is recorded (with its limits) in the policy README; it is
+// not part of this suite.
 //
 // Running this suite requires Docker, a working `pdk-test` runtime image pull
 // and a Flex registration, so it is not part of the `cargo test --lib` gate or

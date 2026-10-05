@@ -397,7 +397,7 @@ Further honest limitations, disclosed rather than hidden:
   reservation **fails closed** (a P6 denial), and the worker remembers the earliest expiry among the
   nonces it kept: until that instant passes, nothing can be swept, so further reservations at the cap
   are refused in O(1) without listing the store again (#58). Two refinements keep a nearly full store
-  from being rescanned on every request: if a sweep frees fewer than **a tenth of the cap** (1,000), the
+  from being rescanned on every request: if a sweep leaves less than **a tenth of the cap** (1,000) free, the
   worker keeps the earliest remaining expiry as its bound and refuses at the cap again until then
   (low-water hysteresis); and a kept entry whose value can't be read has an unknown expiry, so it
   bounds the next rescan to **60 seconds** later rather than never. A worker's own successful
@@ -406,7 +406,9 @@ Further honest limitations, disclosed rather than hidden:
   (1) **the bound is approximate** — the count and the remembered expiry are per worker and reset
   when the worker's VM is rebuilt, while the store is shared by the replica's workers, so between
   sweeps the store can exceed 10,000 by up to 10,000 per worker, and a worker can keep refusing at the
-  cap until its remembered expiry even if another worker's sweep has freed space in the meantime;
+  cap until its remembered expiry even if another worker's sweep has freed space in the meantime
+  (and since PDK reads a host error as "absent", a listed key whose read fails is not counted, so the
+  count can run low);
   (2) **the sweep's key listing (`get_keys`) is not yet verified on a real gateway** — it runs only at
   the cap, and if it errors there, P6 reservations at the cap fail closed; (3) **without P4 in
   `requiredPredicates`, no reserved nonce ever expires**, so once a sweep finds the store full a
@@ -458,7 +460,7 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **115 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **116 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
@@ -487,7 +489,7 @@ required fails closed), **atomic single-use via data storage** (first allow, rep
 monitor mode does not reserve; below the cap a reservation never lists keys, at the cap a sweep
 deletes P4-expired nonces and a still-full store fails closed, a replay at the cap is denied as a
 replay without a scan, repeated at-capacity refusals don't rescan before the earliest kept expiry,
-a rescan frees space once it passes, a sweep below the low-water mark keeps its bound, a worker's own
+a rescan frees space once it passes, a sweep that leaves less than the low-water mark of headroom keeps its bound (even when it freed more), a worker's own
 sooner-expiring nonce lowers it, an unreadable kept entry bounds the rescan to the 60-second backoff,
 a `get` decode error on the nonce fails closed, a reservation racing in between `get` and `store`
 is a replay, and without P4 a full store is never rescanned — exercised with the cap set to 3 and the

@@ -1578,7 +1578,7 @@ fn sweep_runs_only_at_the_cap_and_reclaims_expired_nonces() {
     assert_eq!(
         cap.full_until.get(),
         i64::MIN,
-        "a sweep that frees at least the low-water mark clears the bound"
+        "a sweep that leaves at least the low-water mark of headroom clears the bound"
     );
 }
 
@@ -1716,8 +1716,8 @@ fn rescan_frees_space_once_the_earliest_expiry_passes() {
     assert_eq!(
         cap.full_until.get(),
         now + 300,
-        "a sweep that frees less than the low-water mark keeps the earliest \
-         remaining expiry as the rescan bound"
+        "a sweep that leaves less than the low-water mark of headroom keeps the \
+         earliest remaining expiry as the rescan bound"
     );
 }
 
@@ -1741,8 +1741,33 @@ fn sweep_below_low_water_refuses_at_the_next_cap_without_a_rescan() {
     assert_eq!(
         store.get_keys_calls.get(),
         1,
-        "low-water hysteresis: no rescan after a sweep that freed one slot"
+        "low-water hysteresis: no rescan after a sweep that left one slot"
     );
+}
+
+#[test]
+fn low_water_is_keyed_on_headroom_not_on_slots_freed() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    let now = chrono::Utc::now().timestamp();
+    // Other workers overfilled the store with expired nonces: the sweep frees
+    // three (at least the low-water mark) but leaves only one slot of headroom.
+    fill_to_cap(&store, &cap, now + 600);
+    {
+        let mut items = store.items.borrow_mut();
+        items.insert("n-0".to_string(), json!(now - 10));
+        items.insert("other-1".to_string(), json!(now - 10));
+        items.insert("other-2".to_string(), json!(now - 10));
+    }
+    assert_eq!(reserve(&store, &cap, "a", now + 600), "ok");
+    assert_eq!(store.get_keys_calls.get(), 1);
+    assert_eq!(
+        cap.full_until.get(),
+        now + 600,
+        "little headroom keeps the bound even though many slots were freed"
+    );
+    assert_eq!(reserve(&store, &cap, "b", now + 600), "at-capacity");
+    assert_eq!(store.get_keys_calls.get(), 1, "no rescan for one slot");
 }
 
 #[test]

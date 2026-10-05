@@ -91,7 +91,7 @@ spec:
         replica for flows that need P6, and require P4 with P6 (reserved nonces
         have an approximate per-worker cap of 10,000; at the cap only P4-expired
         ones are reclaimed, and a full store fails closed; the sweep's key listing
-        is not yet verified on a real gateway). P6 is a profile choice, not a universal rule —
+        and the replay pre-check are not yet verified on a real gateway). P6 is a profile choice, not a universal rule —
         reusable approvals are legitimate in some flows — so it defaults out of the
         required set; opt in only when the customer's flow is single-use. An
         empty list is rejected at startup: a binding that requires nothing is

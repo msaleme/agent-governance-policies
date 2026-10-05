@@ -35,8 +35,8 @@
   "absent", so the `get` can only fail closed on a value that doesn't decode; a host error there
   falls through to `store`. When a sweep leaves the store full, the worker remembers the earliest
   kept expiry and refuses further reservations at the cap in O(1) until that instant passes,
-  instead of listing and reading the whole store on every request. A sweep that frees fewer than a
-  tenth of the cap keeps that bound too (low-water hysteresis), a kept entry that can't be decoded
+  instead of listing and reading the whole store on every request. A sweep that leaves less than a
+  tenth of the cap free keeps that bound too (low-water hysteresis), a kept entry that can't be decoded
   bounds the next rescan to 60 seconds rather than never, and a worker's own sooner-expiring
   reservation lowers the bound. Without P4, a full store is never rescanned.
 
