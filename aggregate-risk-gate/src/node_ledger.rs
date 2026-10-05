@@ -121,8 +121,8 @@
 #[cfg(test)]
 use crate::ledger::Snapshot;
 use crate::ledger::{
-    count_reclaim, count_settlement, period, settle_free, LedgerStats, LedgerStore, Refusal,
-    Reservation, ReservationId, ScopeState, Settlement,
+    count_reclaim, count_settlement, expired_on_arrival, period, settle_free, LedgerStats,
+    LedgerStore, Refusal, Reservation, ReservationId, ScopeState, Settlement,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -190,9 +190,10 @@ pub trait KvStore {
     fn delete(&self, key: &str) -> Result<(), StoreError>;
     fn keys(&self) -> Result<Vec<String>, StoreError>;
     /// The current time in epoch milliseconds, read at the moment of the
-    /// call. The tombstone protocol uses it instead of the request's `now`,
-    /// which may be older (it is read before the body is buffered). `0`
-    /// means "no clock" and leaves the caller's `now` in force.
+    /// call: the gateway clock, re-read at reserve time. The tombstone
+    /// protocol uses it instead of the request's `now`, which may be older,
+    /// and no reservation is made that it shows already past its deadline
+    /// (#56). `0` means "no clock" and leaves the caller's `now` in force.
     fn now(&self) -> u64 {
         0
     }
@@ -972,6 +973,14 @@ impl NodeLedger {
         Settlement::Deferred
     }
 
+    /// Refuses a reservation that would already be past its deadline.
+    fn check_fresh(&self, now: u64) -> Result<(), Refusal> {
+        if expired_on_arrival(now, self.ttl, self.store.now()) {
+            return Err(Refusal::Stale);
+        }
+        Ok(())
+    }
+
     /// How many commits are queued on this worker.
     #[cfg(test)]
     pub fn pending(&self) -> usize {
@@ -987,6 +996,7 @@ impl LedgerStore for NodeLedger {
         budget: u64,
         now: u64,
     ) -> Result<Reservation, Refusal> {
+        self.check_fresh(now)?;
         let id = self.next_id();
         let reservation = self.mutate(scope, now, |state| {
             state.check(scope, contribution, budget)?;
@@ -1015,6 +1025,7 @@ impl LedgerStore for NodeLedger {
         budget: u64,
         now: u64,
     ) -> Result<(Reservation, bool), Refusal> {
+        self.check_fresh(now)?;
         let id = self.next_id();
         let reservation = self.mutate(scope, now, |state| {
             state.hold(id, scope, contribution, now, self.ttl)
@@ -2081,5 +2092,34 @@ mod test {
         // The ledger never writes an empty host value: even an empty `Vec`
         // encodes to its 8-byte length prefix.
         assert_eq!(serde_fixint::to_vec(&Vec::<u8>::new()).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn a_reservation_already_past_its_deadline_is_never_created() {
+        // #56: a call whose `now` lags the gateway clock (the store's) by a
+        // full timeout is refused on every reserving path, and nothing is
+        // written.
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let b = worker(&store, 2);
+        store.set_now(10 * TTL);
+        let stale = 10 * TTL - TTL;
+        assert_eq!(a.reserve("s", 1, 1, stale), Err(Refusal::Stale));
+        assert_eq!(a.force_reserve("s", 1, stale), Err(Refusal::Stale));
+        assert_eq!(
+            a.force_reserve_checked("s", 1, 1, stale),
+            Err(Refusal::Stale)
+        );
+        assert!(store.get(&a.key("s")).unwrap().is_none(), "nothing written");
+        assert_eq!(a.stats().active, 0);
+        // One millisecond fresher and the deadline is still ahead.
+        let r = a.reserve("s", 1, 1, stale + 1).unwrap();
+        assert_eq!(r.expires_at, 10 * TTL + 1);
+        assert!(matches!(
+            b.reserve("s", 1, 1, 10 * TTL),
+            Err(Refusal::OverBudget(_))
+        ));
+        assert_eq!(a.commit(&r, 10 * TTL), Settlement::Committed);
+        assert_eq!(b.snapshot("s").committed, 1);
     }
 }

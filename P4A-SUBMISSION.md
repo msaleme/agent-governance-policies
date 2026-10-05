@@ -24,7 +24,7 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 97 pass | 205 pass |
+| Lib tests | 97 pass | 209 pass |
 | Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 items 1–3 (canonical form, maximum approval lifetime, `rpc-param` envelope removal) fixed; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 fixed (node-wide ledger, the new default `ledgerBackend: node`) and #49 A fixed (a refusal at the scope cap is O(1)) |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 

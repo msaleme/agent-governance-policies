@@ -16,10 +16,11 @@
 //! body and has no streaming-exclusion surface. Those tests were removed
 //! rather than left as dead, misleading code.
 //!
-//! What replaces them: three tests that adapt the harness to this policy's own
+//! What replaces them: four tests that adapt the harness to this policy's own
 //! headline scenarios — sequential composition against the aggregate budget,
-//! independent per-agent budgets, and an MCP session handshake where only the
-//! governed `tools/call` is budgeted — run through a real Flex Gateway
+//! independent per-agent budgets, an MCP session handshake where only the
+//! governed `tools/call` is budgeted, and a slow upload that cannot expire its
+//! own reservation (#56, over a raw socket) — run through a real Flex Gateway
 //! container rather than the in-process `pdk-unit` harness used by
 //! `src/lib.rs`'s unit tests. They are not part of the enforced gate and were
 //! not run in this environment (no Docker invocation was performed); anyone
@@ -371,5 +372,114 @@ async fn an_mcp_handshake_passes_and_only_tools_call_is_budgeted_through_a_real_
     }
     // Neither refused tools/call reached the upstream.
     upstream.assert_hits_async(4).await;
+    Ok(())
+}
+
+/// #56: a client that uploads slowly cannot shorten its own reservation.
+/// Over a raw socket, the first call sends its headers and all but the last
+/// body byte, holds the last byte for longer than twice
+/// `reservationTimeoutMs`, then sends it. The upstream answers after
+/// `UPSTREAM_MS`, and a second call reaches the same scope while the first is
+/// still upstream. The reservation's timeout runs from when the body was fully
+/// received, so it is live then: the second call is refused, the first
+/// settles committed, and the upstream is hit once. Timed from the headers,
+/// the reservation (and its tombstone) would already be gone, the second call
+/// would be admitted, and the first would settle not-active, never charged.
+#[pdk_test]
+async fn a_slow_upload_cannot_expire_its_own_reservation_through_a_real_gateway(
+) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+
+    const TIMEOUT_MS: u64 = 2000;
+    const HOLD_MS: u64 = 2 * TIMEOUT_MS + 500;
+    const UPSTREAM_MS: u64 = 1000;
+    let (_composite, flex_url, httpmock) = start_gateway(serde_json::json!({
+        "reservationTimeoutMs": TIMEOUT_MS,
+        "aggregateBudget": 1,
+        "fixedWeight": 1,
+        "window": "worker-lifetime"
+    }))
+    .await?;
+    let mock_server = httpmock::MockServer::connect_async(httpmock.socket()).await;
+    let upstream = mock_server
+        .mock_async(|when, then| {
+            when.any_request();
+            then.status(200)
+                .header("content-type", "application/json")
+                .delay(std::time::Duration::from_millis(UPSTREAM_MS))
+                .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        })
+        .await;
+
+    let url = reqwest::Url::parse(&flex_url)?;
+    let address = format!(
+        "{}:{}",
+        url.host_str().unwrap_or("localhost"),
+        url.port_or_known_default().unwrap_or(80)
+    );
+    let body = call(1);
+    let (head, last) = body.split_at(body.len() - 1);
+    let mut socket = std::net::TcpStream::connect(&address)?;
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(15)))?;
+    write!(
+        socket,
+        "POST {} HTTP/1.1\r\nhost: {}\r\ncontent-type: application/json\r\n\
+         x-agent-id: broker-7\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        url.path(),
+        address,
+        body.len(),
+        head
+    )?;
+    socket.flush()?;
+    tokio::time::sleep(std::time::Duration::from_millis(HOLD_MS)).await;
+    socket.write_all(last.as_bytes())?;
+    socket.flush()?;
+
+    // While the first call is upstream, a second call reaches the scope. The
+    // first call's reservation is live, so the budget is held.
+    tokio::time::sleep(std::time::Duration::from_millis(UPSTREAM_MS / 2)).await;
+    let second = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .post(&flex_url)
+        .header("content-type", "application/json")
+        .header("x-agent-id", "broker-7")
+        .body(call(2))
+        .send()
+        .await?;
+    assert_eq!(second.status(), 200, "rpc-error denial envelope");
+    let second: serde_json::Value = serde_json::from_str(&second.text().await?)?;
+    assert_eq!(second["id"], 2);
+    assert_eq!(
+        second["error"]["code"], -32008,
+        "the second call must be DENIED while the slow call holds the budget"
+    );
+
+    let mut response = String::new();
+    socket.read_to_string(&mut response)?;
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "the slow call must be answered: {}",
+        response.lines().next().unwrap_or_default()
+    );
+    let stamp = response
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("x-aggregate-risk-gate")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    assert!(
+        stamp.starts_with("allowed;"),
+        "the slow call must be admitted, got {}",
+        stamp
+    );
+    assert!(
+        stamp.ends_with(";settlement=committed"),
+        "the slow call must be charged, got {}",
+        stamp
+    );
+    upstream.assert_hits_async(1).await;
     Ok(())
 }
