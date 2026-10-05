@@ -38,8 +38,11 @@ JSON-RPC method (`tools/list`, `initialize`, `ping`, notifications, anything unr
 **out of scope**: it is forwarded upstream untouched, with the result header stamped `out-of-scope`
 in both monitor and block mode. The policy never blocks an identified non-`tools/call` method. The
 same holds for a well-formed JSON-RPC **response** a client POSTs back to a server-initiated request
-(`roots/list`, `sampling/createMessage`, `elicitation/create` replies, #57): it executes nothing, so
-it is forwarded untouched and stamped `out-of-scope` (logged with `"kind":"response"`). Well-formed
+(`roots/list`, `sampling/createMessage`, `elicitation/create` replies, #57): it is not a tool call,
+so by default (`clientResponses: forward`) it is forwarded untouched and stamped `out-of-scope`
+(logged with `"kind":"response"`). It is still input to the in-flight server request it answers,
+and the approval does **not** bind it — see the inspection boundary below, and set
+`clientResponses: deny` to refuse such responses as malformed instead. Well-formed
 means `"jsonrpc":"2.0"`, a string or number `id` (`null` only on an error response), exactly one of
 `result` or `error`, no `method`, no other top-level member, and an `error` that is an object with an
 integer `code` and a string `message`. An ambiguous or malformed response — both `result` and
@@ -135,6 +138,20 @@ otherwise-plausible batch can never slip through as one of several forwarded cal
 batch of client responses: the #57 response pass-through applies to a single response object only,
 and batch handling is unchanged.
 
+**Client responses are not bound (#57).** A well-formed JSON-RPC response a client POSTs back —
+its reply to a server-initiated `roots/list`, `sampling/createMessage` or `elicitation/create` — is
+not a tool invocation, but it is an **input to an in-flight server request**: an elicitation answer
+can, for example, pick the target environment or confirm a step of a tool call that was approved
+earlier. The approval binds the `tools/call` itself (action, arguments, freshness, attester, single
+use); it does **not** bind the content of responses the client supplies while that call runs. With
+`clientResponses: forward` (the default) such responses pass through `out-of-scope`, in both modes,
+so MCP clients that answer server requests keep working. With `clientResponses: deny` they are
+treated as malformed, as before #57 (`block` denies with an empty `403` stamped
+`denied;predicate=malformed`; `monitor` forwards stamped `monitor;predicate=malformed`) — choose it
+when approvals must also cover elicitation and sampling input, at the cost of breaking those MCP
+features behind this policy. An ambiguous or malformed response, and any batch, fails closed under
+either setting.
+
 **What this policy reads — and nothing else.** Inspection is limited to: the approval envelope
 (from `approvalHeader` or, for `approvalSource: rpc-param`, the `approvalRpcField` sibling member of
 the JSON-RPC body), the executor identity header (`executorHeader`), and the JSON-RPC body itself
@@ -163,13 +180,14 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 |---|---|---|---|
 | `approvalSource` | `header`\|`rpc-param`\|`sidecar` | `header` | Where the approval envelope rides. `sidecar` is rejected at startup (not implemented). |
 | `approvalHeader` | string | `x-approval` | Header carrying the JSON-encoded envelope when `approvalSource: header`. |
-| `approvalRpcField` | string | `approvalBinding` | Top-level JSON-RPC body member carrying the envelope when `approvalSource: rpc-param`. |
+| `approvalRpcField` | string | `approvalBinding` | Top-level JSON-RPC body member carrying the envelope when `approvalSource: rpc-param`. A JSON-RPC member name (`jsonrpc`, `id`, `method`, `params`, `result`, `error`) is rejected at startup. |
 | `executorHeader` | string | `client_id` | **Fallback** header naming the executor. The executor identity is taken FIRST from the **verified** authentication data (`client_id`, then `principal`) established by an upstream authentication policy; this header is used only when no verified subject is present, and when P5 is required and no verified subject exists the call **fails closed** rather than trusting the header. Used only for P5. |
 | `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. (There is no P3.) |
 | `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
 | `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. `0`–`3600`; anything else is rejected at startup (**breaking**: a negative value used to be treated as `0`, and there was no upper limit). |
 | `maxApprovalLifetimeSeconds` | integer | `0` (off) | Upper bound on an approval's **remaining** lifetime, checked under P4 against the gateway clock: an approval with `not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds` is denied `predicate=P4`. `1`–`31536000` when set; anything else, or setting it without P4 in `requiredPredicates`, is rejected at startup. See [Approval lifetime bound](#approval-lifetime-bound). |
 | `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new length. Ignored for `approvalSource: header`. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
+| `clientResponses` | `forward`\|`deny` | `forward` | How a well-formed JSON-RPC **response** POSTed by the client (a `roots/list`, sampling or elicitation reply) is handled. `forward`: passed through untouched, stamped `out-of-scope`, in both modes. `deny`: treated as malformed (pre-#57 behaviour). Either way the approval does not bind response content — see [Inspection boundary](#inspection-boundary). Any other value is rejected at startup. |
 | `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
 | `expectedTenant` | string | `""` | The tenant this gateway serves, bound as `tenant`. **Required (non-empty) whenever P5 is required.** |
 | `expectedEnvironment` | string | `""` | The environment this gateway serves, bound as `env`. **Required (non-empty) whenever P5 is required.** |
@@ -363,18 +381,28 @@ Further honest limitations, disclosed rather than hidden:
   namespaced by issuer — it is not in this build (#51).
 - **Reserved P6 nonces are bounded by an approximate cap, not a TTL (#51).** `local()` has no TTL,
   so the policy bounds the store itself. Each reservation records the nonce's expiry, and the normal
-  path is a `get` of the nonce key followed by a single atomic `store(nonce, Absent, …)` — the same
-  operation the P6 path was proven on. The `get` denies an already-reserved nonce as a replay in O(1),
-  before any capacity check, so a replay at the cap is reported as a replay and costs no scan (#58);
-  `store(…, Absent)` remains the authoritative single-use check, so a concurrent reservation still
-  loses as a replay. Each worker counts its reservations; when its count reaches **10,000**, it lists
+  path is a `get` of the nonce key followed by a single atomic `store(nonce, Absent, …)`. Only the
+  `store(…, Absent)` step is what the connected P6 run exercised on a real gateway; the `get`
+  pre-check was added afterwards and is covered by unit tests only, not yet by a real-gateway run.
+  The `get` denies an already-reserved nonce as a replay in O(1), before any capacity check, so a
+  replay at the cap is reported as a replay and costs no scan (#58). It is an optimisation, not the
+  guarantee: `store(…, Absent)` remains the authoritative single-use check, so a reservation that
+  lands between the `get` and the `store` still loses as a replay. PDK 1.10's local `get` maps a host
+  storage error to "absent" rather than an error, so the only `get` failure this policy can see is a
+  value that fails to decode; that is refused (fail closed), and a host error on `get` falls through
+  to the authoritative `store`. Each worker counts its reservations; when its count reaches **10,000**, it lists
   the store, deletes every nonce whose approval has expired under P4 (`now > not_after +
   clockSkewSeconds`), and resets its count to what remains. Forgetting such a nonce cannot reopen a
   replay, because replaying it is still a P4 denial. If the store is still full after that sweep, the
   reservation **fails closed** (a P6 denial), and the worker remembers the earliest expiry among the
   nonces it kept: until that instant passes, nothing can be swept, so further reservations at the cap
-  are refused in O(1) without listing the store again (#58). A storage error during the replay check
-  or the sweep also fails closed. Plan for these limits:
+  are refused in O(1) without listing the store again (#58). Two refinements keep a nearly full store
+  from being rescanned on every request: if a sweep frees fewer than **a tenth of the cap** (1,000), the
+  worker keeps the earliest remaining expiry as its bound and refuses at the cap again until then
+  (low-water hysteresis); and a kept entry whose value can't be read has an unknown expiry, so it
+  bounds the next rescan to **60 seconds** later rather than never. A worker's own successful
+  reservation also lowers the bound to that nonce's expiry if it is sooner. An error listing the store,
+  deleting an expired entry, or storing the nonce fails closed. Plan for these limits:
   (1) **the bound is approximate** — the count and the remembered expiry are per worker and reset
   when the worker's VM is rebuilt, while the store is shared by the replica's workers, so between
   sweeps the store can exceed 10,000 by up to 10,000 per worker, and a worker can keep refusing at the
@@ -430,17 +458,19 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **105 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **115 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
-rejection**, **`expectedAudience` required when P5 is required**), malformed/oversized/batch/
+rejection**, **`expectedAudience` required when P5 is required**, unknown `clientResponses`
+values, and every JSON-RPC member name as `approvalRpcField`), malformed/oversized/batch/
 notification JSON-RPC framing, monitor-vs-block behavior, the rpc-param approval source, **non-
 `tools/call` methods forwarded as out-of-scope** (never blocked), **client JSON-RPC responses
 forwarded untouched as out-of-scope in block and monitor mode** (success with string and numeric
 `id`, error with `null` `id`) while ambiguous or malformed responses (both or neither of
 `result`/`error`, a `method` alongside either, duplicate members, a bad `id` or `error` shape, an
-extra member) and a batch of responses fail closed, **bodyless `GET` (SSE)/`DELETE`
+extra member) and a batch of responses fail closed, and **`clientResponses: deny`** refusing them
+(empty `403` in block, flagged and forwarded in monitor), **bodyless `GET` (SSE)/`DELETE`
 (session)/`OPTIONS`/`HEAD` forwarded out-of-scope in block and monitor mode** while a bodyless or
 lowercase `post` and a non-`POST` carrying a `tools/call` body stay bound, **framing refusals**
 (no/short/oversized `content-length` stamped `denied;framing=content-length`), **charset
@@ -457,8 +487,11 @@ required fails closed), **atomic single-use via data storage** (first allow, rep
 monitor mode does not reserve; below the cap a reservation never lists keys, at the cap a sweep
 deletes P4-expired nonces and a still-full store fails closed, a replay at the cap is denied as a
 replay without a scan, repeated at-capacity refusals don't rescan before the earliest kept expiry,
-a rescan frees space once it passes, and without P4 a full store is never rescanned — exercised with
-the cap set to 3 under `cfg(test)`), **the approval lifetime bound** (allowed exactly at `now +
+a rescan frees space once it passes, a sweep below the low-water mark keeps its bound, a worker's own
+sooner-expiring nonce lowers it, an unreadable kept entry bounds the rescan to the 60-second backoff,
+a `get` decode error on the nonce fails closed, a reservation racing in between `get` and `store`
+is a replay, and without P4 a full store is never rescanned — exercised with the cap set to 3 and the
+low-water mark to 2 under `cfg(test)`), **the approval lifetime bound** (allowed exactly at `now +
 maxApprovalLifetimeSeconds + clockSkewSeconds`, denied one second or one millisecond past it, off
 when unset, never relaxes expiry; range and requires-P4 validated at startup), **rpc-param envelope
 removal** (first, middle, last and only member; whitespace and escapes kept byte-exact; an escaped
@@ -479,7 +512,8 @@ action-mismatch-denied-and-never-reaches-upstream, and the #50 transport pass-th
 `DELETE` session reach upstream stamped `out-of-scope` while an unapproved `tools/call` is denied,
 the #52 rpc-param envelope removal, and the #57 client responses: a `roots/list` result and an
 elicitation error reply reach upstream byte-for-byte stamped `out-of-scope`, while an ambiguous
-response is denied as malformed) — deliberately smaller than Tripwire's
+response is denied as malformed; it POSTs canned response bodies, not a real MCP SDK
+`roots/list` round trip with a server-initiated request) — deliberately smaller than Tripwire's
 integration suite, since this policy's threat model ("is this record proof of this execution") is
 already covered exhaustively by the unit tests; it adds only what an in-process harness cannot
 exercise. Behaviour that needs a connected gateway was checked on a real Flex Gateway: P5 with

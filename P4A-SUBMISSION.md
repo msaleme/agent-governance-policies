@@ -24,7 +24,7 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 105 pass | 205 pass |
+| Lib tests | 115 pass | 205 pass |
 | Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 items 1–3 (canonical form, maximum approval lifetime, `rpc-param` envelope removal) fixed; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 fixed (node-wide ledger, the new default `ledgerBackend: node`) and #49 A fixed (a refusal at the scope cap is O(1)) |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
@@ -38,7 +38,7 @@ excludes all Flex identity material). No further visibility action is required t
 
 ### 1. Approval-to-Execution Binding
 - **Project path:** `/approval-execution-binding` (point the wizard at `/tree/main/approval-execution-binding`)
-- **Category / injection point / scope:** Security / inbound / `api,resource`; `metadata/capabilities/assetTypes: mcp` → applicability **MCP `tools/call` only**. All other JSON-RPC methods, and bodyless non-POST transport requests (the SSE `GET`, the session `DELETE`), pass through untouched as out-of-scope (#50).
+- **Category / injection point / scope:** Security / inbound / `api,resource`; `metadata/capabilities/assetTypes: mcp` → applicability **MCP `tools/call` only**. All other JSON-RPC methods, well-formed client JSON-RPC responses (`roots/list`, sampling and elicitation replies; #57, with `clientResponses: forward`, the default — these are not bound by the approval, and `clientResponses: deny` refuses them), and bodyless non-POST transport requests (the SSE `GET`, the session `DELETE`), pass through untouched as out-of-scope (#50).
 - **Catalog copy:** use `definition/gcl.yaml` `metadata.labels.description` verbatim (publish-ready;
   P4A catalog copy is **frozen at submission time**, so get it right up front — the description is now
   ≤256 chars). One-line hook for the listing summary: *"Proves the executed MCP `tools/call` is the
@@ -46,7 +46,7 @@ excludes all Flex identity material). No further visibility action is required t
 - **Config surface:** approvalSource(header|rpc-param) / approvalHeader / approvalRpcField /
   executorHeader / requiredPredicates(P1,P2,P4,P5; P6 opt-in, single use **per gateway replica, until restart** — **no P3**) / attesterKeys(key ≥32 bytes) /
   clockSkewSeconds (0–3600) / maxApprovalLifetimeSeconds (optional, 0 = off; needs P4) /
-  stripApprovalEnvelope (rpc-param only, default true) / expectedAudience / expectedTenant /
+  stripApprovalEnvelope (rpc-param only, default true) / clientResponses (forward|deny, default forward) / expectedAudience / expectedTenant /
   expectedEnvironment (all required when P5 is required) / mode(block|monitor) /
   onDeny(rpc-error -32008|empty-403) / resultHeader.
 - **Reviewer findings #1–#7 (Tommaso Bolis) — resolution:**
