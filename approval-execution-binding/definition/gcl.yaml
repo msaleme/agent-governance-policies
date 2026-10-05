@@ -52,7 +52,8 @@ spec:
       description: >-
         Top-level JSON-RPC request-body member carrying the approval envelope
         (same shape as approvalHeader's value) when approvalSource=rpc-param.
-        Chosen to avoid colliding with jsonrpc/id/method/params. Removed from the
+        Must not be a JSON-RPC member name (jsonrpc, id, method, params, result,
+        error); such a value is rejected at startup. Removed from the
         forwarded body unless stripApprovalEnvelope is false.
     executorHeader:
       type: string
@@ -159,6 +160,24 @@ spec:
         of the body is not re-serialized) and content-length is set to the new
         length. Ignored when approvalSource=header. Set false only if the
         upstream must see the envelope.
+    clientResponses:
+      type: string
+      default: forward
+      enum:
+        - forward
+        - deny
+      description: >-
+        How a well-formed JSON-RPC response POSTed by the client (its reply to a
+        server-initiated roots/list, sampling/createMessage or elicitation/create
+        request) is handled. Such a response is not a tool call, but it is input
+        to an in-flight server request (an elicitation answer can choose, say,
+        the target environment of an approved call), and the approval does NOT
+        bind it. "forward" passes it through untouched, stamped out-of-scope, in
+        both modes, so MCP clients that answer server requests keep working.
+        "deny" treats it as malformed, as before this option existed (denied in
+        block mode, flagged and forwarded in monitor mode); choose it when
+        approvals must also cover elicitation and sampling input. An ambiguous
+        or malformed response, and any batch, fails closed either way.
     expectedAudience:
       type: string
       default: ""

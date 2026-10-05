@@ -16,6 +16,8 @@ pub struct Config {
     pub approval_source: String,
     #[serde(alias = "attesterKeys")]
     pub attester_keys: Vec<AttesterKeys0Config>,
+    #[serde(alias = "clientResponses")]
+    pub client_responses: Option<String>,
     #[serde(alias = "clockSkewSeconds")]
     pub clock_skew_seconds: i64,
     #[serde(alias = "executorHeader")]

@@ -717,6 +717,62 @@ fn client_jsonrpc_responses_are_out_of_scope_in_monitor_mode() {
 }
 
 #[test]
+fn client_responses_forward_is_explicit_and_matches_the_default() {
+    for config in [
+        config_with(json!({"clientResponses": "forward"})),
+        config_with(json!({"mode": "monitor", "clientResponses": "forward"})),
+    ] {
+        let (backend, mut tester) = harness!(config);
+        for (label, body) in wellformed_client_responses() {
+            tester.request(typed_request("application/json", &json!({}), &body));
+            let forwarded = backend.next().expect(label);
+            assert_eq!(
+                forwarded.header("x-approval-binding"),
+                Some("out-of-scope"),
+                "{}",
+                label
+            );
+            assert_eq!(forwarded.body(), body.as_bytes(), "{}", label);
+        }
+    }
+}
+
+#[test]
+fn client_responses_deny_refuses_them_in_block_mode() {
+    let (backend, mut tester) = harness!(config_with(json!({"clientResponses": "deny"})));
+    for (label, body) in wellformed_client_responses() {
+        let response = tester.request(typed_request("application/json", &json!({}), &body));
+        assert_eq!(response.status_code(), 403, "{}", label);
+        assert_eq!(
+            response.header("x-approval-binding"),
+            Some("denied;predicate=malformed"),
+            "{}",
+            label
+        );
+        assert!(response.body().is_empty(), "{} gets an empty 403", label);
+        assert!(backend.next().is_none(), "{} is not forwarded", label);
+    }
+}
+
+#[test]
+fn client_responses_deny_flags_them_in_monitor_mode() {
+    let (backend, mut tester) = harness!(config_with(
+        json!({"mode": "monitor", "clientResponses": "deny"})
+    ));
+    for (label, body) in wellformed_client_responses() {
+        tester.request(typed_request("application/json", &json!({}), &body));
+        let forwarded = backend.next().expect(label);
+        assert_eq!(
+            forwarded.header("x-approval-binding"),
+            Some("monitor;predicate=malformed"),
+            "{}",
+            label
+        );
+        assert_eq!(forwarded.body(), body.as_bytes(), "{}", label);
+    }
+}
+
+#[test]
 fn ambiguous_or_malformed_jsonrpc_responses_fail_closed() {
     let (backend, mut tester) = harness!(block_config());
     let cases = [
@@ -1385,11 +1441,16 @@ fn bodies_serde_cannot_parse_fail_closed_not_out_of_scope() {
 
 /// In-memory `DataStorage` that counts `get_keys` calls, so the tests can
 /// assert the normal P6 path never lists the store (only the sweep does).
+/// `unreadable` keys fail `get` with a decode error (the only `get` error
+/// PDK's local storage surfaces); `hidden` keys read as absent while still
+/// stored, modelling a reservation that lands between `get` and `store`.
 #[derive(Default)]
 struct CountingStore {
     items: std::cell::RefCell<BTreeMap<String, Value>>,
     get_keys_calls: Cell<usize>,
     fail_get_keys: bool,
+    unreadable: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    hidden: std::cell::RefCell<std::collections::BTreeSet<String>>,
 }
 
 impl DataStorage for CountingStore {
@@ -1419,6 +1480,14 @@ impl DataStorage for CountingStore {
         &self,
         key: &str,
     ) -> Result<Option<(T, String)>, DataStorageError> {
+        if self.unreadable.borrow().contains(key) {
+            return Err(DataStorageError::Unexpected(
+                "undecodable value".to_string(),
+            ));
+        }
+        if self.hidden.borrow().contains(key) {
+            return Ok(None);
+        }
         Ok(self.items.borrow().get(key).map(|value| {
             (
                 serde_json::from_value(value.clone()).unwrap(),
@@ -1505,6 +1574,11 @@ fn sweep_runs_only_at_the_cap_and_reclaims_expired_nonces() {
         cap.since_sweep.get(),
         2,
         "the counter restarts from what remains"
+    );
+    assert_eq!(
+        cap.full_until.get(),
+        i64::MIN,
+        "a sweep that frees at least the low-water mark clears the bound"
     );
 }
 
@@ -1641,9 +1715,124 @@ fn rescan_frees_space_once_the_earliest_expiry_passes() {
     assert!(!store.items.borrow().contains_key("n-1"));
     assert_eq!(
         cap.full_until.get(),
-        i64::MIN,
-        "a sweep that frees space clears the remembered expiry"
+        now + 300,
+        "a sweep that frees less than the low-water mark keeps the earliest \
+         remaining expiry as the rescan bound"
     );
+}
+
+#[test]
+fn sweep_below_low_water_refuses_at_the_next_cap_without_a_rescan() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    let now = chrono::Utc::now().timestamp();
+    // One nonce already expired, the rest unexpired: the sweep frees one,
+    // below the low-water mark.
+    fill_to_cap(&store, &cap, now + 600);
+    store
+        .items
+        .borrow_mut()
+        .insert("n-1".to_string(), json!(now - 10));
+    assert_eq!(reserve(&store, &cap, "a", now + 600), "ok");
+    assert_eq!(store.get_keys_calls.get(), 1);
+    assert_eq!(cap.full_until.get(), now + 600);
+    // Back at the cap: refused in O(1) until the earliest remaining expiry.
+    assert_eq!(reserve(&store, &cap, "b", now + 600), "at-capacity");
+    assert_eq!(
+        store.get_keys_calls.get(),
+        1,
+        "low-water hysteresis: no rescan after a sweep that freed one slot"
+    );
+}
+
+#[test]
+fn own_sooner_expiring_reservation_lowers_the_rescan_bound() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    let now = chrono::Utc::now().timestamp();
+    fill_to_cap(&store, &cap, now + 600);
+    store
+        .items
+        .borrow_mut()
+        .insert("n-1".to_string(), json!(now - 10));
+    assert_eq!(reserve(&store, &cap, "soon", now + 30), "ok");
+    assert_eq!(
+        cap.full_until.get(),
+        now + 30,
+        "the bound never outlives a nonce this worker reserved"
+    );
+}
+
+#[test]
+fn get_error_on_the_nonce_fails_closed() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    store.unreadable.borrow_mut().insert("n".to_string());
+    assert_eq!(
+        reserve(&store, &cap, "n", NONCE_NEVER_EXPIRES),
+        "unavailable"
+    );
+    assert!(
+        !store.items.borrow().contains_key("n"),
+        "an unreadable nonce is not reserved"
+    );
+    assert_eq!(store.get_keys_calls.get(), 0);
+}
+
+#[test]
+fn unreadable_kept_key_bounds_the_rescan_by_the_backoff() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    fill_to_cap(&store, &cap, NONCE_NEVER_EXPIRES);
+    store.unreadable.borrow_mut().insert("n-1".to_string());
+    let before = chrono::Utc::now().timestamp();
+    assert_eq!(
+        reserve(&store, &cap, "over", NONCE_NEVER_EXPIRES),
+        "at-capacity"
+    );
+    let after = chrono::Utc::now().timestamp();
+    assert!(
+        store.items.borrow().contains_key("n-1"),
+        "an unreadable key is kept and still counts"
+    );
+    let bound = cap.full_until.get();
+    assert!(
+        (before + super::UNREADABLE_RESCAN_BACKOFF_SECONDS
+            ..=after + super::UNREADABLE_RESCAN_BACKOFF_SECONDS)
+            .contains(&bound),
+        "an unreadable key caps the bound at now + backoff, not never: {bound}"
+    );
+    // Before the backoff elapses: O(1) refusal.
+    assert_eq!(
+        reserve(&store, &cap, "over-2", NONCE_NEVER_EXPIRES),
+        "at-capacity"
+    );
+    assert_eq!(store.get_keys_calls.get(), 1);
+    // Once it elapses, the store is rescanned.
+    cap.full_until.set(before - 1);
+    assert_eq!(
+        reserve(&store, &cap, "over-3", NONCE_NEVER_EXPIRES),
+        "at-capacity"
+    );
+    assert_eq!(store.get_keys_calls.get(), 2, "rescanned after the backoff");
+}
+
+#[test]
+fn reservation_racing_between_get_and_store_is_a_replay() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    // Another worker reserved "n" after our get saw it absent.
+    store
+        .items
+        .borrow_mut()
+        .insert("n".to_string(), json!(NONCE_NEVER_EXPIRES));
+    store.hidden.borrow_mut().insert("n".to_string());
+    assert_eq!(
+        reserve(&store, &cap, "n", NONCE_NEVER_EXPIRES),
+        "replay",
+        "store(Absent) is authoritative: CasMismatch is a replay"
+    );
+    assert_eq!(cap.since_sweep.get(), 0, "a replay is not a reservation");
 }
 
 #[test]
@@ -1698,6 +1887,33 @@ fn sidecar_approval_source_is_rejected() {
 fn unknown_predicate_is_rejected() {
     let config = parse_config(base_config_json(json!({"requiredPredicates": ["P9"]}))).unwrap();
     assert!(Binding::from_config(&config).is_err());
+}
+
+#[test]
+fn client_responses_values_are_validated() {
+    for value in ["forward", "deny", "DENY"] {
+        let config = parse_config(base_config_json(json!({"clientResponses": value}))).unwrap();
+        assert!(Binding::from_config(&config).is_ok(), "{value}");
+    }
+    let config = parse_config(base_config_json(json!({"clientResponses": "allow"}))).unwrap();
+    match Binding::from_config(&config) {
+        Ok(_) => panic!("expected an unknown clientResponses to be rejected"),
+        Err(err) => assert!(err.to_string().contains("clientResponses")),
+    }
+}
+
+#[test]
+fn jsonrpc_member_names_are_rejected_as_approval_rpc_field() {
+    for field in ["jsonrpc", "id", "method", "params", "result", "error"] {
+        let config = parse_config(base_config_json(
+            json!({"approvalSource": "rpc-param", "approvalRpcField": field}),
+        ))
+        .unwrap();
+        match Binding::from_config(&config) {
+            Ok(_) => panic!("expected approvalRpcField={field} to be rejected"),
+            Err(err) => assert!(err.to_string().contains("approvalRpcField"), "{field}"),
+        }
+    }
 }
 
 #[test]

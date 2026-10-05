@@ -688,7 +688,10 @@ enum ParsedRequest {
     OutOfScope { method: String },
     /// A well-formed JSON-RPC response the client POSTs back to a server-initiated
     /// request (`roots/list`, `sampling/createMessage`, `elicitation/create`, #57).
-    /// It executes nothing, so it is out of scope and forwarded untouched.
+    /// It is not a tool invocation, but it IS input to an in-flight server
+    /// request (an elicitation answer can steer an approved call), and the
+    /// approval does not bind it. `clientResponses` decides: `forward` (default)
+    /// passes it through `out-of-scope`, `deny` treats it as malformed.
     Response,
 }
 
@@ -696,6 +699,10 @@ enum ParsedRequest {
 /// fails closed, so a body forwarded as a response can't also carry members an
 /// upstream might read as a request.
 const RESPONSE_MEMBERS: [&str; 4] = ["jsonrpc", "id", "result", "error"];
+
+/// JSON-RPC 2.0 member names `approvalRpcField` may not take.
+const JSONRPC_RESERVED_MEMBERS: [&str; 6] =
+    ["jsonrpc", "id", "method", "params", "result", "error"];
 
 /// Checks a body with no `method` member as a JSON-RPC 2.0 response (#57): an
 /// `id` that is a string or number (null only on an error response), exactly
@@ -985,6 +992,9 @@ struct Binding {
     max_approval_lifetime_seconds: Option<i64>,
     /// Remove the `rpc-param` envelope from forwarded bodies (#52).
     strip_approval_envelope: bool,
+    /// `clientResponses: forward` (default): forward a well-formed client
+    /// JSON-RPC response `out-of-scope`; `deny` treats it as malformed (#57).
+    forward_client_responses: bool,
     block: bool,
     deny_with_rpc_error: bool,
     result_header: String,
@@ -1092,6 +1102,28 @@ impl Binding {
             }
         };
 
+        // The rpc-param envelope is a sibling of the JSON-RPC members; sharing a
+        // name with one would make the envelope and the message ambiguous.
+        if JSONRPC_RESERVED_MEMBERS.contains(&config.approval_rpc_field.as_str()) {
+            return Err(anyhow!(
+                "approvalRpcField must not be a JSON-RPC member name ({}), got '{}'",
+                JSONRPC_RESERVED_MEMBERS.join("/"),
+                config.approval_rpc_field
+            ));
+        }
+
+        let forward_client_responses = match config
+            .client_responses
+            .as_deref()
+            .unwrap_or("forward")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "forward" => true,
+            "deny" => false,
+            other => return Err(anyhow!("unknown clientResponses '{other}'")),
+        };
+
         let mode = config.mode.to_ascii_lowercase();
         let block = match mode.as_str() {
             "block" => true,
@@ -1118,6 +1150,7 @@ impl Binding {
             clock_skew_seconds: config.clock_skew_seconds,
             max_approval_lifetime_seconds,
             strip_approval_envelope: config.strip_approval_envelope.unwrap_or(true),
+            forward_client_responses,
             block,
             deny_with_rpc_error,
             result_header: config.result_header.clone(),
@@ -1361,13 +1394,28 @@ fn nonce_expiry(binding: &Binding, not_after: Option<&str>) -> i64 {
         .unwrap_or(NONCE_NEVER_EXPIRES)
 }
 
+/// A sweep that frees fewer slots than this is "low water" (#58): the worker
+/// keeps the earliest remaining expiry as `full_until`, so it doesn't run another
+/// full scan after only a handful of reservations. Small under `cfg(test)`.
+#[cfg(not(test))]
+const SWEEP_LOW_WATER: usize = MAX_RESERVED_NONCES / 10;
+#[cfg(test)]
+const SWEEP_LOW_WATER: usize = 2;
+
+/// How long a worker waits before rescanning when the sweep kept nonces it
+/// could not decode. An unreadable entry counts against the cap but has no
+/// known expiry; without this bound it would refuse on that worker forever.
+const UNREADABLE_RESCAN_BACKOFF_SECONDS: i64 = 60;
+
 /// Per-worker bookkeeping for the P6 nonce cap (see `reserve_nonce`).
 struct NonceCap {
     /// Reservations this worker made since its last sweep.
     since_sweep: Cell<usize>,
-    /// Set when a sweep left the store full: the earliest expiry among the kept
-    /// nonces. Until `now` passes it no nonce can be swept, so a rescan would free
-    /// nothing and is skipped (#58). `i64::MIN` means "not known to be full".
+    /// Set when a sweep left the store full, or freed less than
+    /// `SWEEP_LOW_WATER`: the earliest expiry among the nonces this worker knows
+    /// of (lowered by its later reservations). Until `now` passes it a rescan
+    /// would free nothing this worker knows of, so at the cap it is skipped and
+    /// the reservation refused (#58). `i64::MIN` means "no known bound".
     full_until: Cell<i64>,
 }
 
@@ -1382,12 +1430,16 @@ impl NonceCap {
 
 /// Reserves `nonce` with `StoreMode::Absent` (the atomic single-use check).
 ///
-/// The normal path is a `get` of the nonce key, then that `store` call — the op
-/// the P6 path was proven on against a connected gateway. The `get` answers an
-/// already-reserved nonce as `Replay` in O(1), before the capacity path, so a
-/// replay is never misreported (or charged a scan) at capacity (#58). It is only
-/// a fast path: `StoreMode::Absent` stays the authoritative single-use check, so
-/// a reservation racing in between still loses as `Replay`.
+/// The normal path is a `get` of the nonce key, then the `store` call. Only the
+/// `store(Absent)` was proven on a connected gateway (same-replica replay
+/// rejection); the `get` pre-check (#58) is unit-tested only and has not yet run
+/// on a real gateway. The `get` answers an already-reserved nonce as `Replay` in
+/// O(1), before the capacity path, so a replay at capacity is reported as a
+/// replay and costs no scan. It is only a fast path: PDK's local `get` maps a
+/// host error to `Ok(None)` (as if absent), so the only `get` error seen here is
+/// a value that fails to decode, which is refused as `Unavailable`. Single use
+/// rests on `StoreMode::Absent`: a nonce the `get` missed (a race, or a host
+/// error read as absent) still loses there as `Replay`.
 ///
 /// `cap.since_sweep` counts this worker's reservations since its last sweep;
 /// only when it reaches `MAX_RESERVED_NONCES` is the store listed (`get_keys`),
@@ -1395,15 +1447,20 @@ impl NonceCap {
 /// reset to the remaining count. If the store is still full the reservation is
 /// refused (fail closed), and the earliest kept expiry is remembered in
 /// `cap.full_until`: until `now` passes it, further reservations at the cap are
-/// refused in O(1) without rescanning. Without P4 every nonce is stored as
-/// `NONCE_NEVER_EXPIRES`, so a full store is never rescanned. A storage error
-/// is `Unavailable` (fail closed).
+/// refused in O(1) without rescanning. A sweep that frees space but less than
+/// `SWEEP_LOW_WATER` also keeps that bound, so the next time the count reaches
+/// the cap it refuses rather than rescanning for a few slots. Each reservation
+/// lowers the bound to its own expiry if earlier. An undecodable kept nonce caps
+/// the bound at `now + UNREADABLE_RESCAN_BACKOFF_SECONDS`. Without P4 every
+/// nonce is stored as `NONCE_NEVER_EXPIRES`, so a full store is never
+/// rescanned. A storage error during the sweep is `Unavailable` (fail closed).
 ///
 /// The bound is approximate: the counter and `full_until` are per worker and
 /// reset when the VM is rebuilt, while the local store is shared, so between
 /// sweeps the store can exceed the cap by up to the cap per worker, and a worker
 /// can refuse at the cap until its remembered expiry even if another worker's
-/// sweep has since freed space.
+/// sweep, or another worker's earlier-expiring nonce, would since have let it
+/// free space.
 async fn reserve_nonce<S: DataStorage>(
     store: &S,
     cap: &NonceCap,
@@ -1425,13 +1482,17 @@ async fn reserve_nonce<S: DataStorage>(
             .await
             .map_err(|_| ReserveRefusal::Unavailable)?;
         let mut remaining = 0usize;
+        let mut freed = 0usize;
         let mut earliest = NONCE_NEVER_EXPIRES;
         for key in &keys {
             match store.get::<i64>(key).await {
-                Ok(Some((stored_expiry, _))) if now > stored_expiry => store
-                    .delete(key)
-                    .await
-                    .map_err(|_| ReserveRefusal::Unavailable)?,
+                Ok(Some((stored_expiry, _))) if now > stored_expiry => {
+                    store
+                        .delete(key)
+                        .await
+                        .map_err(|_| ReserveRefusal::Unavailable)?;
+                    freed += 1;
+                }
                 // Absent: removed concurrently, nothing to count.
                 Ok(None) => {}
                 // Unexpired: kept, and it bounds when a rescan can free space.
@@ -1439,8 +1500,12 @@ async fn reserve_nonce<S: DataStorage>(
                     remaining += 1;
                     earliest = earliest.min(stored_expiry);
                 }
-                // Unreadable: kept, so it still counts, but it never expires.
-                Err(_) => remaining += 1,
+                // Undecodable: kept, so it still counts. Its expiry is unknown,
+                // so retry after a short backoff rather than never.
+                Err(_) => {
+                    remaining += 1;
+                    earliest = earliest.min(now.saturating_add(UNREADABLE_RESCAN_BACKOFF_SECONDS));
+                }
             }
         }
         cap.since_sweep.set(remaining);
@@ -1448,11 +1513,17 @@ async fn reserve_nonce<S: DataStorage>(
             cap.full_until.set(earliest);
             return Err(ReserveRefusal::AtCapacity);
         }
-        cap.full_until.set(i64::MIN);
+        cap.full_until.set(if freed < SWEEP_LOW_WATER {
+            earliest
+        } else {
+            i64::MIN
+        });
     }
     match store.store(nonce, &StoreMode::Absent, &expiry).await {
         Ok(()) => {
             cap.since_sweep.set(cap.since_sweep.get() + 1);
+            // A nonce of ours that expires sooner lowers the rescan bound.
+            cap.full_until.set(cap.full_until.get().min(expiry));
             Ok(())
         }
         Err(DataStorageError::CasMismatch) => Err(ReserveRefusal::Replay),
@@ -1653,7 +1724,14 @@ async fn request_filter<S: DataStorage>(
         );
     }
 
-    let call = match parse_single_jsonrpc(&body) {
+    let parsed = match parse_single_jsonrpc(&body) {
+        // `clientResponses: deny` restores the pre-#57 fail-closed handling.
+        Ok(ParsedRequest::Response) if !binding.forward_client_responses => {
+            Err("client JSON-RPC response refused (clientResponses=deny)".to_string())
+        }
+        other => other,
+    };
+    let call = match parsed {
         Ok(ParsedRequest::ToolsCall(call)) => call,
         Ok(ParsedRequest::OutOfScope { method }) => {
             // Not a tools/call — out of scope for approval binding. Forward
@@ -1671,9 +1749,10 @@ async fn request_filter<S: DataStorage>(
             return Flow::Continue(());
         }
         Ok(ParsedRequest::Response) => {
-            // A client's reply to a server-initiated request (#57). It runs no
-            // tool, so it is forwarded untouched in BOTH modes, stamped like any
-            // other out-of-scope message.
+            // A client's reply to a server-initiated request (#57), with
+            // `clientResponses: forward`. It is not a tool call, so it is
+            // forwarded untouched in BOTH modes, stamped like any other
+            // out-of-scope message. Its content is NOT bound by the approval.
             logger::info!(
                 "{}",
                 json!({

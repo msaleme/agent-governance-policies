@@ -28,10 +28,10 @@
 // process unit tests, and their FULL end-to-end validation on a real Flex
 // container is handed off to Astra — see `docs/ASTRA-TASK-approval-p6-replay.md`.
 //
-// Running this suite requires Docker and a working `pdk-test` runtime image
-// pull, and was not part of the mandated `cargo test --lib` verification gate
-// for this deliverable — it is not included in the exact pass counts reported
-// alongside this file.
+// Running this suite requires Docker, a working `pdk-test` runtime image pull
+// and a Flex registration, so it is not part of the `cargo test --lib` gate or
+// its reported pass counts. CI runs it on a real Flex Gateway 1.14.0 container
+// in the `runtime-e2e-approval` job.
 
 mod common;
 
@@ -379,6 +379,8 @@ async fn transport_get_and_delete_pass_through_while_unapproved_call_is_denied(
 // `roots/list` result and an elicitation error reply) is POSTed with no method.
 // It must reach the real upstream byte-for-byte, stamped `out-of-scope`, not be
 // 403'd as malformed; an ambiguous response (both result and error) still is.
+// The bodies are canned responses POSTed directly, not a real MCP SDK
+// `roots/list` round trip with a server-initiated request.
 #[pdk_test]
 async fn client_jsonrpc_responses_reach_upstream_unchanged() -> anyhow::Result<()> {
     let httpmock_config = HttpMockConfig::builder()
