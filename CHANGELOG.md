@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Approval-to-Execution Binding
+
+- **Client JSON-RPC responses pass through (#57).** A client's reply to a server-initiated request
+  (`roots/list`, sampling, elicitation) carries no `method`, so it was denied as malformed (an
+  empty 403 in block mode), which broke MCP clients that answer server requests. A well-formed
+  response is now forwarded untouched and stamped `out-of-scope` in both modes, and logged with
+  `"kind":"response"`. Well-formed means `"jsonrpc":"2.0"`, a string or number `id` (`null` only on
+  an error response), exactly one of `result` or `error`, no `method`, no other top-level member,
+  and an `error` that is an object with an integer `code` and a string `message`. An ambiguous or
+  malformed response still fails closed: both `result` and `error`, neither, a `method` alongside
+  either, or a duplicate member. Batches are unchanged and still fail closed, including a batch of
+  responses. Covered by unit tests and a new real-gateway `pdk_test` case.
+- **The P6 nonce cap no longer rescans on every reservation (#58).** A reservation now checks the
+  nonce key with `get` first and denies an existing nonce as a replay in O(1), so a replay at the
+  cap is reported as a replay rather than `at capacity` and costs no scan; `store(…, Absent)` stays
+  the authoritative single-use check. When a sweep leaves the store full, the worker remembers the
+  earliest kept expiry and refuses further reservations at the cap in O(1) until that instant passes,
+  instead of listing and reading the whole store on every request. Without P4, a full store is never
+  rescanned. Fail-closed behaviour is unchanged.
+
 ## 0.1.0-rc.2 — 2026-10-04
 
 Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).

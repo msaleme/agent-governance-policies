@@ -3,7 +3,9 @@
 //!
 //! Scope after the #1–#7 reviewer findings:
 //!   * The policy binds ONLY MCP `tools/call` requests; any other JSON-RPC
-//!     method is forwarded out-of-scope (finding #7).
+//!     method is forwarded out-of-scope (finding #7), and so is a well-formed
+//!     JSON-RPC response a client POSTs back (finding #57); an ambiguous or
+//!     malformed response fails closed.
 //!   * Canonicalization is versioned and fail-closed — non-integer numbers and
 //!     `$ref`-shaped arguments are rejected, never coerced (findings #5, #2).
 //!   * P5 authenticates the versioned, domain-separated `mcp-v1` payload; the
@@ -645,6 +647,176 @@ fn jsonrpc_batch_fails_closed() {
     assert!(backend.next().is_none());
 }
 
+/// Well-formed JSON-RPC responses a client POSTs back to server-initiated
+/// requests (#57): success (string and numeric id) and error (incl. null id).
+fn wellformed_client_responses() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "roots/list result, numeric id",
+            json!({"jsonrpc": "2.0", "id": 3, "result": {"roots": [{"uri": "file:///repo", "name": "repo"}]}})
+                .to_string(),
+        ),
+        (
+            "sampling result, string id",
+            json!({"jsonrpc": "2.0", "id": "s-1", "result": {"role": "assistant", "content": {"type": "text", "text": "ok"}, "model": "m"}})
+                .to_string(),
+        ),
+        (
+            "elicitation decline as error",
+            json!({"jsonrpc": "2.0", "id": 9, "error": {"code": -32600, "message": "declined", "data": {"why": "user"}}})
+                .to_string(),
+        ),
+        (
+            "error with null id",
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})
+                .to_string(),
+        ),
+        (
+            "null result",
+            json!({"jsonrpc": "2.0", "id": 4, "result": null}).to_string(),
+        ),
+    ]
+}
+
+#[test]
+fn client_jsonrpc_responses_are_forwarded_untouched_in_block_mode() {
+    let (backend, mut tester) = harness!(block_config());
+    for (label, body) in wellformed_client_responses() {
+        let response = tester.request(typed_request("application/json", &json!({}), &body));
+        assert_eq!(response.status_code(), 200, "{}", label);
+        let forwarded = backend.next().expect(label);
+        assert_eq!(
+            forwarded.header("x-approval-binding"),
+            Some("out-of-scope"),
+            "{}",
+            label
+        );
+        assert_eq!(
+            forwarded.body(),
+            body.as_bytes(),
+            "{} body unchanged",
+            label
+        );
+    }
+}
+
+#[test]
+fn client_jsonrpc_responses_are_out_of_scope_in_monitor_mode() {
+    let (backend, mut tester) = harness!(monitor_config());
+    for (label, body) in wellformed_client_responses() {
+        tester.request(typed_request("application/json", &json!({}), &body));
+        let forwarded = backend.next().expect(label);
+        assert_eq!(
+            forwarded.header("x-approval-binding"),
+            Some("out-of-scope"),
+            "{} is out of scope, not malformed",
+            label
+        );
+        assert_eq!(forwarded.body(), body.as_bytes(), "{}", label);
+    }
+}
+
+#[test]
+fn ambiguous_or_malformed_jsonrpc_responses_fail_closed() {
+    let (backend, mut tester) = harness!(block_config());
+    let cases = [
+        (
+            "both result and error",
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}, "error": {"code": 1, "message": "x"}})
+                .to_string(),
+        ),
+        (
+            "neither result nor error",
+            json!({"jsonrpc": "2.0", "id": 1}).to_string(),
+        ),
+        (
+            "a request that also carries result",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "result": {}}).to_string(),
+        ),
+        (
+            "a tools/call that also carries error",
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "t"}, "error": {"code": 1, "message": "x"}})
+                .to_string(),
+        ),
+        (
+            "duplicate result member",
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"result":{"x":1}}"#.to_string(),
+        ),
+        (
+            "duplicate id member",
+            r#"{"jsonrpc":"2.0","id":1,"id":2,"result":{}}"#.to_string(),
+        ),
+        (
+            "missing jsonrpc",
+            json!({"id": 1, "result": {}}).to_string(),
+        ),
+        (
+            "wrong jsonrpc version",
+            json!({"jsonrpc": "1.0", "id": 1, "result": {}}).to_string(),
+        ),
+        (
+            "missing id",
+            json!({"jsonrpc": "2.0", "result": {}}).to_string(),
+        ),
+        (
+            "null id on a success response",
+            json!({"jsonrpc": "2.0", "id": null, "result": {}}).to_string(),
+        ),
+        (
+            "object id",
+            json!({"jsonrpc": "2.0", "id": {"a": 1}, "result": {}}).to_string(),
+        ),
+        (
+            "extra top-level member",
+            json!({"jsonrpc": "2.0", "id": 1, "result": {}, "params": {"name": "t"}}).to_string(),
+        ),
+        (
+            "error is not an object",
+            json!({"jsonrpc": "2.0", "id": 1, "error": "boom"}).to_string(),
+        ),
+        (
+            "error.code is not an integer",
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": 1.5, "message": "x"}}).to_string(),
+        ),
+        (
+            "error.code missing",
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"message": "x"}}).to_string(),
+        ),
+        (
+            "error.message is not a string",
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": 1, "message": 7}}).to_string(),
+        ),
+        (
+            "non-string method",
+            json!({"jsonrpc": "2.0", "id": 1, "method": 5}).to_string(),
+        ),
+    ];
+    for (label, body) in cases {
+        let response = tester.request(typed_request("application/json", &json!({}), &body));
+        assert_eq!(response.status_code(), 403, "{}", label);
+        assert_eq!(
+            response.header("x-approval-binding"),
+            Some("denied;predicate=malformed"),
+            "{}",
+            label
+        );
+        assert!(backend.next().is_none(), "{}", label);
+    }
+}
+
+#[test]
+fn batches_of_responses_still_fail_closed() {
+    let (backend, mut tester) = harness!(block_config());
+    let body = json!([{"jsonrpc": "2.0", "id": 1, "result": {}}]).to_string();
+    let response = tester.request(typed_request("application/json", &json!({}), &body));
+    assert_eq!(
+        response.header("x-approval-binding"),
+        Some("denied;predicate=malformed"),
+        "batch handling is unchanged by #57"
+    );
+    assert!(backend.next().is_none());
+}
+
 // ===========================================================================
 // I. Structural / fail-closed edge cases
 // ===========================================================================
@@ -1276,13 +1448,8 @@ fn ready<F: std::future::Future>(future: F) -> F::Output {
     }
 }
 
-fn reserve(
-    store: &CountingStore,
-    since_sweep: &Cell<usize>,
-    nonce: &str,
-    expiry: i64,
-) -> &'static str {
-    match ready(super::reserve_nonce(store, since_sweep, nonce, expiry)) {
+fn reserve(store: &CountingStore, cap: &NonceCap, nonce: &str, expiry: i64) -> &'static str {
+    match ready(super::reserve_nonce(store, cap, nonce, expiry)) {
         Ok(()) => "ok",
         Err(ReserveRefusal::Replay) => "replay",
         Err(ReserveRefusal::AtCapacity) => "at-capacity",
@@ -1293,28 +1460,22 @@ fn reserve(
 #[test]
 fn reservations_below_the_cap_never_list_keys() {
     let store = CountingStore::default();
-    let since_sweep = Cell::new(0);
-    assert_eq!(
-        reserve(&store, &since_sweep, "n-0", NONCE_NEVER_EXPIRES),
-        "ok"
-    );
-    assert_eq!(
-        reserve(&store, &since_sweep, "n-0", NONCE_NEVER_EXPIRES),
-        "replay"
-    );
+    let cap = NonceCap::new();
+    assert_eq!(reserve(&store, &cap, "n-0", NONCE_NEVER_EXPIRES), "ok");
+    assert_eq!(reserve(&store, &cap, "n-0", NONCE_NEVER_EXPIRES), "replay");
     for i in 1..super::MAX_RESERVED_NONCES {
         assert_eq!(
-            reserve(&store, &since_sweep, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
+            reserve(&store, &cap, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
             "ok"
         );
     }
     assert_eq!(
         store.get_keys_calls.get(),
         0,
-        "the normal path is the store(Absent) call alone"
+        "the normal path is get + store(Absent), never a listing"
     );
     assert_eq!(
-        since_sweep.get(),
+        cap.since_sweep.get(),
         super::MAX_RESERVED_NONCES,
         "a replay does not count as a reservation"
     );
@@ -1323,25 +1484,16 @@ fn reservations_below_the_cap_never_list_keys() {
 #[test]
 fn sweep_runs_only_at_the_cap_and_reclaims_expired_nonces() {
     let store = CountingStore::default();
-    let since_sweep = Cell::new(0);
+    let cap = NonceCap::new();
     let past = chrono::Utc::now().timestamp() - 10;
     // One unexpired nonce, the rest already past their P4 deadline.
-    assert_eq!(
-        reserve(&store, &since_sweep, "keep", NONCE_NEVER_EXPIRES),
-        "ok"
-    );
+    assert_eq!(reserve(&store, &cap, "keep", NONCE_NEVER_EXPIRES), "ok");
     for i in 1..super::MAX_RESERVED_NONCES {
-        assert_eq!(
-            reserve(&store, &since_sweep, &format!("old-{i}"), past),
-            "ok"
-        );
+        assert_eq!(reserve(&store, &cap, &format!("old-{i}"), past), "ok");
     }
     assert_eq!(store.get_keys_calls.get(), 0);
 
-    assert_eq!(
-        reserve(&store, &since_sweep, "fresh", NONCE_NEVER_EXPIRES),
-        "ok"
-    );
+    assert_eq!(reserve(&store, &cap, "fresh", NONCE_NEVER_EXPIRES), "ok");
     assert_eq!(
         store.get_keys_calls.get(),
         1,
@@ -1350,7 +1502,7 @@ fn sweep_runs_only_at_the_cap_and_reclaims_expired_nonces() {
     let keys: Vec<String> = store.items.borrow().keys().cloned().collect();
     assert_eq!(keys, vec!["fresh".to_string(), "keep".to_string()]);
     assert_eq!(
-        since_sweep.get(),
+        cap.since_sweep.get(),
         2,
         "the counter restarts from what remains"
     );
@@ -1359,15 +1511,15 @@ fn sweep_runs_only_at_the_cap_and_reclaims_expired_nonces() {
 #[test]
 fn sweep_that_frees_nothing_refuses_at_capacity() {
     let store = CountingStore::default();
-    let since_sweep = Cell::new(0);
+    let cap = NonceCap::new();
     for i in 0..super::MAX_RESERVED_NONCES {
         assert_eq!(
-            reserve(&store, &since_sweep, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
+            reserve(&store, &cap, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
             "ok"
         );
     }
     assert_eq!(
-        reserve(&store, &since_sweep, "over", NONCE_NEVER_EXPIRES),
+        reserve(&store, &cap, "over", NONCE_NEVER_EXPIRES),
         "at-capacity"
     );
     assert_eq!(store.get_keys_calls.get(), 1);
@@ -1375,12 +1527,13 @@ fn sweep_that_frees_nothing_refuses_at_capacity() {
         !store.items.borrow().contains_key("over"),
         "a refused nonce is not stored"
     );
-    // Still full: every further attempt sweeps again and still refuses.
+    // Still full, and without P4 nothing ever expires: further attempts refuse
+    // in O(1) without rescanning (#58).
     assert_eq!(
-        reserve(&store, &since_sweep, "over-2", NONCE_NEVER_EXPIRES),
+        reserve(&store, &cap, "over-2", NONCE_NEVER_EXPIRES),
         "at-capacity"
     );
-    assert_eq!(store.get_keys_calls.get(), 2);
+    assert_eq!(store.get_keys_calls.get(), 1, "no P4 means no rescan");
 }
 
 #[test]
@@ -1389,19 +1542,123 @@ fn sweep_storage_error_fails_closed() {
         fail_get_keys: true,
         ..CountingStore::default()
     };
-    let since_sweep = Cell::new(0);
+    let cap = NonceCap::new();
     for i in 0..super::MAX_RESERVED_NONCES {
         assert_eq!(
-            reserve(&store, &since_sweep, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
+            reserve(&store, &cap, &format!("n-{i}"), NONCE_NEVER_EXPIRES),
             "ok",
             "a failing get_keys is never reached below the cap"
         );
     }
     assert_eq!(
-        reserve(&store, &since_sweep, "over", NONCE_NEVER_EXPIRES),
+        reserve(&store, &cap, "over", NONCE_NEVER_EXPIRES),
         "unavailable"
     );
     assert!(!store.items.borrow().contains_key("over"));
+}
+
+/// Fills the store to the cap with nonces `n-0..` that expire at `expiry`.
+fn fill_to_cap(store: &CountingStore, cap: &NonceCap, expiry: i64) {
+    for i in 0..super::MAX_RESERVED_NONCES {
+        assert_eq!(reserve(store, cap, &format!("n-{i}"), expiry), "ok");
+    }
+}
+
+#[test]
+fn replay_at_capacity_is_denied_as_replay_without_a_scan() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    fill_to_cap(&store, &cap, NONCE_NEVER_EXPIRES);
+    assert_eq!(
+        reserve(&store, &cap, "n-0", NONCE_NEVER_EXPIRES),
+        "replay",
+        "a reserved nonce is a replay, not a capacity refusal (#58)"
+    );
+    assert_eq!(
+        store.get_keys_calls.get(),
+        0,
+        "the replay check is O(1): the store is never listed"
+    );
+}
+
+#[test]
+fn repeated_at_capacity_refusals_do_not_rescan_before_the_earliest_expiry() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    let now = chrono::Utc::now().timestamp();
+    // P4-bounded nonces, none expired yet; "n-1" expires first.
+    fill_to_cap(&store, &cap, now + 600);
+    store
+        .items
+        .borrow_mut()
+        .insert("n-1".to_string(), json!(now + 120));
+    assert_eq!(reserve(&store, &cap, "over", now + 600), "at-capacity");
+    assert_eq!(store.get_keys_calls.get(), 1);
+    assert_eq!(
+        cap.full_until.get(),
+        now + 120,
+        "the sweep remembers the earliest kept expiry"
+    );
+    for i in 0..10 {
+        assert_eq!(
+            reserve(&store, &cap, &format!("over-{i}"), now + 600),
+            "at-capacity"
+        );
+    }
+    assert_eq!(
+        store.get_keys_calls.get(),
+        1,
+        "refusals before the earliest expiry are O(1), with no rescan"
+    );
+}
+
+#[test]
+fn rescan_frees_space_once_the_earliest_expiry_passes() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    let now = chrono::Utc::now().timestamp();
+    fill_to_cap(&store, &cap, now + 600);
+    store
+        .items
+        .borrow_mut()
+        .insert("n-1".to_string(), json!(now + 120));
+    assert_eq!(reserve(&store, &cap, "over", now + 600), "at-capacity");
+    assert_eq!(store.get_keys_calls.get(), 1);
+
+    // Advance time by 300s: shift every stored timestamp, and the remembered
+    // expiry, back by the same amount, so "n-1" is now past its deadline.
+    for value in store.items.borrow_mut().values_mut() {
+        *value = json!(value.as_i64().unwrap() - 300);
+    }
+    cap.full_until.set(cap.full_until.get() - 300);
+
+    assert_eq!(
+        reserve(&store, &cap, "over", now + 600),
+        "ok",
+        "once the earliest expiry passes, the rescan frees space"
+    );
+    assert_eq!(store.get_keys_calls.get(), 2, "exactly one rescan");
+    assert!(!store.items.borrow().contains_key("n-1"));
+    assert_eq!(
+        cap.full_until.get(),
+        i64::MIN,
+        "a sweep that frees space clears the remembered expiry"
+    );
+}
+
+#[test]
+fn without_p4_a_full_store_is_never_rescanned() {
+    let store = CountingStore::default();
+    let cap = NonceCap::new();
+    fill_to_cap(&store, &cap, NONCE_NEVER_EXPIRES);
+    for i in 0..10 {
+        assert_eq!(
+            reserve(&store, &cap, &format!("over-{i}"), NONCE_NEVER_EXPIRES),
+            "at-capacity"
+        );
+    }
+    assert_eq!(store.get_keys_calls.get(), 1, "one sweep, then never again");
+    assert_eq!(cap.full_until.get(), NONCE_NEVER_EXPIRES);
 }
 
 // ===========================================================================

@@ -36,7 +36,14 @@ predicates and denies the call if any **required** predicate fails.
 because that is the method that *executes a tool*, which is what an approval constrains. Every other
 JSON-RPC method (`tools/list`, `initialize`, `ping`, notifications, anything unrecognized) is
 **out of scope**: it is forwarded upstream untouched, with the result header stamped `out-of-scope`
-in both monitor and block mode. The policy never blocks an identified non-`tools/call` method. At
+in both monitor and block mode. The policy never blocks an identified non-`tools/call` method. The
+same holds for a well-formed JSON-RPC **response** a client POSTs back to a server-initiated request
+(`roots/list`, `sampling/createMessage`, `elicitation/create` replies, #57): it executes nothing, so
+it is forwarded untouched and stamped `out-of-scope` (logged with `"kind":"response"`). Well-formed
+means `"jsonrpc":"2.0"`, a string or number `id` (`null` only on an error response), exactly one of
+`result` or `error`, no `method`, no other top-level member, and an `error` that is an object with an
+integer `code` and a string `message`. An ambiguous or malformed response — both `result` and
+`error`, neither, a `method` alongside either, or a duplicate member — fails closed as malformed. At
 the HTTP layer, only `POST` can carry a Streamable-HTTP `tools/call`, so a bodyless `GET` (the
 server→client SSE stream), `DELETE` (session teardown with `Mcp-Session-Id`), `OPTIONS` or `HEAD` is
 also forwarded untouched and stamped `out-of-scope` in both modes. A POST that cannot be inspected
@@ -115,15 +122,18 @@ because it was identified as one; clients that need this policy in block mode mu
 a running 64 KiB cap is a follow-up, not this build.
 
 Once a body clears both gates, the policy evaluates it only if it parses as a single (non-batch)
-JSON-RPC 2.0 object. A `POST` with no body at all, a JSON-RPC **batch**, or fails to parse as a single JSON-RPC object at all (missing/invalid `jsonrpc`, missing
-`method`, or — for `tools/call` — missing `params.name`), or one the JSON parser rejects outright
+JSON-RPC 2.0 object. A `POST` with no body at all, a JSON-RPC **batch**, or fails to parse as a single JSON-RPC object at all (missing/invalid `jsonrpc`, no
+`method` without being a well-formed response, a request that also carries `result` or `error`, or —
+for `tools/call` — missing `params.name`), or one the JSON parser rejects outright
 (nesting deeper than 128, a lone surrogate escape, a leading byte-order mark, invalid UTF-8) is
 treated as **malformed** — never as an out-of-scope method: `monitor`
 mode logs the verdict and always forwards; `block` mode denies. Batches are explicitly out of scope
 for approval binding, not a future predicate — an approval record binds to one executed action, not
 to a collection of them; a batch is therefore rejected atomically (the whole array denied together)
 and never split into a per-member allow/deny — so an unauthorized or altered call riding inside an
-otherwise-plausible batch can never slip through as one of several forwarded calls.
+otherwise-plausible batch can never slip through as one of several forwarded calls. This includes a
+batch of client responses: the #57 response pass-through applies to a single response object only,
+and batch handling is unchanged.
 
 **What this policy reads — and nothing else.** Inspection is limited to: the approval envelope
 (from `approvalHeader` or, for `approvalSource: rpc-param`, the `approvalRpcField` sibling member of
@@ -353,19 +363,27 @@ Further honest limitations, disclosed rather than hidden:
   namespaced by issuer — it is not in this build (#51).
 - **Reserved P6 nonces are bounded by an approximate cap, not a TTL (#51).** `local()` has no TTL,
   so the policy bounds the store itself. Each reservation records the nonce's expiry, and the normal
-  path is a single atomic `store(nonce, Absent, …)` — the same operation the P6 path was proven on.
-  Each worker counts its reservations; when its count reaches **10,000**, it lists the store, deletes
-  every nonce whose approval has expired under P4 (`now > not_after + clockSkewSeconds`), and resets
-  its count to what remains. Forgetting such a nonce cannot reopen a replay, because replaying it is
-  still a P4 denial. If the store is still full after that sweep, the reservation **fails closed** (a
-  P6 denial); a storage error during the sweep also fails closed. Plan for these limits:
-  (1) **the bound is approximate** — the count is per worker and resets when the worker's VM is
-  rebuilt, while the store is shared by the replica's workers, so between sweeps the store can exceed
-  10,000 by up to 10,000 per worker; (2) **the sweep's key listing (`get_keys`) is not yet verified on
-  a real gateway** — it runs only at the cap, and if it errors there, P6 reservations at the cap fail
-  closed; (3) **without P4 in `requiredPredicates`, no reserved nonce ever expires**, so once a sweep
-  finds the store full a P6-only deployment stops admitting new single-use approvals on that replica
-  until restart — require P4 with P6; (4) an approval with a far-future `not_after` holds its slot
+  path is a `get` of the nonce key followed by a single atomic `store(nonce, Absent, …)` — the same
+  operation the P6 path was proven on. The `get` denies an already-reserved nonce as a replay in O(1),
+  before any capacity check, so a replay at the cap is reported as a replay and costs no scan (#58);
+  `store(…, Absent)` remains the authoritative single-use check, so a concurrent reservation still
+  loses as a replay. Each worker counts its reservations; when its count reaches **10,000**, it lists
+  the store, deletes every nonce whose approval has expired under P4 (`now > not_after +
+  clockSkewSeconds`), and resets its count to what remains. Forgetting such a nonce cannot reopen a
+  replay, because replaying it is still a P4 denial. If the store is still full after that sweep, the
+  reservation **fails closed** (a P6 denial), and the worker remembers the earliest expiry among the
+  nonces it kept: until that instant passes, nothing can be swept, so further reservations at the cap
+  are refused in O(1) without listing the store again (#58). A storage error during the replay check
+  or the sweep also fails closed. Plan for these limits:
+  (1) **the bound is approximate** — the count and the remembered expiry are per worker and reset
+  when the worker's VM is rebuilt, while the store is shared by the replica's workers, so between
+  sweeps the store can exceed 10,000 by up to 10,000 per worker, and a worker can keep refusing at the
+  cap until its remembered expiry even if another worker's sweep has freed space in the meantime;
+  (2) **the sweep's key listing (`get_keys`) is not yet verified on a real gateway** — it runs only at
+  the cap, and if it errors there, P6 reservations at the cap fail closed; (3) **without P4 in
+  `requiredPredicates`, no reserved nonce ever expires**, so once a sweep finds the store full a
+  P6-only deployment stops admitting new single-use approvals on that replica until restart, and
+  never rescans — require P4 with P6; (4) an approval with a far-future `not_after` holds its slot
   until then (see the next item).
 - **The approval lifetime bound is off by default and checks `not_after`, not an issue time (#52).**
   With `maxApprovalLifetimeSeconds` unset, P4 checks only `now <= not_after + clockSkewSeconds`, so
@@ -412,13 +430,17 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **97 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **105 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
 rejection**, **`expectedAudience` required when P5 is required**), malformed/oversized/batch/
 notification JSON-RPC framing, monitor-vs-block behavior, the rpc-param approval source, **non-
-`tools/call` methods forwarded as out-of-scope** (never blocked), **bodyless `GET` (SSE)/`DELETE`
+`tools/call` methods forwarded as out-of-scope** (never blocked), **client JSON-RPC responses
+forwarded untouched as out-of-scope in block and monitor mode** (success with string and numeric
+`id`, error with `null` `id`) while ambiguous or malformed responses (both or neither of
+`result`/`error`, a `method` alongside either, duplicate members, a bad `id` or `error` shape, an
+extra member) and a batch of responses fail closed, **bodyless `GET` (SSE)/`DELETE`
 (session)/`OPTIONS`/`HEAD` forwarded out-of-scope in block and monitor mode** while a bodyless or
 lowercase `post` and a non-`POST` carrying a `tools/call` body stay bound, **framing refusals**
 (no/short/oversized `content-length` stamped `denied;framing=content-length`), **charset
@@ -432,9 +454,11 @@ under P2** (top-level, nested, `$ref`+extra keys) while a `$ref` string *value* 
 protected claim, when mutated, flips to deny; kid rotation), **the executor read from verified
 `AuthenticationData`** (an injected verified subject wins over a spoofed header; absent-and-P5-
 required fails closed), **atomic single-use via data storage** (first allow, replay denied under P6,
-monitor mode does not reserve; below the cap a reservation is one `store` call and never lists keys,
-at the cap a sweep deletes P4-expired nonces and a still-full store fails closed, exercised with the
-cap set to 3 under `cfg(test)`), **the approval lifetime bound** (allowed exactly at `now +
+monitor mode does not reserve; below the cap a reservation never lists keys, at the cap a sweep
+deletes P4-expired nonces and a still-full store fails closed, a replay at the cap is denied as a
+replay without a scan, repeated at-capacity refusals don't rescan before the earliest kept expiry,
+a rescan frees space once it passes, and without P4 a full store is never rescanned — exercised with
+the cap set to 3 under `cfg(test)`), **the approval lifetime bound** (allowed exactly at `now +
 maxApprovalLifetimeSeconds + clockSkewSeconds`, denied one second or one millisecond past it, off
 when unset, never relaxes expiry; range and requires-P4 validated at startup), **rpc-param envelope
 removal** (first, middle, last and only member; whitespace and escapes kept byte-exact; an escaped
@@ -452,7 +476,10 @@ without panicking, the ambiguous-duplicate-`id` containment rule, and a corpus s
 that deserializes every `tests/fixtures/abv/*.json` vector. `tests/requests.rs`
 adds a small Docker/`pdk_test` end-to-end suite (sound-approval-reaches-upstream,
 action-mismatch-denied-and-never-reaches-upstream, and the #50 transport pass-through: `GET` SSE and
-`DELETE` session reach upstream stamped `out-of-scope` while an unapproved `tools/call` is denied) — deliberately smaller than Tripwire's
+`DELETE` session reach upstream stamped `out-of-scope` while an unapproved `tools/call` is denied,
+the #52 rpc-param envelope removal, and the #57 client responses: a `roots/list` result and an
+elicitation error reply reach upstream byte-for-byte stamped `out-of-scope`, while an ambiguous
+response is denied as malformed) — deliberately smaller than Tripwire's
 integration suite, since this policy's threat model ("is this record proof of this execution") is
 already covered exhaustively by the unit tests; it adds only what an in-process harness cannot
 exercise. Behaviour that needs a connected gateway was checked on a real Flex Gateway: P5 with

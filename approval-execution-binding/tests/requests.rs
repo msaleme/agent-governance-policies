@@ -16,10 +16,11 @@
 // P1-deny path, plus the #50 transport pass-through (GET SSE stream and DELETE
 // session forwarded `out-of-scope`; an unapproved tools/call still denied), and
 // the #52 rpc-param envelope removal (exact stripped bytes and rewritten
-// content-length as received by the real upstream). It
+// content-length as received by the real upstream), and the #57 client
+// JSON-RPC responses (forwarded byte-for-byte `out-of-scope`). It
 // intentionally does not repeat the unit tests' predicate-by-predicate coverage.
 //
-// SCOPE: these two e2e tests exercise ONLY P1 (action) and P2 (canonical
+// SCOPE: these e2e tests exercise ONLY P1 (action) and P2 (canonical
 // argument match) — the predicates that need no external prerequisite. P5
 // (separate-attester mcp-v1 MAC over the versioned payload) requires a verified
 // AuthenticationData subject from an upstream identity policy, and P6 (atomic
@@ -370,6 +371,124 @@ async fn transport_get_and_delete_pass_through_while_unapproved_call_is_denied(
         calls.hits_async().await,
         0,
         "an unapproved tools/call must never reach upstream"
+    );
+    Ok(())
+}
+
+// #57: a client's JSON-RPC response to a server-initiated request (here a
+// `roots/list` result and an elicitation error reply) is POSTed with no method.
+// It must reach the real upstream byte-for-byte, stamped `out-of-scope`, not be
+// 403'd as malformed; an ambiguous response (both result and error) still is.
+#[pdk_test]
+async fn client_jsonrpc_responses_reach_upstream_unchanged() -> anyhow::Result<()> {
+    let httpmock_config = HttpMockConfig::builder()
+        .port(80)
+        .version("latest")
+        .hostname("backend")
+        .build();
+    let policy_config = PolicyConfig::builder()
+        .name(POLICY_NAME)
+        .configuration(approval_policy_config(&["P1", "P2"]))
+        .build();
+    let api_config = ApiConfig::builder()
+        .name("myApi")
+        .upstream(&httpmock_config)
+        .path("/mcp/")
+        .port(FLEX_PORT)
+        .policies([policy_config])
+        .build();
+    let flex_config = FlexConfig::builder()
+        .version("1.14.0")
+        .hostname("local-flex")
+        .with_api(api_config)
+        .config_mounts([
+            (POLICY_DIR, "custom-policies"),
+            (COMMON_CONFIG_DIR, "common"),
+        ])
+        .build();
+    let composite = TestComposite::builder()
+        .with_service(flex_config)
+        .with_service(httpmock_config)
+        .build()
+        .await?;
+
+    let flex: Flex = composite.service()?;
+    let flex_url = flex.external_url(FLEX_PORT).unwrap();
+    let httpmock: HttpMock = composite.service()?;
+    let mock_server = MockServer::connect_async(httpmock.socket()).await;
+
+    let roots_reply = serde_json::json!({
+        "jsonrpc": "2.0", "id": 7,
+        "result": {"roots": [{"uri": "file:///workspace", "name": "workspace"}]}
+    })
+    .to_string();
+    let elicitation_reply = serde_json::json!({
+        "jsonrpc": "2.0", "id": "elicit-1",
+        "error": {"code": -32600, "message": "user declined"}
+    })
+    .to_string();
+    let roots = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .header("x-approval-binding", "out-of-scope")
+                .body(roots_reply.as_str());
+            then.status(202);
+        })
+        .await;
+    let elicitation = mock_server
+        .mock_async(|when, then| {
+            when.method(httpmock::Method::POST)
+                .header("x-approval-binding", "out-of-scope")
+                .body(elicitation_reply.as_str());
+            then.status(202);
+        })
+        .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    for body in [&roots_reply, &elicitation_reply] {
+        let response = client
+            .post(&flex_url)
+            .header("content-type", "application/json")
+            .header("client_id", "executor.example")
+            .header("mcp-session-id", "e2e-session")
+            .body(body.clone())
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            202,
+            "a client JSON-RPC response must reach upstream, not be denied"
+        );
+    }
+    roots.assert_async().await;
+    elicitation.assert_async().await;
+
+    let ambiguous = client
+        .post(&flex_url)
+        .header("content-type", "application/json")
+        .header("client_id", "executor.example")
+        .body(
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 8, "result": {},
+                "error": {"code": 1, "message": "x"}
+            })
+            .to_string(),
+        )
+        .send()
+        .await?;
+    assert_eq!(
+        ambiguous.status(),
+        403,
+        "an ambiguous response fails closed"
+    );
+    assert_eq!(
+        ambiguous
+            .headers()
+            .get("x-approval-binding")
+            .and_then(|v| v.to_str().ok()),
+        Some("denied;predicate=malformed")
     );
     Ok(())
 }
