@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+### Aggregate-Risk Gate
+
+- **A slow upload can no longer expire its own reservation (#56).** The admission time was read
+  when the request headers arrived, before the body was buffered. A client that held back its last
+  body byte for longer than `reservationTimeoutMs` got a reservation that had already expired. It
+  was reclaimed before the call was forwarded, so the next call was admitted, and the slow call's
+  commit settled not-active: a permanent undercount. The admission time is now read once the body
+  is fully received (bodyless and uninspectable calls keep the header-time reading).
+- **Guard: no reservation is created already past its deadline (#56).** Both ledger backends
+  re-read the gateway clock at reserve time and refuse a reservation whose deadline
+  (admission time + `reservationTimeoutMs`) is at or before it. The node ledger reads the clock
+  from its store, the worker ledger from the gateway clock injected at configure time. The call is
+  denied with the new `reason=stale-admission` in `block` mode, or forwarded with that reason
+  stamped in `monitor` mode. The guard refuses rather than moving the admission time forward, so a
+  regression of the fix above shows up as refusals instead of being masked. A clock that reads 0
+  (no clock) disables the guard; the unit tests that drive the ledgers directly with decreasing
+  times use that and behave as before.
+- **Documented limits, unchanged behaviour.** A call that runs for longer than twice the timeout,
+  on a scope another call touches meanwhile, settles not-active and is never charged; a client
+  that controls upstream duration can still provoke this, and it lasts until a restart
+  (`worker-lifetime`) or until the window rolls. A client that disconnects after the upstream ran
+  is never charged either, so it can run about `aggregateBudget ÷ contribution` uncharged calls
+  every `reservationTimeoutMs`. See "Choosing the timeout" and "Scope of the guarantee" in the
+  policy README.
+- **Tests.** A filter-chain unit test (a hold filter ahead of the gate for the slow upload and one
+  behind it for upstream time) fails on both backends when the body-time re-read is reverted. The
+  `pdk_test` over a raw socket now overlaps a second call with the slow call's upstream time
+  (mock delay 1000 ms, last byte held 4500 ms with a 2000 ms timeout) and asserts the second call
+  is refused, the slow call settles `committed`, and the upstream is hit once.
+
 ### Approval-to-Execution Binding
 
 - **Client JSON-RPC responses pass through (#57).** A client's reply to a server-initiated request
