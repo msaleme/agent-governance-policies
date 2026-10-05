@@ -8,8 +8,9 @@ nothing crashes.
 | Version | Supported |
 | --- | --- |
 | `main` | Yes |
-| `v0.1.0-rc.2` (source prerelease) | Yes |
-| `v0.1.0-rc.1` (source prerelease) | No. Superseded by `v0.1.0-rc.2`. |
+| `v0.1.0-rc.3` (source prerelease) | Yes |
+| `v0.1.0-rc.2` (source prerelease) | No. Superseded by `v0.1.0-rc.3`. |
+| `v0.1.0-rc.1` (source prerelease) | No. Superseded by `v0.1.0-rc.3`. |
 | Anything earlier | No. It was never released. |
 
 ## Reporting a vulnerability
