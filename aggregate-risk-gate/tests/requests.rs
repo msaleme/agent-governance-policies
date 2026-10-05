@@ -377,22 +377,27 @@ async fn an_mcp_handshake_passes_and_only_tools_call_is_budgeted_through_a_real_
 
 /// #56: a client that uploads slowly cannot shorten its own reservation.
 /// Over a raw socket, the first call sends its headers and all but the last
-/// body byte, waits longer than twice `reservationTimeoutMs`, then sends the
-/// last byte. The reservation's timeout runs from when the body was fully
-/// received, so the call commits (budget 1, weight 1) and a second call is
-/// refused. Timed from the headers, the reservation would already have
-/// expired, its commit would settle not-active, and the second call would be
-/// admitted.
+/// body byte, holds the last byte for longer than twice
+/// `reservationTimeoutMs`, then sends it. The upstream answers after
+/// `UPSTREAM_MS`, and a second call reaches the same scope while the first is
+/// still upstream. The reservation's timeout runs from when the body was fully
+/// received, so it is live then: the second call is refused, the first
+/// settles committed, and the upstream is hit once. Timed from the headers,
+/// the reservation (and its tombstone) would already be gone, the second call
+/// would be admitted, and the first would settle not-active, never charged.
 #[pdk_test]
 async fn a_slow_upload_cannot_expire_its_own_reservation_through_a_real_gateway(
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
-    const TIMEOUT_MS: u64 = 1000;
+    const TIMEOUT_MS: u64 = 2000;
+    const HOLD_MS: u64 = 2 * TIMEOUT_MS + 500;
+    const UPSTREAM_MS: u64 = 1000;
     let (_composite, flex_url, httpmock) = start_gateway(serde_json::json!({
         "reservationTimeoutMs": TIMEOUT_MS,
         "aggregateBudget": 1,
-        "fixedWeight": 1
+        "fixedWeight": 1,
+        "window": "worker-lifetime"
     }))
     .await?;
     let mock_server = httpmock::MockServer::connect_async(httpmock.socket()).await;
@@ -401,6 +406,7 @@ async fn a_slow_upload_cannot_expire_its_own_reservation_through_a_real_gateway(
             when.any_request();
             then.status(200)
                 .header("content-type", "application/json")
+                .delay(std::time::Duration::from_millis(UPSTREAM_MS))
                 .body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
         })
         .await;
@@ -425,9 +431,30 @@ async fn a_slow_upload_cannot_expire_its_own_reservation_through_a_real_gateway(
         head
     )?;
     socket.flush()?;
-    tokio::time::sleep(std::time::Duration::from_millis(2 * TIMEOUT_MS + 1500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(HOLD_MS)).await;
     socket.write_all(last.as_bytes())?;
     socket.flush()?;
+
+    // While the first call is upstream, a second call reaches the scope. The
+    // first call's reservation is live, so the budget is held.
+    tokio::time::sleep(std::time::Duration::from_millis(UPSTREAM_MS / 2)).await;
+    let second = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .post(&flex_url)
+        .header("content-type", "application/json")
+        .header("x-agent-id", "broker-7")
+        .body(call(2))
+        .send()
+        .await?;
+    assert_eq!(second.status(), 200, "rpc-error denial envelope");
+    let second: serde_json::Value = serde_json::from_str(&second.text().await?)?;
+    assert_eq!(second["id"], 2);
+    assert_eq!(
+        second["error"]["code"], -32008,
+        "the second call must be DENIED while the slow call holds the budget"
+    );
+
     let mut response = String::new();
     socket.read_to_string(&mut response)?;
     assert!(
@@ -448,25 +475,10 @@ async fn a_slow_upload_cannot_expire_its_own_reservation_through_a_real_gateway(
         "the slow call must be admitted, got {}",
         stamp
     );
-    upstream.assert_hits_async(1).await;
-
-    // Its reservation was still active when it settled, so it committed and
-    // the budget is spent.
-    let second = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?
-        .post(&flex_url)
-        .header("content-type", "application/json")
-        .header("x-agent-id", "broker-7")
-        .body(call(2))
-        .send()
-        .await?;
-    assert_eq!(second.status(), 200, "rpc-error denial envelope");
-    let second: serde_json::Value = serde_json::from_str(&second.text().await?)?;
-    assert_eq!(second["id"], 2);
-    assert_eq!(
-        second["error"]["code"], -32008,
-        "the second call must be DENIED: the slow call's commit was not lost"
+    assert!(
+        stamp.ends_with(";settlement=committed"),
+        "the slow call must be charged, got {}",
+        stamp
     );
     upstream.assert_hits_async(1).await;
     Ok(())

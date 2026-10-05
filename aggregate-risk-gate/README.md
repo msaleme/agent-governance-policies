@@ -219,7 +219,7 @@ batch have no request id to answer and are not echoed.
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. In both modes a reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
-| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `scope-saturated`, `ledger-contention`, `ledger-unavailable`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
+| `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `scope-saturated`, `ledger-contention`, `ledger-unavailable`, `stale-admission`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
 
 ```yaml
 - policyRef:
@@ -318,8 +318,10 @@ must now set `identitySource: trusted-header` and, to keep raw scopes in the res
 
 Every reservation gets an id that is unique on the replica (a random 64-bit per-worker prefix
 and a counter), so a response handled by another worker settles it by id, a creation time and an expiry time
-of creation + `reservationTimeoutMs`. Time is the gateway's own clock, read when the request
-headers arrive and again when the response headers arrive. A reservation ends in exactly one of
+of creation + `reservationTimeoutMs`. Time is the gateway's own clock. A call is admitted at the
+time its request body has been fully received; a bodyless or uninspectable call, which is decided
+at the headers, uses the time its headers arrived. The clock is read again when the response
+headers arrive. A reservation ends in exactly one of
 these states, and the response stamps which one as `settlement=`:
 
 | `settlement=` | When | Effect on the ledger |
@@ -355,6 +357,20 @@ reservation is reclaimed while the call is still running. That frees budget anot
 before the slow call commits late, so the scope can briefly overshoot its budget by the late amount.
 Too long, and a stranded reservation holds budget longer than needed. Overshoot only happens past
 the timeout. Within it the budget holds exactly.
+
+A call that runs for longer than twice the timeout, on a scope that another call touches in the
+meantime, is worse off: its tombstone is dropped before it responds, so it settles `not-active`
+and is **never charged**. Timing from body receipt does not prevent this when the upstream's
+duration depends on what the client sends (a costly query, a large `arguments` payload), so a
+client can still pick calls that outlive their reservation. The undercount lasts until a restart
+with `window: worker-lifetime`, or until the window rolls with `fixed-period`. Set the timeout above
+twice the longest upstream time a client can provoke, not the typical one.
+
+As a guard, both ledger backends refuse to create a reservation whose deadline is already at or
+before the gateway clock, re-read at reserve time (the node ledger reads it from the store, the
+worker ledger from the same gateway clock). Such a call is denied with `reason=stale-admission`
+(`monitor` forwards it and stamps the reason) instead of being admitted with a budget hold that is
+reclaimed at once.
 
 A response that is not one of the normal kinds (`committed`, `released`) writes one log line with
 the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned,
@@ -528,6 +544,15 @@ shows it holding the budget where a naive read-then-write counter breaches), but
 
 **Both backends:**
 
+- **A client that disconnects after the upstream ran is not charged.** Only the response leg
+  settles a reservation. If the client drops the connection after the call has been forwarded,
+  the response never reaches this policy, the reservation is reclaimed at its timeout (counted
+  `expired`, then `abandoned` once its tombstone is dropped), and the call is never charged,
+  although the upstream did the work. A client can do
+  this on purpose: while each such call holds its contribution until it times out, it can run
+  about `aggregateBudget ÷ contribution` uncharged calls every `reservationTimeoutMs`. This build
+  does not change that: a reclaimed reservation cannot tell a call the upstream ran from one it
+  never received. The `expired` and `abandoned` counters in the settlement log line show it.
 - **No signed decision records.** No ledger operation is independently attestable outside the
   gateway. This build makes no claim that its admit/deny decisions are cryptographically
   non-repudiable.
@@ -547,7 +572,7 @@ placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 207 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 209 tests, none of which touch the network or
 Docker:
 
 - **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 55 tests): correctness of
@@ -685,7 +710,8 @@ HTTP mock upstream:
   call, a different agent has an independent budget, an MCP handshake (`initialize`,
   `notifications/initialized`, `tools/list`) passes under `spend-amount` + `block` while only
   `tools/call` is budgeted, and a slow upload over a raw socket (its last body byte held back
-  past twice `reservationTimeoutMs`) still commits, so the next call is refused (#56).
+  past twice `reservationTimeoutMs`) holds its reservation while it is upstream: a second call
+  sent then is refused, the slow call settles `committed`, and the upstream is hit once (#56).
 - **`tests/connected_e2e.rs`** has the real-gateway validation cases from
   `docs/ASTRA-TASK-aggregate-risk-connected.md`. They are `#[ignore]` and are run explicitly.
   They cover:

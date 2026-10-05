@@ -506,15 +506,18 @@ impl Gate {
         Self::from_config_with(
             config,
             |_| Box::new(node_ledger::fake::FakeStore::default()),
+            || 0,
         )
     }
 
     /// Builds the gate. `node_store` opens the shared-data store for the node
     /// ledger: the policy instance's own namespace for `None`, or the named
-    /// shared one.
+    /// shared one. `gateway_clock` is the worker ledger's clock in epoch ms
+    /// (`0` for none); the node ledger reads its store's.
     fn from_config_with(
         config: &Config,
         node_store: impl FnOnce(Option<&str>) -> Box<dyn KvStore>,
+        gateway_clock: impl Fn() -> u64 + 'static,
     ) -> Result<Self> {
         let budget_scope = match config.budget_scope.as_str() {
             "agent" | "fabric" | "tenant" => config.budget_scope.clone(),
@@ -708,11 +711,10 @@ impl Gate {
                     node_ledger::random_prefix(),
                 ))
             } else {
-                Box::new(Ledger::with_limits(
-                    max_scopes,
-                    reservation_timeout_ms,
-                    window,
-                ))
+                Box::new(
+                    Ledger::with_limits(max_scopes, reservation_timeout_ms, window)
+                        .with_clock(gateway_clock),
+                )
             },
         })
     }
@@ -971,6 +973,7 @@ enum DenyReason {
     ScopeSaturated,
     LedgerContention,
     LedgerUnavailable,
+    StaleAdmission,
     Unpriceable,
     OutOfRange,
     BudgetExceeded(Denial),
@@ -986,6 +989,7 @@ impl DenyReason {
             DenyReason::ScopeSaturated => "scope-saturated",
             DenyReason::LedgerContention => "ledger-contention",
             DenyReason::LedgerUnavailable => "ledger-unavailable",
+            DenyReason::StaleAdmission => "stale-admission",
             DenyReason::Unpriceable => "unpriceable",
             DenyReason::OutOfRange => "out-of-range",
             DenyReason::BudgetExceeded(_) => "budget-exceeded",
@@ -1024,6 +1028,9 @@ impl DenyReason {
             DenyReason::LedgerUnavailable => format!(
                 "aggregate risk gate: the shared ledger is unavailable for scope \"{scope}\""
             ),
+            DenyReason::StaleAdmission => format!(
+                "aggregate risk gate: the call's admission time for scope \"{scope}\" is already past its reservation timeout"
+            ),
             DenyReason::Unpriceable => {
                 format!("aggregate risk gate: call could not be priced for scope \"{scope}\"")
             }
@@ -1047,6 +1054,7 @@ fn refusal_label(refusal: &Refusal) -> &'static str {
         Refusal::Saturated => DenyReason::ScopeSaturated.label(),
         Refusal::Contention => DenyReason::LedgerContention.label(),
         Refusal::Unavailable => DenyReason::LedgerUnavailable.label(),
+        Refusal::Stale => DenyReason::StaleAdmission.label(),
     }
 }
 
@@ -1122,6 +1130,7 @@ fn admit(
                     Refusal::Saturated => DenyReason::ScopeSaturated,
                     Refusal::Contention => DenyReason::LedgerContention,
                     Refusal::Unavailable => DenyReason::LedgerUnavailable,
+                    Refusal::Stale => DenyReason::StaleAdmission,
                 };
                 return refuse(gate, reason, &display, echo_bytes);
             }
@@ -1370,19 +1379,26 @@ async fn configure(
     })?;
 
     let clock = std::rc::Rc::new(clock);
-    let gate = Gate::from_config_with(&config, |namespace| {
-        let storage = match namespace {
-            None => store_builder.local(NODE_LEDGER_STORE),
-            Some(namespace) => store_builder
-                .clone()
-                .shared()
-                .local(format!("aggregate-risk-gate-ledger-{namespace}")),
-        };
-        Box::new(PdkStore {
-            storage,
-            clock: clock.clone(),
-        })
-    })?;
+    let gate = Gate::from_config_with(
+        &config,
+        |namespace| {
+            let storage = match namespace {
+                None => store_builder.local(NODE_LEDGER_STORE),
+                Some(namespace) => store_builder
+                    .clone()
+                    .shared()
+                    .local(format!("aggregate-risk-gate-ledger-{namespace}")),
+            };
+            Box::new(PdkStore {
+                storage,
+                clock: clock.clone(),
+            })
+        },
+        {
+            let clock = clock.clone();
+            move || epoch_ms(clock.now())
+        },
+    )?;
     if gate
         .governed_methods
         .iter()
@@ -1427,7 +1443,8 @@ async fn configure(
 mod test {
     use super::*;
     use pdk_unit::{
-        TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse, UnitTestBuilder,
+        FilterChainBuilder, TraceBackend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse,
+        UnitTestBuilder,
     };
     use serde_json::json;
     use std::rc::Rc;
@@ -2907,6 +2924,110 @@ mod test {
         );
     }
 
+    /// Test-only filter for the #56 interleaving: it lets the headers through,
+    /// then holds the call at its body for the milliseconds named in the
+    /// request header its configuration names. Ahead of the gate it is a slow
+    /// upload (the gate sees the headers at once and the body only after the
+    /// hold); behind it, upstream time. A call without the header passes.
+    async fn hold_filter(
+        request_state: RequestState,
+        timer: &pdk::hl::timer::Timer,
+        header: &str,
+    ) -> Flow<()> {
+        let headers_state = request_state.into_headers_state().await;
+        let hold_ms = headers_state
+            .handler()
+            .header(header)
+            .and_then(|value| value.parse::<u64>().ok());
+        let _body_state = headers_state.into_body_state().await;
+        if let Some(hold_ms) = hold_ms {
+            timer.sleep(std::time::Duration::from_millis(hold_ms)).await;
+        }
+        Flow::Continue(())
+    }
+
+    async fn hold_configure(
+        launcher: Launcher,
+        Configuration(bytes): Configuration,
+        clock: Clock,
+    ) -> Result<()> {
+        let header = String::from_utf8(bytes)?;
+        let timer = clock.period(std::time::Duration::from_millis(10));
+        launcher
+            .launch(on_request(|request_state| {
+                hold_filter(request_state, &timer, &header)
+            }))
+            .await?;
+        Ok(())
+    }
+
+    /// #56 at the filter level: a call whose body arrives more than twice the
+    /// reservation timeout after its headers, still upstream when a second
+    /// call reaches the same scope. The gate must admit it at body time so its
+    /// reservation is live while it runs: the second call is refused and the
+    /// first settles committed. Admitting at the header-time instant fails
+    /// this test on both backends.
+    #[test]
+    fn a_slow_upload_is_admitted_at_body_time_and_holds_its_reservation_upstream() {
+        const TIMEOUT_MS: u64 = 1_000;
+        const UPLOAD_MS: u64 = 3 * TIMEOUT_MS;
+        const UPSTREAM_MS: u64 = 500;
+        for backend in ["node", "worker"] {
+            let mut tester = FilterChainBuilder::default()
+                .with_filter("x-test-upload-ms", hold_configure)
+                .with_filter(
+                    config(json!({
+                        "ledgerBackend": backend,
+                        "reservationTimeoutMs": TIMEOUT_MS,
+                        "aggregateBudget": 1,
+                        "fixedWeight": 1,
+                        "window": "worker-lifetime",
+                    })),
+                    super::configure,
+                )
+                .with_filter("x-test-upstream-ms", hold_configure)
+                .with_backend(ok_backend)
+                .build();
+            let mut slow = tester.request_partial(
+                rpc_request(1, "broker-7")
+                    .with_header("x-test-upload-ms", UPLOAD_MS.to_string())
+                    .with_header("x-test-upstream-ms", UPSTREAM_MS.to_string()),
+            );
+            assert!(slow.poll().is_pending());
+            // Past the upload, inside the first call's upstream time.
+            tester.sleep(std::time::Duration::from_millis(
+                UPLOAD_MS + UPSTREAM_MS / 2,
+            ));
+            assert!(
+                slow.poll().is_pending(),
+                "{}: the first call is still upstream",
+                backend
+            );
+            let second = tester.request(rpc_request(2, "broker-7"));
+            assert_eq!(
+                response_error_code(&second),
+                Some(MCP_BLOCKED_CODE),
+                "{}: the first call's reservation is live while it runs",
+                backend
+            );
+            let first = loop {
+                if let std::task::Poll::Ready(response) = slow.poll() {
+                    break response;
+                }
+                tester.tick();
+            };
+            assert_eq!(response_error_code(&first), None, "{}", backend);
+            let stamp = first.header("x-aggregate-risk-gate").unwrap();
+            assert!(stamp.starts_with("allowed;"), "{}: {}", backend, stamp);
+            assert!(
+                stamp.ends_with(";settlement=committed"),
+                "{}: {}",
+                backend,
+                stamp
+            );
+        }
+    }
+
     #[test]
     fn reservation_timeout_must_be_between_one_second_and_one_day() {
         for bad in [0, 999, -1, 86_400_001] {
@@ -3767,7 +3888,7 @@ mod test {
         let store = node_ledger::fake::FakeStore::default();
         let cfg: Config = serde_json::from_str(&config(overrides)).unwrap();
         let handle = store.clone();
-        let gate = Gate::from_config_with(&cfg, move |_| Box::new(handle)).unwrap();
+        let gate = Gate::from_config_with(&cfg, move |_| Box::new(handle), || 0).unwrap();
         (gate, store)
     }
 
@@ -3911,7 +4032,7 @@ mod test {
         let (a, store) = node_gate(json!({}));
         let cfg: Config = serde_json::from_str(&config(json!({}))).unwrap();
         let handle = store.clone();
-        let b = Gate::from_config_with(&cfg, move |_| Box::new(handle)).unwrap();
+        let b = Gate::from_config_with(&cfg, move |_| Box::new(handle), || 0).unwrap();
         let body = tools_call();
         let admitted = (0..10)
             .filter(|i| {
@@ -4000,10 +4121,14 @@ mod test {
         let seen = std::cell::RefCell::new(Vec::new());
         for namespace in ["", "team-a"] {
             cfg.ledger_namespace = namespace.to_string();
-            Gate::from_config_with(&cfg, |ns| {
-                seen.borrow_mut().push(ns.map(str::to_string));
-                Box::new(node_ledger::fake::FakeStore::default())
-            })
+            Gate::from_config_with(
+                &cfg,
+                |ns| {
+                    seen.borrow_mut().push(ns.map(str::to_string));
+                    Box::new(node_ledger::fake::FakeStore::default())
+                },
+                || 0,
+            )
             .unwrap();
         }
         assert_eq!(*seen.borrow(), vec![None, Some("team-a".to_string())]);

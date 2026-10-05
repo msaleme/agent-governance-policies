@@ -132,7 +132,10 @@ spec:
       minimum: 1000
       maximum: 86400000
       description: >-
-        How long, in milliseconds, a reservation may stay unsettled. A request
+        How long, in milliseconds, a reservation may stay unsettled. The
+        timeout starts when the request body has been fully received (for a
+        bodyless or uninspectable call, when its headers arrived), not when
+        the headers of a call with a body arrived. A request
         whose response never reaches this policy (client disconnect,
         cancellation, upstream timeout without a response) leaves its
         reservation held; after this timeout the reservation is reclaimed and
@@ -350,7 +353,7 @@ spec:
         budget=3000;unit=points" (or "reason=missing-identity",
         "reason=invalid-identity", "reason=scope-capacity", "reason=scope-saturated",
         "reason=ledger-contention", "reason=ledger-unavailable",
-        "reason=unpriceable", or "reason=out-of-range" for the non-budget deny
+        "reason=stale-admission", "reason=unpriceable", or "reason=out-of-range" for the non-budget deny
         reasons); on an ungoverned message (see governedMethods),
         "pass;reason=ungoverned-method". The scope is shown per scopeDisclosure; the examples use
         "raw". All amounts are exact integers; unit is "points"

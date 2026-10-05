@@ -433,6 +433,19 @@ pub enum Refusal {
     /// The scope already holds `MAX_HELD` reservations and tombstones.
     /// Nothing was reserved.
     Saturated,
+    /// The call's `now` is so far behind the gateway clock that its
+    /// reservation would already be past its deadline (#56). Nothing was
+    /// reserved.
+    Stale,
+}
+
+/// Whether a reservation made at `now` would already be past its deadline by
+/// the gateway clock `clock`, re-read at reserve time (`0` means no clock). Such
+/// a reservation is never created: it would be reclaimed before its call was
+/// even forwarded, freeing its budget for the next call while the call still
+/// runs (#56).
+pub(crate) fn expired_on_arrival(now: u64, ttl: u64, clock: u64) -> bool {
+    clock != 0 && now.saturating_add(ttl) <= clock
 }
 
 #[cfg(test)]
@@ -551,10 +564,6 @@ struct Inner {
     idle_index: BTreeSet<(u64, String)>,
     next_id: ReservationId,
     stats: LedgerStats,
-    /// The latest time this ledger has seen. A call's `now` is floored to it,
-    /// so a stale instant can never create a reservation whose deadline has
-    /// already passed (#56).
-    clock: u64,
     /// How many scope states the capacity path has examined.
     #[cfg(test)]
     examined: u64,
@@ -624,12 +633,20 @@ impl Inner {
 /// refused. Live enforcement state is never evicted, so the cap can never be
 /// used to reset another scope's running total, and a refusal at the cap costs
 /// O(log n), not a scan of every scope.
-pub struct Ledger {
+pub struct Ledger<C = fn() -> u64> {
     inner: Mutex<Inner>,
     max_scopes: usize,
     ttl: u64,
     /// Fixed window length in ms; `None` accumulates for the worker's life.
     window: Option<u64>,
+    /// The gateway clock in epoch ms, re-read at reserve time; `0` means "no
+    /// clock" (see `expired_on_arrival`).
+    clock: C,
+}
+
+/// The clock of a ledger built without one.
+fn no_clock() -> u64 {
+    0
 }
 
 /// The default reservation lifetime used by tests of the budget arithmetic.
@@ -661,16 +678,29 @@ impl Ledger {
                 idle_index: BTreeSet::new(),
                 next_id: 1,
                 stats: LedgerStats::default(),
-                clock: 0,
                 #[cfg(test)]
                 examined: 0,
             }),
             max_scopes,
             ttl,
             window,
+            clock: no_clock,
         }
     }
 
+    /// The same ledger, reading the gateway clock through `clock`.
+    pub fn with_clock<C: Fn() -> u64>(self, clock: C) -> Ledger<C> {
+        Ledger {
+            inner: self.inner,
+            max_scopes: self.max_scopes,
+            ttl: self.ttl,
+            window: self.window,
+            clock,
+        }
+    }
+}
+
+impl<C: Fn() -> u64> Ledger<C> {
     fn period(&self, now: u64) -> u64 {
         period(self.window, now)
     }
@@ -689,18 +719,15 @@ impl Ledger {
     /// Runs `f` on `scope`'s state, creating it if needed, after reclaiming
     /// its expired reservations. Returns `AtCapacity`, without running `f`,
     /// if `scope` is new and there is no room for it. The capacity check, any
-    /// reclamation or eviction, and `f` all happen under one lock. `f` gets
-    /// `now` floored to the latest time the ledger has seen.
+    /// reclamation or eviction, and `f` all happen under one lock.
     fn with_state<R>(
         &self,
         scope: &str,
         now: u64,
-        f: impl FnOnce(&mut ScopeState, &mut ReservationId, &mut LedgerStats, u64) -> Result<R, Refusal>,
+        f: impl FnOnce(&mut ScopeState, &mut ReservationId, &mut LedgerStats) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
         let mut guard = self.lock();
         let inner = &mut *guard;
-        inner.clock = inner.clock.max(now);
-        let now = inner.clock;
         let period = self.period(now);
         if !inner.scopes.contains_key(scope)
             && inner.scopes.len() >= self.max_scopes
@@ -711,9 +738,17 @@ impl Ledger {
         let state = inner.scopes.entry(scope.to_string()).or_default();
         state.roll(period);
         count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
-        let result = f(state, &mut inner.next_id, &mut inner.stats, now);
+        let result = f(state, &mut inner.next_id, &mut inner.stats);
         inner.reindex(scope, self.ttl, self.window);
         result
+    }
+
+    /// Refuses a reservation that would already be past its deadline.
+    fn check_fresh(&self, now: u64) -> Result<(), Refusal> {
+        if expired_on_arrival(now, self.ttl, (self.clock)()) {
+            return Err(Refusal::Stale);
+        }
+        Ok(())
     }
 
     /// Adds a new active reservation to `state`.
@@ -740,8 +775,6 @@ impl Ledger {
     fn settle(&self, reservation: &Reservation, now: u64, commit: bool) -> Settlement {
         let mut guard = self.lock();
         let inner = &mut *guard;
-        inner.clock = inner.clock.max(now);
-        let now = inner.clock;
         if let Some(outcome) = settle_free(&mut inner.stats, reservation, commit) {
             return outcome;
         }
@@ -814,7 +847,7 @@ pub(crate) fn count_settlement(stats: &mut LedgerStats, outcome: Settlement) {
     }
 }
 
-impl LedgerStore for Ledger {
+impl<C: Fn() -> u64> LedgerStore for Ledger<C> {
     fn reserve(
         &self,
         scope: &str,
@@ -822,7 +855,8 @@ impl LedgerStore for Ledger {
         budget: u64,
         now: u64,
     ) -> Result<Reservation, Refusal> {
-        self.with_state(scope, now, |state, next_id, stats, now| {
+        self.check_fresh(now)?;
+        self.with_state(scope, now, |state, next_id, stats| {
             state.check(scope, contribution, budget)?;
             self.hold(state, next_id, stats, scope, contribution, now)
         })
@@ -834,7 +868,8 @@ impl LedgerStore for Ledger {
         contribution: u64,
         now: u64,
     ) -> Result<Reservation, Refusal> {
-        self.with_state(scope, now, |state, next_id, stats, now| {
+        self.check_fresh(now)?;
+        self.with_state(scope, now, |state, next_id, stats| {
             self.hold(state, next_id, stats, scope, contribution, now)
         })
     }
@@ -846,7 +881,8 @@ impl LedgerStore for Ledger {
         budget: u64,
         now: u64,
     ) -> Result<(Reservation, bool), Refusal> {
-        self.with_state(scope, now, |state, next_id, stats, now| {
+        self.check_fresh(now)?;
+        self.with_state(scope, now, |state, next_id, stats| {
             let reservation = self.hold(state, next_id, stats, scope, contribution, now)?;
             let breached = reservation.total > budget;
             Ok((reservation, breached))
@@ -862,7 +898,7 @@ impl LedgerStore for Ledger {
     }
 
     fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal> {
-        self.with_state(scope, now, |state, _, _, _| {
+        self.with_state(scope, now, |state, _, _| {
             state.record(contribution);
             Ok(())
         })
@@ -1850,28 +1886,38 @@ mod test {
     }
 
     #[test]
-    fn a_stale_now_never_creates_a_reservation_that_is_already_expired() {
-        // #56: the request read its clock long before it reached the ledger
-        // (a slow upload). The ledger has already seen a later time.
-        let ledger = Ledger::new();
-        let later = 10 * TEST_TTL;
-        ledger.record("other", 0, later).unwrap();
-        let r = ledger.reserve("s", 1, 1, 0).unwrap();
-        assert!(r.expires_at > later, "the deadline is still ahead");
-        assert_eq!(r.expires_at, later + TEST_TTL);
-        // So it holds the budget for the next call, at the ledger's time...
+    fn a_reservation_already_past_its_deadline_is_never_created() {
+        // #56: a call whose `now` lags the gateway clock by a full timeout
+        // (it was read before a slow upload finished) is refused, on every
+        // reserving path, and nothing is held.
+        let clock = std::rc::Rc::new(std::cell::Cell::new(10 * TEST_TTL));
+        let ledger = Ledger::with_limits(usize::MAX, TEST_TTL, None).with_clock({
+            let clock = clock.clone();
+            move || clock.get()
+        });
+        let stale = 10 * TEST_TTL - TEST_TTL;
+        assert_eq!(ledger.reserve("s", 1, 1, stale), Err(Refusal::Stale));
+        assert_eq!(ledger.force_reserve("s", 1, stale), Err(Refusal::Stale));
+        assert_eq!(
+            ledger.force_reserve_checked("s", 1, 1, stale),
+            Err(Refusal::Stale)
+        );
+        assert_eq!(ledger.scope_count(), 0, "nothing was held");
+        // One millisecond fresher and the deadline is still ahead.
+        let r = ledger.reserve("s", 1, 1, stale + 1).unwrap();
+        assert_eq!(r.expires_at, clock.get() + 1);
         assert!(matches!(
-            ledger.reserve("s", 1, 1, later + 1),
+            ledger.reserve("s", 1, 1, clock.get()),
             Err(Refusal::OverBudget(_))
         ));
-        // ...and the forced paths are floored the same way.
-        let (forced, _) = ledger.force_reserve_checked("t", 1, 1, 0).unwrap();
-        assert_eq!(forced.expires_at, later + 1 + TEST_TTL);
-        assert_eq!(
-            ledger.force_reserve("u", 1, 0).unwrap().created_at,
-            later + 1
-        );
-        // It settles normally, not as expired or untracked.
-        assert_eq!(ledger.commit(&r, later + 2), Settlement::Committed);
+        assert_eq!(ledger.commit(&r, clock.get()), Settlement::Committed);
+    }
+
+    #[test]
+    fn a_ledger_without_a_clock_takes_the_callers_now() {
+        // No gateway clock (`0`): the guard cannot tell, and stays out of
+        // the way, as for every other test in this module.
+        let ledger = Ledger::new();
+        assert!(ledger.reserve("s", 1, 1, 0).is_ok());
     }
 }
