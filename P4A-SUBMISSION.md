@@ -4,7 +4,7 @@ Prepared 2026-09-24. Updated 2026-09-25: the visibility blocker was resolved,
 reviewer findings #1–#7 were resolved and merged, and connected verification was
 complete. Updated 2026-10-03: aggregate-risk findings #14–#18 were resolved and
 closed, and source prerelease `v0.1.0-rc.1` was cut. Updated 2026-10-04: the re-review at
-`v0.1.0-rc.1` opened #47–#52; the fixes are described per policy below. #47–#52 were fixed, merged and closed, and source prerelease `v0.1.0-rc.2` was cut. Turnkey pack for submitting the two policies in this repo to the
+`v0.1.0-rc.1` opened #47–#52; the fixes are described per policy below. #47–#52 were fixed, merged and closed, and source prerelease `v0.1.0-rc.2` was cut. Updated 2026-10-05: a runtime review opened #56–#58; all three were fixed, merged and closed, and source prerelease `v0.1.0-rc.3` was cut. Turnkey pack for submitting the two policies in this repo to the
 **P4A (Policies for Agents)** marketplace, mirroring the path the three published
 `agent-decoy-policies` siblings took. Submission itself is **UI-gated** (the P4A wizard) —
 this doc is everything a human needs to drive it; nothing here submits automatically.
@@ -135,7 +135,8 @@ excludes all Flex identity material). No further visibility action is required t
    publish/build fixes #23 and #26; per-finding resolution table above), and the policy has been
    verified connected on a real gateway — so expect fewer round-trips. #1–#7 and #14–#18 are all
    closed. His re-review at `v0.1.0-rc.1` opened #47–#52; all six are fixed, merged and closed,
-   and source prerelease `v0.1.0-rc.2` carries the fixes for his re-review.
+   and source prerelease `v0.1.0-rc.2` carries the fixes for his re-review. A later runtime review
+   opened #56–#58, fixed in source prerelease `v0.1.0-rc.3`.
 
 ## Not claimed
 No P4A submission, acceptance, dashboard ID, or publication is asserted here — those come from an actual
