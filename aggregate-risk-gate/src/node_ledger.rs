@@ -191,8 +191,9 @@ pub trait KvStore {
     fn keys(&self) -> Result<Vec<String>, StoreError>;
     /// The current time in epoch milliseconds, read at the moment of the
     /// call. The tombstone protocol uses it instead of the request's `now`,
-    /// which may be older (it is read before the body is buffered). `0`
-    /// means "no clock" and leaves the caller's `now` in force.
+    /// which may be older (another worker may have written since), and a new
+    /// reservation never starts before it (#56). `0` means "no clock" and
+    /// leaves the caller's `now` in force.
     fn now(&self) -> u64 {
         0
     }
@@ -987,6 +988,9 @@ impl LedgerStore for NodeLedger {
         budget: u64,
         now: u64,
     ) -> Result<Reservation, Refusal> {
+        // A reservation's deadline never starts before the store clock, so a
+        // stale `now` cannot create one that is already expired (#56).
+        let now = now.max(self.store.now());
         let id = self.next_id();
         let reservation = self.mutate(scope, now, |state| {
             state.check(scope, contribution, budget)?;
@@ -1015,6 +1019,7 @@ impl LedgerStore for NodeLedger {
         budget: u64,
         now: u64,
     ) -> Result<(Reservation, bool), Refusal> {
+        let now = now.max(self.store.now());
         let id = self.next_id();
         let reservation = self.mutate(scope, now, |state| {
             state.hold(id, scope, contribution, now, self.ttl)
@@ -2081,5 +2086,30 @@ mod test {
         // The ledger never writes an empty host value: even an empty `Vec`
         // encodes to its 8-byte length prefix.
         assert_eq!(serde_fixint::to_vec(&Vec::<u8>::new()).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn a_stale_now_never_creates_a_reservation_that_is_already_expired() {
+        // #56: the request read its clock long before it reached the ledger
+        // (a slow upload); the store clock is the real time.
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let b = worker(&store, 2);
+        let later = 10 * TTL;
+        store.set_now(later);
+        let r = a.reserve("s", 1, 1, 0).unwrap();
+        assert_eq!(r.created_at, later);
+        assert_eq!(r.expires_at, later + TTL, "the deadline is still ahead");
+        // So it holds the budget for the next call, on any worker...
+        assert!(matches!(
+            b.reserve("s", 1, 1, later + 1),
+            Err(Refusal::OverBudget(_))
+        ));
+        // ...and the forced path is floored the same way.
+        let (forced, _) = a.force_reserve_checked("t", 1, 1, 0).unwrap();
+        assert_eq!(forced.expires_at, later + TTL);
+        // It settles normally, not as expired or untracked.
+        assert_eq!(a.commit(&r, later + 2), Settlement::Committed);
+        assert_eq!(b.snapshot("s").committed, 1);
     }
 }

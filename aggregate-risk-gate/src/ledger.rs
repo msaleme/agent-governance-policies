@@ -551,6 +551,10 @@ struct Inner {
     idle_index: BTreeSet<(u64, String)>,
     next_id: ReservationId,
     stats: LedgerStats,
+    /// The latest time this ledger has seen. A call's `now` is floored to it,
+    /// so a stale instant can never create a reservation whose deadline has
+    /// already passed (#56).
+    clock: u64,
     /// How many scope states the capacity path has examined.
     #[cfg(test)]
     examined: u64,
@@ -657,6 +661,7 @@ impl Ledger {
                 idle_index: BTreeSet::new(),
                 next_id: 1,
                 stats: LedgerStats::default(),
+                clock: 0,
                 #[cfg(test)]
                 examined: 0,
             }),
@@ -684,15 +689,18 @@ impl Ledger {
     /// Runs `f` on `scope`'s state, creating it if needed, after reclaiming
     /// its expired reservations. Returns `AtCapacity`, without running `f`,
     /// if `scope` is new and there is no room for it. The capacity check, any
-    /// reclamation or eviction, and `f` all happen under one lock.
+    /// reclamation or eviction, and `f` all happen under one lock. `f` gets
+    /// `now` floored to the latest time the ledger has seen.
     fn with_state<R>(
         &self,
         scope: &str,
         now: u64,
-        f: impl FnOnce(&mut ScopeState, &mut ReservationId, &mut LedgerStats) -> Result<R, Refusal>,
+        f: impl FnOnce(&mut ScopeState, &mut ReservationId, &mut LedgerStats, u64) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        inner.clock = inner.clock.max(now);
+        let now = inner.clock;
         let period = self.period(now);
         if !inner.scopes.contains_key(scope)
             && inner.scopes.len() >= self.max_scopes
@@ -703,7 +711,7 @@ impl Ledger {
         let state = inner.scopes.entry(scope.to_string()).or_default();
         state.roll(period);
         count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
-        let result = f(state, &mut inner.next_id, &mut inner.stats);
+        let result = f(state, &mut inner.next_id, &mut inner.stats, now);
         inner.reindex(scope, self.ttl, self.window);
         result
     }
@@ -732,6 +740,8 @@ impl Ledger {
     fn settle(&self, reservation: &Reservation, now: u64, commit: bool) -> Settlement {
         let mut guard = self.lock();
         let inner = &mut *guard;
+        inner.clock = inner.clock.max(now);
+        let now = inner.clock;
         if let Some(outcome) = settle_free(&mut inner.stats, reservation, commit) {
             return outcome;
         }
@@ -812,7 +822,7 @@ impl LedgerStore for Ledger {
         budget: u64,
         now: u64,
     ) -> Result<Reservation, Refusal> {
-        self.with_state(scope, now, |state, next_id, stats| {
+        self.with_state(scope, now, |state, next_id, stats, now| {
             state.check(scope, contribution, budget)?;
             self.hold(state, next_id, stats, scope, contribution, now)
         })
@@ -824,7 +834,7 @@ impl LedgerStore for Ledger {
         contribution: u64,
         now: u64,
     ) -> Result<Reservation, Refusal> {
-        self.with_state(scope, now, |state, next_id, stats| {
+        self.with_state(scope, now, |state, next_id, stats, now| {
             self.hold(state, next_id, stats, scope, contribution, now)
         })
     }
@@ -836,7 +846,7 @@ impl LedgerStore for Ledger {
         budget: u64,
         now: u64,
     ) -> Result<(Reservation, bool), Refusal> {
-        self.with_state(scope, now, |state, next_id, stats| {
+        self.with_state(scope, now, |state, next_id, stats, now| {
             let reservation = self.hold(state, next_id, stats, scope, contribution, now)?;
             let breached = reservation.total > budget;
             Ok((reservation, breached))
@@ -852,7 +862,7 @@ impl LedgerStore for Ledger {
     }
 
     fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal> {
-        self.with_state(scope, now, |state, _, _| {
+        self.with_state(scope, now, |state, _, _, _| {
             state.record(contribution);
             Ok(())
         })
@@ -1837,5 +1847,31 @@ mod test {
         // ...until they are dropped one ttl later.
         assert!(ledger.reserve("s", 1, u64::MAX, 2 * TEST_TTL).is_ok());
         assert_eq!(ledger.commit(&held[0], 2 * TEST_TTL), Settlement::NotActive);
+    }
+
+    #[test]
+    fn a_stale_now_never_creates_a_reservation_that_is_already_expired() {
+        // #56: the request read its clock long before it reached the ledger
+        // (a slow upload). The ledger has already seen a later time.
+        let ledger = Ledger::new();
+        let later = 10 * TEST_TTL;
+        ledger.record("other", 0, later).unwrap();
+        let r = ledger.reserve("s", 1, 1, 0).unwrap();
+        assert!(r.expires_at > later, "the deadline is still ahead");
+        assert_eq!(r.expires_at, later + TEST_TTL);
+        // So it holds the budget for the next call, at the ledger's time...
+        assert!(matches!(
+            ledger.reserve("s", 1, 1, later + 1),
+            Err(Refusal::OverBudget(_))
+        ));
+        // ...and the forced paths are floored the same way.
+        let (forced, _) = ledger.force_reserve_checked("t", 1, 1, 0).unwrap();
+        assert_eq!(forced.expires_at, later + 1 + TEST_TTL);
+        assert_eq!(
+            ledger.force_reserve("u", 1, 0).unwrap().created_at,
+            later + 1
+        );
+        // It settles normally, not as expired or untracked.
+        assert_eq!(ledger.commit(&r, later + 2), Settlement::Committed);
     }
 }

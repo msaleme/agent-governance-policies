@@ -1237,7 +1237,8 @@ async fn request_filter(
     violations: &PolicyViolations,
 ) -> Flow<Ticket> {
     let headers_state = request_state.into_headers_state().await;
-    // The admission instant: a reservation's timeout runs from here.
+    // The admission instant for a call decided at the header phase. A call
+    // whose body is buffered re-reads the clock once the body is in (#56).
     let now = epoch_ms(clock.now());
     // Resolved at the header phase, before any body is buffered.
     let identity = gate.identity(
@@ -1255,6 +1256,12 @@ async fn request_filter(
         return decide(identity, now, gate, RawBody::Uninspectable, violations);
     }
     let state = headers_state.into_headers_body_state().await;
+    // The admission instant: a reservation's timeout runs from here, once the
+    // whole body has arrived. Reading it at the header phase would let a
+    // client that holds back its last body byte past `reservationTimeoutMs`
+    // get a reservation that is already expired, and so is reclaimed before
+    // the call is even forwarded (#56).
+    let now = epoch_ms(clock.now());
     let body = state.handler().body();
     // Defense in depth: a Content-Length that undersold the real body size
     // must not smuggle an oversized body past the header-phase gate above.

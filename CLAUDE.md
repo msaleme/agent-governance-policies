@@ -38,7 +38,7 @@ cargo +1.89.0 build --release --target wasm32-wasip1 --locked
 ```
 
 The `--lib` test suite is the authoritative gate, at 97 tests for approval binding
-and 205 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
+and 207 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
 those counts. CI's `runtime-e2e` job runs the aggregate-risk `#[pdk_test]` suites
 on a real Flex Gateway 1.14.0 container. Its `case2c` is run by hand. Regenerate config assets with the
 Makefile (`make build-asset-files`) after changing `definition/gcl.yaml`.

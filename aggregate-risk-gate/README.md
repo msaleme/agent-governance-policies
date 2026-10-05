@@ -347,8 +347,10 @@ after the timeout instead of pinning the budget for the life of the worker.
 Settling by id means a duplicate or reordered response cannot commit or release twice, a commit
 after a release changes nothing, and a release after a commit cannot take back committed exposure.
 
-**Choosing the timeout.** Set `reservationTimeoutMs` above the longest time a governed call can
-legitimately take, including upstream and gateway timeouts. Too short, and a slow call's
+**Choosing the timeout.** The timeout runs from when the gateway has received the whole request
+body, not from when the headers arrived, so a client cannot shorten its own reservation by
+uploading slowly (#56). Set `reservationTimeoutMs` above the longest time a governed call can
+legitimately take from then, including upstream and gateway timeouts. Too short, and a slow call's
 reservation is reclaimed while the call is still running. That frees budget another call can take
 before the slow call commits late, so the scope can briefly overshoot its budget by the late amount.
 Too long, and a stranded reservation holds budget longer than needed. Overshoot only happens past
@@ -545,7 +547,7 @@ placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 205 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 207 tests, none of which touch the network or
 Docker:
 
 - **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 55 tests): correctness of
@@ -679,10 +681,11 @@ Docker:
 Two Docker suites run the policy through a real, containerized Flex Gateway 1.14.0 with a real
 HTTP mock upstream:
 
-- **`tests/requests.rs`** has three `pdk_test` cases: sequential composition refuses the fourth
-  call, a different agent has an independent budget, and an MCP handshake (`initialize`,
+- **`tests/requests.rs`** has four `pdk_test` cases: sequential composition refuses the fourth
+  call, a different agent has an independent budget, an MCP handshake (`initialize`,
   `notifications/initialized`, `tools/list`) passes under `spend-amount` + `block` while only
-  `tools/call` is budgeted.
+  `tools/call` is budgeted, and a slow upload over a raw socket (its last body byte held back
+  past twice `reservationTimeoutMs`) still commits, so the next call is refused (#56).
 - **`tests/connected_e2e.rs`** has the real-gateway validation cases from
   `docs/ASTRA-TASK-aggregate-risk-connected.md`. They are `#[ignore]` and are run explicitly.
   They cover:

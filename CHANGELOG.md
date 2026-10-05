@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Aggregate-Risk Gate
+
+- **A slow upload can no longer expire its own reservation (#56).** The admission time was read
+  when the request headers arrived, before the body was buffered. A client that held back its last
+  body byte for longer than `reservationTimeoutMs` got a reservation that had already expired. It
+  was reclaimed before the call was forwarded, so the next call was admitted, and the slow call's
+  commit settled not-active: a permanent undercount. The admission time is now read once the body
+  is fully received (bodyless and uninspectable calls keep the header-time reading). As a guard,
+  both ledger backends floor a new reservation's start time to the latest time they have seen (the
+  worker ledger) or to the store clock (the node ledger), so a stale time can never create a
+  reservation whose deadline has already passed. A new `pdk_test` reproduces the slow upload over a
+  raw socket.
+
 ## 0.1.0-rc.2 — 2026-10-04
 
 Fixes from the P4A re-review of `v0.1.0-rc.1` (#47–#52).
