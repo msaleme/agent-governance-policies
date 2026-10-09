@@ -2534,7 +2534,10 @@ fn rc4_nonce_is_bounded_in_bytes_and_malformed_above_limit() {
     }
 }
 #[test]
-fn rc4_nonce_namespaces_issuers_and_still_refuses_replay() {
+fn rc4_nonce_reuse_across_issuers_is_a_p6_replay() {
+    // The key is not namespaced by issuer: the attestation list is
+    // caller-controlled, so issuer-namespacing reopens subset replays. A second
+    // issuer reusing a nonce is denied (fail closed), not allowed.
     let other = "second-approver";
     let (backend, mut tester) = harness!(config_with(json!({
         "requiredPredicates":["P1","P2","P4","P5","P6"],
@@ -2543,7 +2546,7 @@ fn rc4_nonce_namespaces_issuers_and_still_refuses_replay() {
     let args = json!({"replicas":3});
     let body = jsonrpc_call(1, "deploy.apply", args.clone());
     let deadline = far_future();
-    for (issuer, allowed) in [(APPROVER, true), (other, true), (APPROVER, false)] {
+    for (issuer, allowed) in [(APPROVER, true), (other, false), (APPROVER, false)] {
         let mut envelope = sound_approval("deploy.apply", &args, "same-nonce", &deadline);
         envelope["attestations"][0]["authority"] = json!(issuer);
         envelope["attestations"][0]["mac"] = json!(mcp_v1_mac(
@@ -2567,6 +2570,52 @@ fn rc4_nonce_namespaces_issuers_and_still_refuses_replay() {
             assert!(backend.next().is_none());
         }
     }
+}
+#[test]
+fn rc4_subset_replay_of_multi_attester_approval_is_p6_denied() {
+    let other = "second-approver";
+    let other_key = "second-approver-key-0123456789abcdXY";
+    let (backend, mut tester) = harness!(config_with(json!({
+        "requiredPredicates":["P1","P2","P4","P5","P6"],
+        "attesterKeys":[attester(APPROVER, APPROVER_KEY),attester(other, other_key)]
+    })));
+    let args = json!({"replicas":3});
+    let body = jsonrpc_call(1, "deploy.apply", args.clone());
+    let deadline = far_future();
+    let mut envelope = sound_approval("deploy.apply", &args, "dual-nonce", &deadline);
+    let mut second = envelope["attestations"][0].clone();
+    second["authority"] = json!(other);
+    second["mac"] = json!(mcp_v1_mac(
+        other_key.as_bytes(),
+        other,
+        EXECUTOR,
+        "deploy.apply",
+        &digest_value(&args).unwrap(),
+        &deadline,
+        "dual-nonce"
+    ));
+    envelope["attestations"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+
+    let first = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(first.body(), OK_BODY, "dual-attested first use is allowed");
+    assert!(backend.next().is_some());
+
+    // Replay the same approval with the second attestation dropped: the
+    // remaining MAC still passes P5, so only the nonce key can catch it.
+    envelope["attestations"].as_array_mut().unwrap().pop();
+    let replay = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(
+        replay.header("x-approval-binding"),
+        Some("denied;predicate=P6"),
+        "a subset replay is a P6 replay"
+    );
+    assert!(
+        backend.next().is_none(),
+        "a subset replay must not reach upstream"
+    );
 }
 #[test]
 fn rc4_header_envelope_stripping_respects_flag_in_both_modes() {

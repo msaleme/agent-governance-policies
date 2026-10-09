@@ -381,7 +381,8 @@ Further honest limitations, disclosed rather than hidden:
   **Recommendation: deploy a single gateway replica for flows that require P6**, and treat a
   restart as reopening unexpired approvals. The follow-up for a global guarantee is
   `remote()` storage with a TTL ≥ the maximum approval lifetime + `clockSkewSeconds`, keys
-  namespaced by issuer — it is not in this build (#51).
+  namespaced by audience, tenant and environment (not by issuer; see the rc.4 nonce
+  details below) — it is not in this build (#51).
 - **Reserved P6 nonces are bounded by an approximate cap, not a TTL (#51).** `local()` has no TTL,
   so the policy bounds the store itself. Each reservation records the nonce's expiry, and the normal
   path is a `get` of the nonce key followed by a single atomic `store(nonce, Absent, …)`. Only the
@@ -600,10 +601,12 @@ The PDK provides provides a set of example policy projects to get started creati
 `approval.nonce` is limited to 128 UTF-8 bytes; longer values receive the existing
 malformed-approval verdict. P6 keys are SHA-256 hashes of a domain-separated,
 length-prefixed tuple: the configured expected audience, tenant and environment,
-the sorted unique `authority` values of approval attestations (the `mcp-v1` issuers),
-and the nonce. Attestation order and duplicate authorities do not create another
-nonce namespace. P5 authenticates these fields; without P5 the startup warning
-applies. The key format changes at rc.4; existing raw-nonce reservations are not
+and the nonce. Attestation authorities are deliberately not part of the key: the
+attestation list is caller-controlled, so an issuer-namespaced key would let a
+multi-attested approval be replayed with an attestation dropped (the remaining MACs
+still pass P5). Two issuers that choose the same nonce therefore share one
+reservation, and the second use is denied under P6 (fail closed). Without P5 the
+nonce itself is unauthenticated, as the startup warning states. The key format changes at rc.4; existing raw-nonce reservations are not
 migrated, so treat rollout as a reset of the documented per-replica single-use
 state and let outstanding approvals expire before upgrading.
 

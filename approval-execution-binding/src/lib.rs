@@ -1393,9 +1393,12 @@ enum ReserveRefusal {
     Unavailable,
 }
 
-/// Fixed-size, domain-separated storage key. Issuers are the sorted unique
-/// authorities of approval attestations; P5 authenticates every such authority.
-/// Without P5 these fields remain caller-asserted, as the startup warning states.
+/// Fixed-size, domain-separated storage key over audience, tenant, environment
+/// and nonce. Attestation authorities are deliberately NOT part of the key: the
+/// attestation list is caller-controlled, so a dual-attested approval replayed
+/// with one attestation dropped would otherwise get a fresh key while the
+/// remaining MAC still passes P5. Two issuers that pick the same nonce therefore
+/// share one reservation; the second use is a P6 denial (fail closed).
 fn nonce_storage_key(binding: &Binding, envelope: &Envelope) -> Option<String> {
     use sha2::Digest;
     let nonce = envelope
@@ -1403,26 +1406,14 @@ fn nonce_storage_key(binding: &Binding, envelope: &Envelope) -> Option<String> {
         .nonce
         .as_deref()
         .filter(|n| !n.is_empty() && n.len() <= MAX_NONCE_BYTES)?;
-    let mut issuers: Vec<&str> = envelope
-        .attestations
-        .iter()
-        .filter(|a| a.claim.as_deref() == Some("approval"))
-        .map(|a| a.authority.as_str())
-        .collect();
-    issuers.sort_unstable();
-    issuers.dedup();
     let mut digest = Sha256::new();
     digest.update(b"approval-nonce-v1");
     for field in [
-        &binding.expected_audience,
-        &binding.expected_tenant,
-        &binding.expected_environment,
+        binding.expected_audience.as_str(),
+        binding.expected_tenant.as_str(),
+        binding.expected_environment.as_str(),
+        nonce,
     ] {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field.as_bytes());
-    }
-    digest.update((issuers.len() as u64).to_be_bytes());
-    for field in issuers.into_iter().chain(std::iter::once(nonce)) {
         digest.update((field.len() as u64).to_be_bytes());
         digest.update(field.as_bytes());
     }

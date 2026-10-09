@@ -8,8 +8,10 @@
   bytes receive the malformed-approval verdict. P6 without P5 remains accepted
   with a warning because callers can mint unauthenticated nonces.
 - Replace the request-path panic with the existing framing refusal. Namespace P6
-  keys with SHA-256 over length-prefixed issuer authorities, audience, tenant,
-  environment and nonce; retain reservations through the extra boundary second.
+  keys with SHA-256 over length-prefixed audience, tenant, environment and nonce;
+  retain reservations through the extra boundary second. Issuers are deliberately
+  excluded (an issuer-namespaced key allowed a subset-attestation replay), so two
+  issuers reusing one nonce get a fail-closed P6 denial.
   The key-format change resets recognition of old raw-nonce reservations: let
   outstanding approvals expire before upgrading.
 - Strip evaluated header-mode approval envelopes in block and monitor modes when

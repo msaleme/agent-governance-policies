@@ -803,8 +803,13 @@ impl NodeLedger {
                                 }
                                 break;
                             }
-                            Err(StoreError::Failed) => break,
+                            // Unsaved: still schedule a rescan for this record.
+                            Err(StoreError::Failed) => {
+                                next_idle = next_idle.min(idle_at);
+                                break;
+                            }
                             Err(StoreError::CasMismatch) => {
+                                next_idle = next_idle.min(idle_at);
                                 let Ok(Some((bytes, cas))) = self.store.get(key) else {
                                     break;
                                 };
@@ -2213,7 +2218,7 @@ mod test {
         }
         assert_eq!(a.pending(), 0);
         // Stale slot accounting is separate; it must no longer be queue contention.
-        assert_ne!(a.reserve("new", 1, 10, 3), Err(Refusal::Contention));
+        assert_eq!(a.reserve("new", 1, 10, 3), Err(Refusal::AtCapacity));
     }
 
     #[test]
