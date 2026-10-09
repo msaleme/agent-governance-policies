@@ -1224,15 +1224,8 @@ fn decide(
     if gate.mode == Mode::Block {
         refuse(gate, reason, &display, echo_bytes)
     } else {
-        // Monitor mode: the call still happened, so it is recorded (at a zero
-        // contribution — its real exposure is unknown or unrepresentable, not
-        // zero, but there is nothing exact to charge) so the scope shows up in
-        // the ledger and an operator can see the gap; the gap itself is made
-        // visible on the header rather than silently inflating or deflating the
-        // running total. At the scope cap, or if the shared ledger is
-        // contended or unavailable, nothing is recorded; the stamp already
-        // flags the call.
-        let _ = gate.ledger.record(&scope, 0, now);
+        // Unknown exposure is visible in the verdict, but a zero-cost record
+        // would consume a scope slot without accounting for that exposure.
         let stamp = format!("monitor;scope={display};reason={}", reason.label());
         Flow::Continue(Ticket::None(stamp))
     }
@@ -1417,6 +1410,9 @@ async fn configure(
              replica that can list shared-data keys can confirm a guessed identity. \
              Set scopeDigestKey to a secret."
         );
+    }
+    if !config.ledger_namespace.is_empty() && config.scope_digest_key.is_empty() {
+        logger::warn!("Aggregate Risk Gate: ledgerNamespace is set and scopeDigestKey is empty; co-located policies using the same namespace can read and write this ledger. Set a secret scopeDigestKey.");
     }
     logger::info!(
         "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, \
@@ -4132,5 +4128,38 @@ mod test {
             .unwrap();
         }
         assert_eq!(*seen.borrow(), vec![None, Some("team-a".to_string())]);
+    }
+    #[test]
+    fn rc4_monitor_unpriceable_calls_do_not_take_scope_slots() {
+        for backend in ["worker", "node"] {
+            let gate = gate_with(
+                json!({"contribution":"spend-amount", "mode":"monitor", "ledgerBackend":backend, "maxScopes":1}),
+            );
+            let bytes = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#;
+            let flow = decide(
+                Identity::Scope("agent:unpriceable".into()),
+                0,
+                &gate,
+                RawBody::Present(bytes),
+                &violations(),
+            );
+            assert!(matches!(flow, Flow::Continue(Ticket::None(_))));
+            assert_eq!(gate.ledger.scope_count(), 0);
+            assert!(gate.ledger.reserve("agent:priced", 1, 3000, 0).is_ok());
+        }
+    }
+    #[test]
+    fn rc4_shared_namespace_without_key_warns_of_read_write_exposure() {
+        let mut tester = UnitTestBuilder::default()
+            .with_config(config(
+                json!({"ledgerBackend":"node", "ledgerNamespace":"rc4-tests", "scopeDigestKey":""}),
+            ))
+            .with_backend(ok_backend)
+            .with_entrypoint(super::configure);
+        tester.request(rpc_request(1, "broker-7"));
+        assert!(tester
+            .logs()
+            .iter()
+            .any(|line| line.contains("Warn:") && line.contains("read and write")));
     }
 }

@@ -58,7 +58,7 @@ fn config_with(overrides: Value) -> String {
         "approvalHeader": "x-approval",
         "approvalRpcField": "approvalBinding",
         "executorHeader": "client_id",
-        "requiredPredicates": ["P1", "P2", "P5", "P6"],
+        "requiredPredicates": ["P1", "P2", "P4", "P5", "P6"],
         "attesterKeys": [
             attester(APPROVER, APPROVER_KEY),
             attester(EXECUTOR, EXECUTOR_KEY)
@@ -1247,8 +1247,8 @@ fn post_without_content_length_is_stamped_framing_in_monitor_mode() {
 
 #[test]
 fn nonce_store_at_capacity_fails_closed_for_p6() {
-    // block_config has no P4, so no reserved nonce is ever sweepable: once the
-    // cap is reached, a fresh nonce is refused rather than growing the store.
+    // The P4-bounded approvals remain fresh throughout this test: once the cap
+    // is reached, a fresh nonce is refused rather than growing the store.
     let (backend, mut tester) = harness!(block_config());
     let args = json!({"replicas": 3});
     let body = jsonrpc_call(1, "deploy.apply", args.clone());
@@ -1290,7 +1290,7 @@ fn expired_nonces_are_swept_at_capacity() {
         assert!(backend.next().is_some());
         expiring.push(envelope);
     }
-    std::thread::sleep(std::time::Duration::from_millis(3100));
+    std::thread::sleep(std::time::Duration::from_millis(4100));
 
     let fresh = sound_approval("deploy.apply", &args, "n-sweep-fresh", &far_future());
     let response = tester.request(request_with(&fresh, EXECUTOR, &body));
@@ -1825,7 +1825,8 @@ fn unreadable_kept_key_bounds_the_rescan_by_the_backoff() {
         (before + super::UNREADABLE_RESCAN_BACKOFF_SECONDS
             ..=after + super::UNREADABLE_RESCAN_BACKOFF_SECONDS)
             .contains(&bound),
-        "an unreadable key caps the bound at now + backoff, not never: {bound}"
+        "an unreadable key caps the bound at now + backoff, not never: {}",
+        bound
     );
     // Before the backoff elapses: O(1) refusal.
     assert_eq!(
@@ -1918,7 +1919,7 @@ fn unknown_predicate_is_rejected() {
 fn client_responses_values_are_validated() {
     for value in ["forward", "deny", "DENY"] {
         let config = parse_config(base_config_json(json!({"clientResponses": value}))).unwrap();
-        assert!(Binding::from_config(&config).is_ok(), "{value}");
+        assert!(Binding::from_config(&config).is_ok(), "{}", value);
     }
     let config = parse_config(base_config_json(json!({"clientResponses": "allow"}))).unwrap();
     match Binding::from_config(&config) {
@@ -1935,8 +1936,8 @@ fn jsonrpc_member_names_are_rejected_as_approval_rpc_field() {
         ))
         .unwrap();
         match Binding::from_config(&config) {
-            Ok(_) => panic!("expected approvalRpcField={field} to be rejected"),
-            Err(err) => assert!(err.to_string().contains("approvalRpcField"), "{field}"),
+            Ok(_) => panic!("expected approvalRpcField={} to be rejected", field),
+            Err(err) => assert!(err.to_string().contains("approvalRpcField"), "{}", field),
         }
     }
 }
@@ -2475,5 +2476,203 @@ fn monitor_strip_failure_never_claims_allowed() {
     assert_eq!(
         forwarded_result(Some("P2"), true),
         "would-deny;predicate=P2;envelope=unstripped"
+    );
+}
+
+#[test]
+fn rc4_p6_requires_p4_but_not_p5() {
+    let invalid: Config =
+        serde_json::from_str(&config_with(json!({"requiredPredicates":["P6"]}))).unwrap();
+    assert!(Binding::from_config(&invalid).is_err());
+    let valid: Config =
+        serde_json::from_str(&config_with(json!({"requiredPredicates":["P4","P6"]}))).unwrap();
+    assert!(Binding::from_config(&valid).is_ok());
+}
+#[test]
+fn rc4_p6_without_p5_warns_at_startup() {
+    let (_, mut tester) = harness!(config_with(json!({"requiredPredicates":["P4","P6"]})));
+    let args = json!({"replicas":3});
+    let envelope = sound_approval("deploy.apply", &args, "startup-warning", &far_future());
+    assert_eq!(
+        tester
+            .request(request_with(
+                &envelope,
+                EXECUTOR,
+                &jsonrpc_call(1, "deploy.apply", args)
+            ))
+            .status_code(),
+        200
+    );
+    assert!(tester
+        .logs()
+        .iter()
+        .any(|line| line.contains("Warn:") && line.contains("P6 without P5")));
+}
+#[test]
+fn rc4_nonce_is_bounded_in_bytes_and_malformed_above_limit() {
+    for nonce in ["a".repeat(128), "a".repeat(129), "é".repeat(65)] {
+        let (backend, mut tester) = harness!(config_with(
+            json!({"requiredPredicates":["P1","P2","P4","P5","P6"]})
+        ));
+        let args = json!({"replicas":3});
+        let envelope = sound_approval("deploy.apply", &args, &nonce, &far_future());
+        let response = tester.request(request_with(
+            &envelope,
+            EXECUTOR,
+            &jsonrpc_call(1, "deploy.apply", args),
+        ));
+        if nonce.len() <= 128 {
+            assert_eq!(response.body(), OK_BODY);
+            assert!(backend.next().is_some());
+        } else {
+            assert_eq!(
+                response.header("x-approval-binding"),
+                Some("denied;predicate=malformed")
+            );
+            assert!(backend.next().is_none());
+        }
+    }
+}
+#[test]
+fn rc4_nonce_reuse_across_issuers_is_a_p6_replay() {
+    // The key is not namespaced by issuer: the attestation list is
+    // caller-controlled, so issuer-namespacing reopens subset replays. A second
+    // issuer reusing a nonce is denied (fail closed), not allowed.
+    let other = "second-approver";
+    let (backend, mut tester) = harness!(config_with(json!({
+        "requiredPredicates":["P1","P2","P4","P5","P6"],
+        "attesterKeys":[attester(APPROVER, APPROVER_KEY),attester(other, APPROVER_KEY)]
+    })));
+    let args = json!({"replicas":3});
+    let body = jsonrpc_call(1, "deploy.apply", args.clone());
+    let deadline = far_future();
+    for (issuer, allowed) in [(APPROVER, true), (other, false), (APPROVER, false)] {
+        let mut envelope = sound_approval("deploy.apply", &args, "same-nonce", &deadline);
+        envelope["attestations"][0]["authority"] = json!(issuer);
+        envelope["attestations"][0]["mac"] = json!(mcp_v1_mac(
+            APPROVER_KEY.as_bytes(),
+            issuer,
+            EXECUTOR,
+            "deploy.apply",
+            &digest_value(&args).unwrap(),
+            &deadline,
+            "same-nonce"
+        ));
+        let response = tester.request(request_with(&envelope, EXECUTOR, &body));
+        if allowed {
+            assert_eq!(response.body(), OK_BODY);
+            assert!(backend.next().is_some());
+        } else {
+            assert_eq!(
+                response.header("x-approval-binding"),
+                Some("denied;predicate=P6")
+            );
+            assert!(backend.next().is_none());
+        }
+    }
+}
+#[test]
+fn rc4_subset_replay_of_multi_attester_approval_is_p6_denied() {
+    let other = "second-approver";
+    let other_key = "second-approver-key-0123456789abcdXY";
+    let (backend, mut tester) = harness!(config_with(json!({
+        "requiredPredicates":["P1","P2","P4","P5","P6"],
+        "attesterKeys":[attester(APPROVER, APPROVER_KEY),attester(other, other_key)]
+    })));
+    let args = json!({"replicas":3});
+    let body = jsonrpc_call(1, "deploy.apply", args.clone());
+    let deadline = far_future();
+    let mut envelope = sound_approval("deploy.apply", &args, "dual-nonce", &deadline);
+    let mut second = envelope["attestations"][0].clone();
+    second["authority"] = json!(other);
+    second["mac"] = json!(mcp_v1_mac(
+        other_key.as_bytes(),
+        other,
+        EXECUTOR,
+        "deploy.apply",
+        &digest_value(&args).unwrap(),
+        &deadline,
+        "dual-nonce"
+    ));
+    envelope["attestations"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+
+    let first = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(first.body(), OK_BODY, "dual-attested first use is allowed");
+    assert!(backend.next().is_some());
+
+    // Replay the same approval with the second attestation dropped: the
+    // remaining MAC still passes P5, so only the nonce key can catch it.
+    envelope["attestations"].as_array_mut().unwrap().pop();
+    let replay = tester.request(request_with(&envelope, EXECUTOR, &body));
+    assert_eq!(
+        replay.header("x-approval-binding"),
+        Some("denied;predicate=P6"),
+        "a subset replay is a P6 replay"
+    );
+    assert!(
+        backend.next().is_none(),
+        "a subset replay must not reach upstream"
+    );
+}
+#[test]
+fn rc4_header_envelope_stripping_respects_flag_in_both_modes() {
+    for mode in ["block", "monitor"] {
+        for strip in [true, false] {
+            let (backend, mut tester) = harness!(config_with(
+                json!({"requiredPredicates":["P1","P2","P4","P5","P6"],"mode":mode,"stripApprovalEnvelope":strip})
+            ));
+            let args = json!({"replicas":3});
+            let envelope = sound_approval("deploy.apply", &args, "header-strip", &far_future());
+            assert_eq!(
+                tester
+                    .request(request_with(
+                        &envelope,
+                        EXECUTOR,
+                        &jsonrpc_call(1, "deploy.apply", args)
+                    ))
+                    .body(),
+                OK_BODY
+            );
+            assert_eq!(
+                backend.next().unwrap().header("x-approval").is_none(),
+                strip
+            );
+        }
+    }
+}
+#[test]
+fn rc4_monitor_denial_also_strips_the_header() {
+    let (backend, mut tester) = harness!(config_with(
+        json!({"requiredPredicates":["P1","P2","P4","P5","P6"],"mode":"monitor"})
+    ));
+    let args = json!({"replicas":3});
+    let envelope = sound_approval("deploy.apply", &args, "header-monitor-deny", &far_future());
+    tester.request(request_with(
+        &envelope,
+        EXECUTOR,
+        &jsonrpc_call(1, "other.action", args),
+    ));
+    let forwarded = backend.next().unwrap();
+    assert!(forwarded
+        .header("x-approval-binding")
+        .unwrap()
+        .contains("would-deny"));
+    assert_eq!(forwarded.header("x-approval"), None);
+}
+#[test]
+fn rc4_sweep_waits_through_the_boundary_second() {
+    assert!(!nonce_sweep_due(100, 100));
+    assert!(!nonce_sweep_due(101, 100));
+    assert!(nonce_sweep_due(102, 100));
+    assert!(!nonce_sweep_due(i64::MAX, i64::MAX));
+}
+#[test]
+fn rc4_missing_admitted_length_denies_instead_of_panicking() {
+    assert_eq!(
+        admitted_length(None),
+        Err("request body has no valid, admissible declared content-length")
     );
 }

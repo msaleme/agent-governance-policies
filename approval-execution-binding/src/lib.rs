@@ -91,6 +91,9 @@ const MCP_BLOCKED_CODE: i64 = -32008;
 /// Bound on the request body this policy will parse. This is an admission
 /// filter, not an observed cap on bytes Flex buffers before exposing the body.
 const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_NONCE_BYTES: usize = 128;
+const CONTENT_LENGTH: &str = "content-length";
+const INADMISSIBLE_FRAMING: &str = "request body has no valid, admissible declared content-length";
 
 /// Minimum accepted attester-key length (bytes). A shorter shared secret is
 /// rejected at configure time rather than silently accepted — publishability
@@ -1025,6 +1028,11 @@ impl Binding {
             required.insert(predicate);
         }
 
+        if required.contains(Predicate::P6) && !required.contains(Predicate::P4) {
+            return Err(anyhow!(
+                "P6 single use requires P4 expiry; add P4 to requiredPredicates"
+            ));
+        }
         let mut attester_keys = BTreeMap::new();
         for entry in &config.attester_keys {
             if entry.kid.trim().is_empty() {
@@ -1231,6 +1239,17 @@ fn evaluate(
         }
     };
 
+    if envelope
+        .approval
+        .nonce
+        .as_ref()
+        .is_some_and(|nonce| nonce.len() > MAX_NONCE_BYTES)
+    {
+        return Verdict::Deny {
+            predicate: None,
+            reason: "approval nonce exceeds 128 bytes".to_string(),
+        };
+    }
     if binding.required.contains(Predicate::P5) {
         if !executor_verified {
             return Verdict::Deny {
@@ -1374,6 +1393,44 @@ enum ReserveRefusal {
     Unavailable,
 }
 
+/// Fixed-size, domain-separated storage key over audience, tenant, environment
+/// and nonce. Attestation authorities are deliberately NOT part of the key: the
+/// attestation list is caller-controlled, so a dual-attested approval replayed
+/// with one attestation dropped would otherwise get a fresh key while the
+/// remaining MAC still passes P5. Two issuers that pick the same nonce therefore
+/// share one reservation; the second use is a P6 denial (fail closed).
+fn nonce_storage_key(binding: &Binding, envelope: &Envelope) -> Option<String> {
+    use sha2::Digest;
+    let nonce = envelope
+        .approval
+        .nonce
+        .as_deref()
+        .filter(|n| !n.is_empty() && n.len() <= MAX_NONCE_BYTES)?;
+    let mut digest = Sha256::new();
+    digest.update(b"approval-nonce-v1");
+    for field in [
+        binding.expected_audience.as_str(),
+        binding.expected_tenant.as_str(),
+        binding.expected_environment.as_str(),
+        nonce,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    Some(hex_encode(&digest.finalize()))
+}
+
+fn nonce_sweep_due(now: i64, expiry: i64) -> bool {
+    now > expiry.saturating_add(1)
+}
+
+fn admitted_length(length: Option<usize>) -> Result<usize, &'static str> {
+    let Some(length) = length else {
+        return Err(INADMISSIBLE_FRAMING);
+    };
+    Ok(length)
+}
+
 /// The instant after which a stored nonce may be forgotten: the P4 deadline
 /// (`not_after + clockSkewSeconds`, whole seconds) when P4 is required and
 /// `not_after` parses, else `NONCE_NEVER_EXPIRES`. Only a P4-rejected approval
@@ -1487,7 +1544,7 @@ async fn reserve_nonce<S: DataStorage>(
         let mut earliest = NONCE_NEVER_EXPIRES;
         for key in &keys {
             match store.get::<i64>(key).await {
-                Ok(Some((stored_expiry, _))) if now > stored_expiry => {
+                Ok(Some((stored_expiry, _))) if nonce_sweep_due(now, stored_expiry) => {
                     store
                         .delete(key)
                         .await
@@ -1498,7 +1555,9 @@ async fn reserve_nonce<S: DataStorage>(
                 // Unexpired: kept, and it bounds when a rescan can free space.
                 Ok(Some((stored_expiry, _))) => {
                     remaining += 1;
-                    earliest = earliest.min(stored_expiry);
+                    // An expiry in the one-second grace period is kept. Cache
+                    // this second too, rather than rescanning on every request.
+                    earliest = earliest.min(stored_expiry.max(now));
                 }
                 // Undecodable: kept, so it still counts. Its expiry is unknown,
                 // so retry after a short backoff rather than never.
@@ -1574,15 +1633,13 @@ fn forwarded_result(denied_predicate: Option<&str>, envelope_unstripped: bool) -
     }
 }
 
-/// Replaces the body forwarded upstream and sets `content-length` to match.
-/// PDK 1.10's `set_body` writes the body buffer only and leaves headers alone,
-/// and the request still carries the client's original `content-length`, so the
-/// header is rewritten here; the headers have not been sent yet in this state.
+/// Replace the forwarded body and its declared length while headers are buffered.
+/// Explicit length rewriting retains the verified upstream framing contract.
 fn replace_forwarded_body(handler: &dyn HeadersBodyHandler, body: &[u8]) -> Result<(), String> {
     handler
         .set_body(body)
         .map_err(|err| format!("set_body failed: {err:?}"))?;
-    handler.set_header("content-length", &body.len().to_string());
+    handler.set_header(CONTENT_LENGTH, &body.len().to_string());
     Ok(())
 }
 
@@ -1705,16 +1762,15 @@ async fn request_filter<S: DataStorage>(
     // MAX_BODY_BYTES cap is a follow-up, not this build. It could still be a
     // tools/call, so it is denied
     // — stamped as a framing refusal, not as a malformed JSON-RPC call (#50).
-    let declared_length = declared_body_length(handler.header("content-length"));
+    let declared_length = declared_body_length(handler.header(CONTENT_LENGTH));
     let admissible = declared_length.is_some_and(|length| length <= MAX_BODY_BYTES);
     if !admissible {
-        return framing_refusal(
-            binding,
-            handler,
-            "request body has no valid, admissible declared content-length",
-        );
+        return framing_refusal(binding, handler, INADMISSIBLE_FRAMING);
     }
-    let declared_length = declared_length.expect("admissible implies present");
+    let declared_length = match admitted_length(declared_length) {
+        Ok(length) => length,
+        Err(reason) => return framing_refusal(binding, handler, reason),
+    };
 
     let state = headers_state.into_headers_body_state().await;
     let handler = state.handler();
@@ -1782,14 +1838,12 @@ async fn request_filter<S: DataStorage>(
     };
 
     let envelope = extract_envelope(binding, header_value, &call);
-    // Capture the signed nonce (if any) and its sweep expiry BEFORE the envelope
-    // is moved into `evaluate`; the nonce is the DataStorage reservation key on
-    // the allowed path.
+    // Capture the scoped nonce key and expiry before evaluation consumes the
+    // envelope. Storage is touched only after every required predicate passes.
     let reserved_nonce = envelope
         .as_ref()
         .ok()
-        .and_then(|env| env.approval.nonce.clone())
-        .filter(|nonce| !nonce.is_empty());
+        .and_then(|env| nonce_storage_key(binding, env));
     let nonce_expiry = nonce_expiry(
         binding,
         envelope
@@ -1804,6 +1858,9 @@ async fn request_filter<S: DataStorage>(
     // failure here never burns a nonce. The splice fails closed in block mode;
     // monitor mode forwards the body unchanged, records a violation, and stamps
     // the result header with `envelope=unstripped` instead of claiming allowed.
+    if binding.approval_source == ApprovalSource::Header && binding.strip_approval_envelope {
+        handler.remove_header(&binding.approval_header);
+    }
     let forwards = !binding.block || matches!(verdict, Verdict::Allow);
     let mut envelope_unstripped = false;
     if forwards
@@ -1909,6 +1966,9 @@ async fn configure(
     })?;
 
     let binding = Binding::from_config(&config)?;
+    if binding.required.contains(Predicate::P6) && !binding.required.contains(Predicate::P5) {
+        logger::warn!("Approval-to-Execution Binding: P6 without P5 uses an unauthenticated nonce; a caller can mint fresh nonces to bypass single use");
+    }
     logger::info!(
         "Approval-to-Execution Binding armed: predicates={:?}, mode={}",
         Predicate::ALL

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — rc.4 planned
+
+### Approval-to-Execution Binding (#62, #63)
+
+- **Breaking:** startup rejects P6 without P4, and approval nonces above 128 UTF-8
+  bytes receive the malformed-approval verdict. P6 without P5 remains accepted
+  with a warning because callers can mint unauthenticated nonces.
+- Replace the request-path panic with the existing framing refusal. Namespace P6
+  keys with SHA-256 over length-prefixed audience, tenant, environment and nonce;
+  retain reservations through the extra boundary second. Issuers are deliberately
+  excluded (an issuer-namespaced key allowed a subset-attestation replay), so two
+  issuers reusing one nonce get a fail-closed P6 denial.
+  The key-format change resets recognition of old raw-nonce reservations: let
+  outstanding approvals expire before upgrading.
+- Strip evaluated header-mode approval envelopes in block and monitor modes when
+  enabled. Centralize the Content-Length header name; retain explicit length
+  rewriting after the proposed removal failed the existing runtime test (#63 N7a).
+  Add UI bounds for approval lifetime and document monitor/framing limits.
+- Fix Rust 2018 panic formatting and check all targets with Clippy for both policies.
+
+### Aggregate-Risk Gate (#65)
+
+- Persist busy records reconciled by a sweep, with CAS retries, so deferred commits
+  see matching records and markers. Drop a pending commit after three confirmed
+  missing-record capacity failures and emit `aggregate_risk_pending_commit_dropped`;
+  that commit remains uncharged. Storage outages and ordinary contention keep retrying.
+- Warn that an empty digest key exposes a shared namespace to co-located reads and
+  writes; retain default startup behavior. Unpriceable monitor calls no longer
+  consume scope slots. Correct the startup-log example.
+- Keep the worker mutex and the broader cleanup/accounting behavior tracked in #64.
+
+
 ## 0.1.0-rc.3 — 2026-10-05
 
 ### Aggregate-Risk Gate

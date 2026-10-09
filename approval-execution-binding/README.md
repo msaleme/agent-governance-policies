@@ -182,16 +182,16 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `approvalHeader` | string | `x-approval` | Header carrying the JSON-encoded envelope when `approvalSource: header`. |
 | `approvalRpcField` | string | `approvalBinding` | Top-level JSON-RPC body member carrying the envelope when `approvalSource: rpc-param`. A JSON-RPC member name (`jsonrpc`, `id`, `method`, `params`, `result`, `error`) is rejected at startup. |
 | `executorHeader` | string | `client_id` | **Fallback** header naming the executor. The executor identity is taken FIRST from the **verified** authentication data (`client_id`, then `principal`) established by an upstream authentication policy; this header is used only when no verified subject is present, and when P5 is required and no verified subject exists the call **fails closed** rather than trusting the header. Used only for P5. |
-| `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in. (There is no P3.) |
+| `requiredPredicates` | string[] | `[P1, P2, P4, P5]` | Predicates that MUST hold. Empty list rejected at startup. P6 is opt-in and requires P4; P6 without P5 logs an unauthenticated-nonce warning. (There is no P3.) |
 | `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
 | `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. `0`–`3600`; anything else is rejected at startup (**breaking**: a negative value used to be treated as `0`, and there was no upper limit). |
 | `maxApprovalLifetimeSeconds` | integer | `0` (off) | Upper bound on an approval's **remaining** lifetime, checked under P4 against the gateway clock: an approval with `not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds` is denied `predicate=P4`. `1`–`31536000` when set; anything else, or setting it without P4 in `requiredPredicates`, is rejected at startup. See [Approval lifetime bound](#approval-lifetime-bound). |
-| `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new length. Ignored for `approvalSource: header`. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
+| `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new byte length. With `approvalSource: header`, remove the configured approval header after evaluation in both modes. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
 | `clientResponses` | `forward`\|`deny` | `forward` | How a well-formed JSON-RPC **response** POSTed by the client (a `roots/list`, sampling or elicitation reply) is handled. `forward`: passed through untouched, stamped `out-of-scope`, in both modes. `deny`: treated as malformed (pre-#57 behaviour). Either way the approval does not bind response content — see [Inspection boundary](#inspection-boundary). Any other value is rejected at startup. |
 | `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
 | `expectedTenant` | string | `""` | The tenant this gateway serves, bound as `tenant`. **Required (non-empty) whenever P5 is required.** |
 | `expectedEnvironment` | string | `""` | The environment this gateway serves, bound as `env`. **Required (non-empty) whenever P5 is required.** |
-| `mode` | `monitor`\|`block` | `monitor` | Evaluate and log only, vs. actually deny on a failed required predicate. |
+| `mode` | `monitor`\|`block` | `monitor` | Evaluate and log vs. deny on a failed predicate; monitor still strips the envelope when `stripApprovalEnvelope` is enabled. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a block-mode denial is rendered. A request that can't be confidently parsed as a single, non-batch JSON-RPC call with an echoable id always falls back to `empty-403` regardless of this setting — echoing an untrustworthy id risks exposing a protected value. This includes a `POST` refused for framing (no valid declared `content-length` ≤ 64 KiB), stamped `denied;framing=content-length`. A notification (no id) always gets an empty HTTP 202. Never applies to a bodyless non-`POST` request (`GET` SSE stream, `DELETE` session, `OPTIONS`, `HEAD`), which is forwarded `out-of-scope` and never denied. |
 | `resultHeader` | string | `x-approval-binding` | Header stamped with the verdict (`allowed`, `out-of-scope`, `would-deny;predicate=P2`, `denied;predicate=P5`, `denied;predicate=malformed`, `denied;framing=content-length`, the `monitor;…` forms of the last two, and `monitor;envelope=unstripped` or a `;envelope=unstripped` suffix when monitor mode forwards an rpc-param body whose envelope could not be removed) — never the approval or argument values themselves. |
 
@@ -281,7 +281,7 @@ deny under P4  if  not_after > now + maxApprovalLifetimeSeconds + clockSkewSecon
 
 The check is part of P4, so it needs P4 in `requiredPredicates`; a config that sets it without P4
 fails at startup. A `not_after` exactly at the limit is allowed. The bound also limits how long a P6
-nonce is held, since a nonce is kept until `not_after + clockSkewSeconds`.
+nonce is held, since a nonce is kept until strictly after `not_after + clockSkewSeconds + 1`.
 
 **Is `not_after` authenticated?** Only when P5 is required. `not_after` is one of the fields of the
 signed `mcp-v1` payload (see above), so under P5 a caller can't change it without breaking the MAC.
@@ -303,8 +303,9 @@ With `approvalSource: rpc-param` and `stripApprovalEnvelope: true` (the default)
 the top-level `approvalRpcField` member from the body before forwarding it (#52), so the MCP server
 never receives the approval or its attestation MACs, and a strict JSON-RPC server doesn't see an
 unknown top-level member. This applies to every forwarded `tools/call`: an allowed call in either
-mode, and a monitor-mode would-deny. An out-of-scope method, a denied call and `approvalSource:
-header` are left as they are.
+mode, and a monitor-mode would-deny. The body of an out-of-scope method or a denied call is not rewritten. With
+`approvalSource: header`, the configured approval header is removed after
+evaluation in block and monitor modes when stripping is enabled.
 
 - **Byte-exact.** The member is cut out of the original bytes together with one adjoining comma.
   Nothing else is re-serialized, so the upstream receives exactly the argument bytes P2 checked,
@@ -318,14 +319,13 @@ header` are left as they are.
   `monitor;envelope=unstripped` (or adds `;envelope=unstripped` to a would-deny) instead of
   `allowed`. The removal runs before the P6 reservation, so a failure
   never uses up a nonce.
-- **`content-length` is rewritten.** PDK 1.10's `BodyHandler::set_body` writes only the body buffer
-  (`pdk-classy` `hl/headers_body.rs`); nothing in the PDK or `proxy-wasm` 0.2.5 adjusts
-  `content-length`. So the policy sets `content-length` to the new length itself. The request
-  headers haven't been sent upstream yet at that point, because the filter is still holding the
-  request to read its body. The `#[pdk_test]`
-  `rpc_param_envelope_is_stripped_before_the_real_upstream` checks this on a real Flex Gateway
-  1.14.0: the upstream mock accepts only the exact stripped bytes with the new `content-length`.
-  It runs in CI (`runtime-e2e-approval`).
+- **Explicit length rewriting.** After `set_body` succeeds, the policy sets
+  `content-length` to the new byte length. Removing it was attempted for #63 N7(a),
+  but the existing Flex 1.14.0 upstream test returned 404 instead of 200 in
+  [CI run 37933777102](https://github.com/msaleme/agent-governance-policies/actions/runs/37933777102).
+  The test requires both the exact stripped bytes and their declared length; this
+  result does not identify which matcher failed. Removal is deferred, and the
+  existing runtime test remains unchanged. This is Local Mode evidence.
 
 On a denial the log carries a structured event, e.g.
 `{"event":"approval_execution_binding","action":"deny","predicate":"P1","reason":"approved action 'deploy.apply', executed 'deploy.destroy'"}`
@@ -357,9 +357,12 @@ Further honest limitations, disclosed rather than hidden:
   attestation service is out of scope for this build. Selecting it fails policy startup with a
   clear error rather than silently no-op-ing, so a misconfiguration can't be mistaken for an armed
   binding.
+- **Declared request length is required in block mode.** A POST without a declared
+  `content-length` is denied with `denied;framing=content-length`. This is fail-closed
+  by design; HTTP/2 clients, chunked uploads and some MCP clients or proxies omit it.
 - <a id="p6-single-use-boundary"></a>**P6 single use is per gateway replica, until restart.** P6 uses
   gateway data storage `local()`, which is per-replica and has no TTL control. P6
-  reserves the nonce atomically via the gateway's data-storage API (`store(&nonce,
+  reserves a SHA-256 nonce key atomically via the gateway's data-storage API (`store(&nonce_key,
   &StoreMode::Absent, ...)`): the first reservation succeeds and the call is allowed; a second
   reservation of the same nonce returns a CAS mismatch and the call is denied under P6; any other
   storage error **fails closed** (deny). The reservation happens only in **block** mode — monitor
@@ -378,7 +381,8 @@ Further honest limitations, disclosed rather than hidden:
   **Recommendation: deploy a single gateway replica for flows that require P6**, and treat a
   restart as reopening unexpired approvals. The follow-up for a global guarantee is
   `remote()` storage with a TTL ≥ the maximum approval lifetime + `clockSkewSeconds`, keys
-  namespaced by issuer — it is not in this build (#51).
+  namespaced by audience, tenant and environment (not by issuer; see the rc.4 nonce
+  details below) — it is not in this build (#51).
 - **Reserved P6 nonces are bounded by an approximate cap, not a TTL (#51).** `local()` has no TTL,
   so the policy bounds the store itself. Each reservation records the nonce's expiry, and the normal
   path is a `get` of the nonce key followed by a single atomic `store(nonce, Absent, …)`. Only the
@@ -392,7 +396,7 @@ Further honest limitations, disclosed rather than hidden:
   value that fails to decode; that is refused (fail closed), and a host error on `get` falls through
   to the authoritative `store`. Each worker counts its reservations; when its count reaches **10,000**, it lists
   the store, deletes every nonce whose approval has expired under P4 (`now > not_after +
-  clockSkewSeconds`), and resets its count to what remains. Forgetting such a nonce cannot reopen a
+  clockSkewSeconds + 1`), and resets its count to what remains. Forgetting such a nonce cannot reopen a
   replay, because replaying it is still a P4 denial. If the store is still full after that sweep, the
   reservation **fails closed** (a P6 denial), and the worker remembers the earliest expiry among the
   nonces it kept: until that instant passes, nothing can be swept, so further reservations at the cap
@@ -410,10 +414,8 @@ Further honest limitations, disclosed rather than hidden:
   (and since PDK reads a host error as "absent", a listed key whose read fails is not counted, so the
   count can run low);
   (2) **the sweep's key listing (`get_keys`) is not yet verified on a real gateway** — it runs only at
-  the cap, and if it errors there, P6 reservations at the cap fail closed; (3) **without P4 in
-  `requiredPredicates`, no reserved nonce ever expires**, so once a sweep finds the store full a
-  P6-only deployment stops admitting new single-use approvals on that replica until restart, and
-  never rescans — require P4 with P6; (4) an approval with a far-future `not_after` holds its slot
+  the cap, and if it errors there, P6 reservations at the cap fail closed; (3) **P6 without P4 is rejected at startup**, since otherwise reserved nonces never expire;
+  P6 without P5 starts with a warning because callers can mint unauthenticated nonces; (4) an approval with a far-future `not_after` holds its slot
   until then (see the next item).
 - **The approval lifetime bound is off by default and checks `not_after`, not an issue time (#52).**
   With `maxApprovalLifetimeSeconds` unset, P4 checks only `now <= not_after + clockSkewSeconds`, so
@@ -593,3 +595,23 @@ The `make release` goal also publishes the policy to Anypoint Exchange, but as a
 ### Policy Examples
 
 The PDK provides provides a set of example policy projects to get started creating policies and using the PDK features. To learn more about these examples see [Custom policy Examples](https://docs.mulesoft.com/pdk/latest/policies-pdk-policy-templates).
+
+### rc.4 nonce and framing details
+
+`approval.nonce` is limited to 128 UTF-8 bytes; longer values receive the existing
+malformed-approval verdict. P6 keys are SHA-256 hashes of a domain-separated,
+length-prefixed tuple: the configured expected audience, tenant and environment,
+and the nonce. Attestation authorities are deliberately not part of the key: the
+attestation list is caller-controlled, so an issuer-namespaced key would let a
+multi-attested approval be replayed with an attestation dropped (the remaining MACs
+still pass P5). Two issuers that choose the same nonce therefore share one
+reservation, and the second use is denied under P6 (fail closed). Without P5 the
+nonce itself is unauthenticated, as the startup warning states. The key format changes at rc.4; existing raw-nonce reservations are not
+migrated, so treat rollout as a reset of the documented per-replica single-use
+state and let outstanding approvals expire before upgrading.
+
+In block mode, a POST without a declared `content-length` is denied with
+`denied;framing=content-length`. This is fail-closed by design; HTTP/2 clients,
+chunked uploads and some MCP clients or proxies omit the header. Monitor mode
+still strips evaluated approval envelopes when stripping is enabled, including
+the configured approval header, so attestation MACs do not reach the MCP server.

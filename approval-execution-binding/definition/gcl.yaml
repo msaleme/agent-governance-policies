@@ -88,10 +88,12 @@ spec:
         (opt-in) single use PER GATEWAY REPLICA, UNTIL RESTART, enforced
         atomically via local gateway data storage in block mode only — a replay
         on another replica or after a restart is not caught, so deploy a single
-        replica for flows that need P6, and require P4 with P6 (reserved nonces
+        replica for flows that need P6. Startup rejects P6 without P4 and warns
+        when P6 is enabled without P5 (the nonce is then unauthenticated). Nonces
+        are limited to 128 UTF-8 bytes. Reserved nonces
         have an approximate per-worker cap of 10,000; at the cap only P4-expired
         ones are reclaimed, and a full store fails closed; the sweep's key listing
-        and the replay pre-check are not yet verified on a real gateway). P6 is a profile choice, not a universal rule —
+        and the replay pre-check are not yet verified on a real gateway. P6 is a profile choice, not a universal rule —
         reusable approvals are legitimate in some flows — so it defaults out of the
         required set; opt in only when the customer's flow is single-use. An
         empty list is rejected at startup: a binding that requires nothing is
@@ -138,6 +140,8 @@ spec:
     maxApprovalLifetimeSeconds:
       type: integer
       default: 0
+      minimum: 0
+      maximum: 31536000
       description: >-
         Optional upper bound on an approval's REMAINING lifetime, enforced under
         P4. 0 (the default) turns the bound off. When set (1 to 31536000), an
@@ -158,8 +162,9 @@ spec:
         its attestation MACs and a strict JSON-RPC server does not see an
         unknown top-level member. The member is cut out byte-for-byte (the rest
         of the body is not re-serialized) and content-length is set to the new
-        length. Ignored when approvalSource=header. Set false only if the
-        upstream must see the envelope.
+        byte length. With approvalSource=header, remove the configured
+        approvalHeader after evaluation. Both sources are stripped in block and
+        monitor mode. Set false only if the upstream must see the envelope.
     clientResponses:
       type: string
       default: forward
@@ -211,7 +216,8 @@ spec:
         "monitor" — evaluate every required predicate and log the verdict
         (allow, or the specific predicate that would have failed) via a
         structured warning, but always forward the request. Use to characterize
-        traffic before enforcing. "block" — deny the request when a required
+        traffic before enforcing. Monitor still strips the approval envelope
+        when stripApprovalEnvelope is enabled. "block" — deny the request when a required
         predicate fails, per onDeny. Every deployment, including monitor,
         requires change-management review of what the approval envelope and
         attesterKeys disclose to logs.

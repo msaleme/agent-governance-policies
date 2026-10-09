@@ -141,6 +141,7 @@ const DRAIN_RETRIES: u32 = 8;
 const DRAIN_PER_CALL: usize = 16;
 /// New reservations are refused while this many commits are queued.
 const PENDING_LIMIT: usize = 256;
+const MISSING_RECORD_ATTEMPTS: u8 = 3;
 /// How long a `Vacant` tombstone is kept before it is deleted.
 const GRACE_MS: u64 = 30_000;
 /// A `Doomed` record this old was left by a sweep that never finished its
@@ -281,6 +282,7 @@ struct Pending {
     /// Its commit marker was written: a later touch charges it even if this
     /// worker never runs again, so the queue only lands it sooner.
     persisted: bool,
+    missing_record_attempts: u8,
 }
 
 /// hex(HMAC-SHA256(`secret`, `parts`...)).
@@ -767,24 +769,58 @@ impl NodeLedger {
             };
             match decode::<Record>(&bytes) {
                 Ok(Record::Scope(mut state)) => {
-                    state.roll(period(self.window, now));
-                    // A reservation is only ever taken off a record through
-                    // its marker, so a sweep never drops a queued commit.
-                    if self.reconcile(key, &mut state, now).is_err() {
-                        continue;
-                    }
-                    let _ = state.reclaim(now, self.ttl);
-                    if state.is_idle() {
-                        let vacant = Record::Vacant {
-                            since: clock,
-                            period: state.period(),
+                    let mut current_cas = cas;
+                    for _ in 0..MARKER_RETRIES {
+                        let rolled = state.roll_to(period(self.window, now));
+                        // Markers are recoverable claims. Save every reconciled
+                        // record, including busy ones, using the same CAS/reload
+                        // discipline as an ordinary ledger touch.
+                        let Ok(charged) = self.reconcile(key, &mut state, now) else {
+                            break;
                         };
-                        if self.put_record(key, Some(&cas), &vacant).is_ok() {
-                            freed += 1;
-                            continue;
+                        let reclaimed = state.reclaim(now, self.ttl);
+                        if !rolled && charged == 0 && reclaimed == (0, 0) && !state.is_idle() {
+                            next_idle = next_idle.min(state.idle_at(self.ttl, self.window));
+                            break;
+                        }
+                        let idle = state.is_idle();
+                        let idle_at = state.idle_at(self.ttl, self.window);
+                        let updated = if idle {
+                            Record::Vacant {
+                                since: clock,
+                                period: state.period(),
+                            }
+                        } else {
+                            Record::Scope(state)
+                        };
+                        match self.put_record(key, Some(&current_cas), &updated) {
+                            Ok(()) => {
+                                self.count_touch(reclaimed, charged);
+                                if idle {
+                                    freed += 1;
+                                } else {
+                                    next_idle = next_idle.min(idle_at);
+                                }
+                                break;
+                            }
+                            // Unsaved: still schedule a rescan for this record.
+                            Err(StoreError::Failed) => {
+                                next_idle = next_idle.min(idle_at);
+                                break;
+                            }
+                            Err(StoreError::CasMismatch) => {
+                                next_idle = next_idle.min(idle_at);
+                                let Ok(Some((bytes, cas))) = self.store.get(key) else {
+                                    break;
+                                };
+                                let Ok(Record::Scope(latest)) = decode::<Record>(&bytes) else {
+                                    break;
+                                };
+                                state = latest;
+                                current_cas = cas;
+                            }
                         }
                     }
-                    next_idle = next_idle.min(state.idle_at(self.ttl, self.window));
                 }
                 Ok(Record::Vacant { since, period }) => {
                     if clock >= since.saturating_add(GRACE_MS) {
@@ -928,7 +964,7 @@ impl NodeLedger {
     /// record: if not, a touch already charged it through its marker.
     fn drain_pending(&self, now: u64) {
         for _ in 0..DRAIN_PER_CALL {
-            let Some(entry) = self.pending.borrow_mut().pop_front() else {
+            let Some(mut entry) = self.pending.borrow_mut().pop_front() else {
                 return;
             };
             let result = if entry.persisted {
@@ -949,8 +985,28 @@ impl NodeLedger {
                     self.pending.borrow_mut().push_front(entry);
                     return;
                 }
-                // Stuck on its own key (contended, or no slot for a missing
-                // record): let the commits queued behind it go first.
+                // Bound only confirmed missing-record capacity failures. An
+                // outage or ordinary CAS contention must never discard a commit.
+                Err(Refusal::AtCapacity)
+                    if matches!(
+                        self.read(&self.key(&entry.reservation.scope)),
+                        Ok(Read::New(_, _))
+                    ) =>
+                {
+                    entry.missing_record_attempts += 1;
+                    if entry.missing_record_attempts >= MISSING_RECORD_ATTEMPTS {
+                        pdk::logger::warn!(
+                            "{}",
+                            serde_json::json!({
+                                "event":"aggregate_risk_pending_commit_dropped",
+                                "reason":"missing-record-at-capacity",
+                                "attempts":entry.missing_record_attempts
+                            })
+                        );
+                    } else {
+                        self.pending.borrow_mut().push_back(entry);
+                    }
+                }
                 Err(_) => self.pending.borrow_mut().push_back(entry),
             }
         }
@@ -968,6 +1024,7 @@ impl NodeLedger {
             pending.push_back(Pending {
                 reservation: reservation.clone(),
                 persisted,
+                missing_record_attempts: 0,
             });
         }
         Settlement::Deferred
@@ -1071,6 +1128,7 @@ impl LedgerStore for NodeLedger {
         outcome
     }
 
+    #[cfg(test)]
     fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal> {
         self.mutate(scope, now, |state| {
             state.record(contribution);
@@ -2121,5 +2179,61 @@ mod test {
         ));
         assert_eq!(a.commit(&r, 10 * TTL), Settlement::Committed);
         assert_eq!(b.snapshot("s").committed, 1);
+    }
+    #[test]
+    fn rc4_sweep_persists_reconciled_busy_record_before_deferred_commit() {
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let b = worker(&store, 2);
+        let r = a.reserve("busy", 800, 3000, 0).unwrap();
+        let live = a.reserve("busy", 1, 3000, TTL / 2).unwrap();
+        defer_commit(&store, &a, &r, 1);
+        b.sweep(TTL, String::new());
+        assert_eq!(b.snapshot("busy").committed, 800);
+        assert_eq!(b.snapshot("busy").reserved, 1);
+        a.drain_pending(TTL + 1);
+        assert_eq!(a.pending(), 0);
+        assert_eq!(b.snapshot("busy").committed, 800);
+        assert_eq!(b.commit(&live, TTL + 1), Settlement::Committed);
+        assert_eq!(b.snapshot("busy").committed, 801);
+    }
+    #[test]
+    fn rc4_missing_records_cannot_livelock_a_full_pending_queue() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, PENDING_LIMIT, None);
+        let reservations: Vec<_> = (0..PENDING_LIMIT)
+            .map(|i| a.reserve(&format!("lost-{i}"), 1, 10, 0).unwrap())
+            .collect();
+        store.set_failing(true);
+        for r in &reservations {
+            assert_eq!(a.commit(r, 1), Settlement::Deferred);
+        }
+        store.set_failing(false);
+        // Records vanished without freeing the shared slot count.
+        for r in &reservations {
+            store.delete(&a.key(&r.scope)).unwrap();
+        }
+        for _ in 0..(3 * PENDING_LIMIT / DRAIN_PER_CALL) {
+            a.drain_pending(2);
+        }
+        assert_eq!(a.pending(), 0);
+        // Stale slot accounting is separate; it must no longer be queue contention.
+        assert_eq!(a.reserve("new", 1, 10, 3), Err(Refusal::AtCapacity));
+    }
+
+    #[test]
+    fn rc4_sweep_reloads_a_contended_record_without_losing_the_commit() {
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        let b = worker(&store, 2);
+        let r = a.reserve("busy", 800, 3000, 0).unwrap();
+        a.reserve("busy", 1, 3000, TTL / 2).unwrap();
+        defer_commit(&store, &a, &r, 1);
+        store.force_mismatches(1);
+        b.sweep(TTL, String::new());
+        assert_eq!(b.snapshot("busy").committed, 800);
+        assert_eq!(b.snapshot("busy").reserved, 1);
+        a.drain_pending(TTL + 1);
+        assert_eq!(b.snapshot("busy").committed, 800);
     }
 }
