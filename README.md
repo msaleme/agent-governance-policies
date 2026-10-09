@@ -44,7 +44,7 @@ corpus defines what a correct check means, and the policy performs it at runtime
 
 | | |
 | --- | --- |
-| Repository release | [`v0.1.0-rc.3`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
+| Repository release | [`v0.1.0-rc.4`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
 | Policy versions | Both policies are `1.0.0` in their `Cargo.toml`. The repository version is separate from them. |
 | Exchange | Both policies have been dev-published to Exchange under disposable ids and deleted again. No ready-for-production Exchange asset is published from this repository. |
 | P4A marketplace | Reviewer findings on both policies are resolved and merged. No marketplace acceptance or listing is claimed here. See the [P4A submission pack](P4A-SUBMISSION.md). |
@@ -159,7 +159,7 @@ Every pull request and every push to `main` runs the
 The packaging and runtime jobs need repository secrets, so pull requests from
 forks skip them.
 
-Current library test counts: **116** for Approval-to-Execution Binding and **209**
+Current library test counts: **125** for Approval-to-Execution Binding and **214**
 for the aggregate-risk gate.
 
 To run the CI's `policies` checks locally, from a policy directory:

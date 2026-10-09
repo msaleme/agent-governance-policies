@@ -4,7 +4,7 @@ Prepared 2026-09-24. Updated 2026-09-25: the visibility blocker was resolved,
 reviewer findings #1–#7 were resolved and merged, and connected verification was
 complete. Updated 2026-10-03: aggregate-risk findings #14–#18 were resolved and
 closed, and source prerelease `v0.1.0-rc.1` was cut. Updated 2026-10-04: the re-review at
-`v0.1.0-rc.1` opened #47–#52; the fixes are described per policy below. #47–#52 were fixed, merged and closed, and source prerelease `v0.1.0-rc.2` was cut. Updated 2026-10-05: a runtime review opened #56–#58; all three were fixed, merged and closed, and source prerelease `v0.1.0-rc.3` was cut. Turnkey pack for submitting the two policies in this repo to the
+`v0.1.0-rc.1` opened #47–#52; the fixes are described per policy below. #47–#52 were fixed, merged and closed, and source prerelease `v0.1.0-rc.2` was cut. Updated 2026-10-05: a runtime review opened #56–#58; all three were fixed, merged and closed, and source prerelease `v0.1.0-rc.3` was cut. Updated 2026-10-09: his rc.3 re-review opened #62–#65; #62 and #65 are fixed and closed, #63 is fixed except one deferred item (N7a), and #64 (before GA) is open; source prerelease `v0.1.0-rc.4` was cut. Turnkey pack for submitting the two policies in this repo to the
 **P4A (Policies for Agents)** marketplace, mirroring the path the three published
 `agent-decoy-policies` siblings took. Submission itself is **UI-gated** (the P4A wizard) —
 this doc is everything a human needs to drive it; nothing here submits automatically.
@@ -24,7 +24,7 @@ unified project roots) a `.project.yaml`. Status per that list:
 | rust-toolchain pinned | OK — 1.89.0 | OK — 1.89.0 |
 | Builds to wasm32-wasip1 | OK (CI) | OK (CI) |
 | CI green (fmt/clippy -D warnings/test/wasm build) | OK — green on `main` | OK — green on `main` |
-| Lib tests | 116 pass | 209 pass |
+| Lib tests | 125 pass | 214 pass |
 | Reviewer findings addressed | OK — Tommaso Bolis #1–#7 resolved & merged (PR #19; publish/build fixes #23, #26). Re-review #50, #51 (claim narrowed + nonce cap) and #52 items 1–3 (canonical form, maximum approval lifetime, `rpc-param` envelope removal) fixed; a charset (UTF-7) bypass found in self-review also fixed | OK — P4A review #14 (PR #37), #15 (#39), #16 (#35, #42), #17 (#38), #18 (#36); all closed. Re-review #47 (blocker) and #49 B fixed, plus a charset (UTF-7) bypass found in self-review; #48 fixed (node-wide ledger, the new default `ledgerBackend: node`) and #49 A fixed (a refusal at the scope cap is O(1)) |
 | **Public accessibility** | **OK** — repo PUBLIC since 2026-09-24 | **OK** — repo PUBLIC since 2026-09-24 |
 
@@ -136,7 +136,9 @@ excludes all Flex identity material). No further visibility action is required t
    verified connected on a real gateway — so expect fewer round-trips. #1–#7 and #14–#18 are all
    closed. His re-review at `v0.1.0-rc.1` opened #47–#52; all six are fixed, merged and closed,
    and source prerelease `v0.1.0-rc.2` carries the fixes for his re-review. A later runtime review
-   opened #56–#58, fixed in source prerelease `v0.1.0-rc.3`.
+   opened #56–#58, fixed in source prerelease `v0.1.0-rc.3`. His rc.3 re-review opened #62–#65
+   (none blocks catalog approval); `v0.1.0-rc.4` fixes #62, #65 and all of #63 except N7a. #64 is
+   tracked for before GA.
 
 ## Not claimed
 No P4A submission, acceptance, dashboard ID, or publication is asserted here — those come from an actual

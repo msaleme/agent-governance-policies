@@ -462,7 +462,7 @@ Further honest limitations, disclosed rather than hidden:
 
 ### Testing
 
-`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **116 tests**, run via
+`src/test.rs` (declared as `#[cfg(test)] mod test;` from `src/lib.rs`; **125 tests**, run via
 `cargo +1.89.0 test --lib`) covers all five predicates via the vendored ABV vectors
 (`tests/fixtures/abv/`) plus hand-authored edge cases: config validation (empty/unknown predicates
 and enum values, `sidecar` rejection, duplicate/blank attester kids, **sub-32-byte attester key
