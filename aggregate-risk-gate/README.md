@@ -572,10 +572,10 @@ placeholder has been removed.
 
 ## Testing
 
-`cargo +1.89.0 test --lib --locked --offline` runs 209 tests, none of which touch the network or
+`cargo +1.89.0 test --lib --locked --offline` runs 214 tests, none of which touch the network or
 Docker:
 
-- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 55 tests): correctness of
+- **`src/ledger.rs` — the pure decision engine** (no PDK dependency, 57 tests): correctness of
   `reserve`/`force_reserve`/`force_reserve_checked`/`commit`/`release`/`record`/`snapshot`
   in isolation, plus two concurrency tests that are the load-bearing proof for this whole policy —
   `naive_counter_breaches_budget_under_concurrency` (a read-then-write counter admits 5 concurrent
@@ -603,7 +603,7 @@ Docker:
   without a window nothing resets; and a scope from an earlier period can be evicted.
   Two cover the cost of the cap (#49 A): 1,000 refusals against 100,000 live scopes examine no
   scope at all, and the idle index follows every settlement.
-- **`src/node_ledger.rs` — the node-wide ledger** (34 tests, over an in-memory test store that can
+- **`src/node_ledger.rs` — the node-wide ledger** (38 tests, over an in-memory test store that can
   force CAS conflicts and storage errors): two workers racing on every write admit exactly 3 of the
   reference calls, and interleaved workers admit exactly what fits; persistent CAS mismatch is
   `Contention` and a storage error `Unavailable`, both reserving nothing; a reservation made on
@@ -625,7 +625,7 @@ Docker:
   charge them, and are collected after the tombstone window. A raw empty host value (fixint `Eof`)
   reads as absent; a zero contribution holds nothing; a scope refuses past 512 held entries; and a
   new digest key or window starts a fresh ledger with fresh slots.
-- **`src/lib.rs` — the PDK filter** (116 tests), mostly exercised end to end through the
+- **`src/lib.rs` — the PDK filter** (119 tests), mostly exercised end to end through the
   `pdk-unit` harness, which runs the node backend over the real `LocalDataStorage` adapter: per-mode
   behavior (`monitor` never denies; `block` denies past budget), both `onDeny` renderings and their
   JSON-RPC-notification/non-JSON-RPC fallbacks, all three `contribution` modes including the

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — rc.4 planned
+## 0.1.0-rc.4 — 2026-10-09
 
 ### Approval-to-Execution Binding (#62, #63)
 
