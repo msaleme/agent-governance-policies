@@ -2344,7 +2344,10 @@ fn allowed_rpc_param_call_forwards_without_the_envelope() {
         r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"deploy.apply","arguments":{args}}}}}"#
     );
     assert_eq!(forwarded.body(), expected.as_bytes());
-    assert_eq!(forwarded.header("content-length"), None);
+    assert_eq!(
+        forwarded.header("content-length"),
+        Some(expected.len().to_string().as_str())
+    );
 }
 
 #[test]
@@ -2610,21 +2613,6 @@ fn rc4_monitor_denial_also_strips_the_header() {
         .contains("would-deny"));
     assert_eq!(forwarded.header("x-approval"), None);
 }
-#[test]
-fn rc4_rewritten_body_uses_host_framing() {
-    let (backend, mut tester) = harness!(config_with(
-        json!({"requiredPredicates":["P1","P2","P4","P5","P6"],"approvalSource":"rpc-param"})
-    ));
-    let args = json!({"replicas":3});
-    let envelope = sound_approval("deploy.apply", &args, "host-framing", &far_future());
-    tester.request(rpc_param_request(&rpc_param_body(&envelope, &args)));
-    let forwarded = backend.next().unwrap();
-    assert_eq!(forwarded.header("content-length"), None);
-    let body: Value = serde_json::from_slice(forwarded.body()).unwrap();
-    assert!(body.get("approvalBinding").is_none());
-    assert_eq!(body["params"]["arguments"], args);
-}
-
 #[test]
 fn rc4_sweep_waits_through_the_boundary_second() {
     assert!(!nonce_sweep_due(100, 100));

@@ -161,8 +161,8 @@ spec:
         monitor-mode forward), so the MCP server never receives the approval or
         its attestation MACs and a strict JSON-RPC server does not see an
         unknown top-level member. The member is cut out byte-for-byte (the rest
-        of the body is not re-serialized) and content-length is removed so the
-        host frames the body. With approvalSource=header, remove the configured
+        of the body is not re-serialized) and content-length is set to the new
+        byte length. With approvalSource=header, remove the configured
         approvalHeader after evaluation. Both sources are stripped in block and
         monitor mode. Set false only if the upstream must see the envelope.
     clientResponses:

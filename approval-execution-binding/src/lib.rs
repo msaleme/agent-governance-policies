@@ -1642,13 +1642,13 @@ fn forwarded_result(denied_predicate: Option<&str>, envelope_unstripped: bool) -
     }
 }
 
-/// Replace the forwarded body, then remove the original length so the host
-/// frames the rewritten bytes. Headers have not been sent yet in this state.
+/// Replace the forwarded body and its declared length while headers are buffered.
+/// Explicit length rewriting retains the verified upstream framing contract.
 fn replace_forwarded_body(handler: &dyn HeadersBodyHandler, body: &[u8]) -> Result<(), String> {
     handler
         .set_body(body)
         .map_err(|err| format!("set_body failed: {err:?}"))?;
-    handler.remove_header(CONTENT_LENGTH);
+    handler.set_header(CONTENT_LENGTH, &body.len().to_string());
     Ok(())
 }
 

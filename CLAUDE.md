@@ -37,7 +37,7 @@ cargo +1.89.0 test --tests --no-run --locked --offline      # integration tests 
 cargo +1.89.0 build --release --target wasm32-wasip1 --locked
 ```
 
-The `--lib` test suite is the authoritative gate, at 125 tests for approval binding
+The `--lib` test suite is the authoritative gate, at 124 tests for approval binding
 and 214 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
 those counts. CI's `runtime-e2e` job runs the aggregate-risk `#[pdk_test]` suites
 on a real Flex Gateway 1.14.0 container (its `case2c` is run by hand), and the

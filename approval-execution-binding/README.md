@@ -186,7 +186,7 @@ Denial rendering follows the request's own framing, not just `onDeny`:
 | `attesterKeys` | `{kid, key}[]` | `[]` | Known attester keys for the P5 HMAC-SHA256 check over the `mcp-v1` payload. Each `key` must be **at least 32 bytes** — a shorter key is rejected at startup. An attestation from an authority not listed here always fails P5. |
 | `clockSkewSeconds` | integer | `60` | Tolerance applied to P4: valid while `now <= not_after + clockSkewSeconds`. `0`–`3600`; anything else is rejected at startup (**breaking**: a negative value used to be treated as `0`, and there was no upper limit). |
 | `maxApprovalLifetimeSeconds` | integer | `0` (off) | Upper bound on an approval's **remaining** lifetime, checked under P4 against the gateway clock: an approval with `not_after > now + maxApprovalLifetimeSeconds + clockSkewSeconds` is denied `predicate=P4`. `1`–`31536000` when set; anything else, or setting it without P4 in `requiredPredicates`, is rejected at startup. See [Approval lifetime bound](#approval-lifetime-bound). |
-| `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and remove `content-length` so the host frames the body. With `approvalSource: header`, remove the configured approval header after evaluation in both modes. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
+| `stripApprovalEnvelope` | boolean | `true` | With `approvalSource: rpc-param`, cut the `approvalRpcField` member out of every forwarded body (an allowed call, or a monitor-mode forward) and set `content-length` to the new byte length. With `approvalSource: header`, remove the configured approval header after evaluation in both modes. See [rpc-param envelope removal](#rpc-param-envelope-removal). |
 | `clientResponses` | `forward`\|`deny` | `forward` | How a well-formed JSON-RPC **response** POSTed by the client (a `roots/list`, sampling or elicitation reply) is handled. `forward`: passed through untouched, stamped `out-of-scope`, in both modes. `deny`: treated as malformed (pre-#57 behaviour). Either way the approval does not bind response content — see [Inspection boundary](#inspection-boundary). Any other value is rejected at startup. |
 | `expectedAudience` | string | `""` | This gateway's deployment audience, bound into the `mcp-v1` payload as `aud`. **Required (non-empty) whenever P5 is required.** |
 | `expectedTenant` | string | `""` | The tenant this gateway serves, bound as `tenant`. **Required (non-empty) whenever P5 is required.** |
@@ -319,10 +319,13 @@ evaluation in block and monitor modes when stripping is enabled.
   `monitor;envelope=unstripped` (or adds `;envelope=unstripped` to a would-deny) instead of
   `allowed`. The removal runs before the P6 reservation, so a failure
   never uses up a nonce.
-- **The host frames rewritten bodies.** After `set_body` succeeds, the policy removes
-  `content-length` rather than setting a replacement. Other request-body bytes remain
-  unchanged. The `runtime-e2e-approval` CI job exercises this path against Flex 1.14.0;
-  its result is Local Mode evidence, not a connected-mode claim.
+- **Explicit length rewriting.** After `set_body` succeeds, the policy sets
+  `content-length` to the new byte length. Removing it was attempted for #63 N7(a),
+  but the existing Flex 1.14.0 upstream test returned 404 instead of 200 in
+  [CI run 37933777102](https://github.com/msaleme/agent-governance-policies/actions/runs/37933777102).
+  The test requires both the exact stripped bytes and their declared length; this
+  result does not identify which matcher failed. Removal is deferred, and the
+  existing runtime test remains unchanged. This is Local Mode evidence.
 
 On a denial the log carries a structured event, e.g.
 `{"event":"approval_execution_binding","action":"deny","predicate":"P1","reason":"approved action 'deploy.apply', executed 'deploy.destroy'"}`

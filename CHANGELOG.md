@@ -13,7 +13,8 @@
   The key-format change resets recognition of old raw-nonce reservations: let
   outstanding approvals expire before upgrading.
 - Strip evaluated header-mode approval envelopes in block and monitor modes when
-  enabled. Remove Content-Length after body stripping so the host frames it.
+  enabled. Centralize the Content-Length header name; retain explicit length
+  rewriting after the proposed removal failed the existing runtime test (#63 N7a).
   Add UI bounds for approval lifetime and document monitor/framing limits.
 - Fix Rust 2018 panic formatting and check all targets with Clippy for both policies.
 
