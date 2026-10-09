@@ -31,14 +31,14 @@ here.** Edit it normally. The two policies originated from the Tier 1 build kit 
 ```bash
 cd approval-execution-binding        # or aggregate-risk-gate
 cargo +1.89.0 fmt --check
-cargo +1.89.0 clippy --lib --locked --offline -- -D warnings
+cargo +1.89.0 clippy --all-targets --locked --offline -- -D warnings
 cargo +1.89.0 test --lib --locked --offline
 cargo +1.89.0 test --tests --no-run --locked --offline      # integration tests compile (Docker to run)
 cargo +1.89.0 build --release --target wasm32-wasip1 --locked
 ```
 
-The `--lib` test suite is the authoritative gate, at 116 tests for approval binding
-and 209 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
+The `--lib` test suite is the authoritative gate, at 125 tests for approval binding
+and 214 for the aggregate-risk gate. `tests/*.rs` need Docker and aren't part of
 those counts. CI's `runtime-e2e` job runs the aggregate-risk `#[pdk_test]` suites
 on a real Flex Gateway 1.14.0 container (its `case2c` is run by hand), and the
 `runtime-e2e-approval` job does the same for approval binding's `tests/requests.rs`. Regenerate config assets with the

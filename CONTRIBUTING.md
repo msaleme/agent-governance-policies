@@ -22,7 +22,7 @@ the CI `policies` job:
 
 ```bash
 cargo +1.89.0 fmt --check
-cargo +1.89.0 clippy --lib --locked --offline -- -D warnings
+cargo +1.89.0 clippy --all-targets --locked --offline -- -D warnings
 cargo +1.89.0 test --lib --locked --offline
 cargo +1.89.0 test --tests --no-run --locked --offline
 cargo +1.89.0 build --release --target wasm32-wasip1 --locked

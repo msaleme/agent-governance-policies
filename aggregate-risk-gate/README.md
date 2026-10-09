@@ -178,7 +178,7 @@ at the HEADER phase, before this policy ever buffers the body:
 
 A body excluded on any of these grounds is never buffered or read, so its method is unknown; it is
 treated as governed and unpriceable —
-fail-closed in `block` mode (denied, `onDeny` applies), recorded as zero contribution with the gap
+fail-closed in `block` mode (denied, `onDeny` applies), forwarded without a ledger entry, with the gap
 flagged on the header in `monitor` mode (see the Configuration table below). None of this is a
 security containment boundary the way a tripwire's would be — a call this policy cannot price has
 an explicit, safe fallback, not a risk of missing a hidden secret — and none of it substitutes for
@@ -214,7 +214,7 @@ batch have no request id to answer and are not echoed.
 | `contribution` | `estimated-token-weight`\|`spend-amount`\|`fixed-weight` | `fixed-weight` | How the call's contribution is computed. `fixed-weight` — static, from `fixedWeight`. `spend-amount` — integer minor units read from the request body at `spendAmountField`. `estimated-token-weight` — reserved as `estimatedTokens` before authorizing, then **committed at that same estimate** on a successful response (this build's response handling is headers-only and never reads the response body for a real `usage.total_tokens` figure — see Scope of the guarantee below). This mode was called `token-cost` in earlier drafts; that name is now rejected at configure time, because the mode charges a fixed estimate and never measures a cost. A JSON-RPC **batch** (array) request's per-item contribution is multiplied/summed across every governed item, never priced as a single call. |
 | `fixedWeight` | integer, `0`–`9007199254740991` | `1` | Per-call contribution when `contribution=fixed-weight`. |
 | `governedMethods` | list of strings | `["tools/call"]` | The JSON-RPC methods this policy prices and enforces, matched exactly and case-sensitively. All other traffic is forwarded uncharged and stamped `pass;reason=ungoverned-method` (see Applicability above). Must be non-empty with no blank, padded or duplicate entries; `"*"` is rejected. |
-| `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. Only governed requests are read. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and recorded as zero in `monitor` mode. |
+| `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. Only governed requests are read. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and forwarded without consuming a scope slot in `monitor` mode. |
 | `spendCurrency` | string, ISO 4217 | `USD` | Currency of `spend-amount` values: three uppercase letters, with amounts in that currency's ISO 4217 minor unit. Stamped into `resultHeader` as `unit=<code>-minor`. The policy does no currency conversion. |
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
 | `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. In both modes a reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
@@ -266,7 +266,7 @@ Neither format carries another session's call content or the raw identity — on
 digest and the numeric totals — so both are safe to forward downstream to logging, SIEM, or a
 Kill Switch. The gateway log never carries an identity. At policy start-up the gateway log separately carries a plain diagnostic
 line naming the armed configuration, e.g.
-`Aggregate Risk Gate armed: budgetScope=agent, aggregateBudget=3000, contribution=fixed-weight, mode=block`
+`Aggregate Risk Gate armed: budgetScope=agent, aggregateBudget=3000, contribution=fixed-weight, ledgerBackend=node, mode=block`
 — a one-time informational line, not a per-call structured event; the `resultHeader` above is the
 per-call decision record.
 
@@ -812,3 +812,18 @@ The `make release` goal also publishes the policy to Anypoint Exchange, but as a
 ### Policy Examples
 
 The PDK provides provides a set of example policy projects to get started creating policies and using the PDK features. To learn more about these examples see [Custom policy Examples](https://docs.mulesoft.com/pdk/latest/policies-pdk-policy-templates).
+
+### rc.4 ledger corrections
+
+A shared `ledgerNamespace` with an empty `scopeDigestKey` permits co-located
+policies using that namespace to read and write the ledger. Startup warns but
+continues; use a secret digest key for shared namespaces.
+
+Monitor-mode unpriceable and out-of-range calls retain their diagnostic verdict
+without recording a zero-cost scope. Sweeps persist reconciled busy records as
+well as their reservation markers. A deferred commit with a confirmed missing
+record is dropped after three capacity failures, emitting the warning event
+`aggregate_risk_pending_commit_dropped` with reason `missing-record-at-capacity`.
+That commit remains uncharged; storage outages and ordinary CAS contention do
+not trigger this drop. This bounded queue recovery does not resolve the broader
+cleanup and accounting limitations tracked in #64.

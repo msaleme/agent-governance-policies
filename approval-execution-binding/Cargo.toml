@@ -31,7 +31,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 
 [dev-dependencies]
 pdk-test = { version = "=1.10.0" }
-pdk-unit = { version = "=1.10.0", features = ["enable_stop_iteration", "experimental"] }
+pdk-unit = { version = "=1.10.0", features = ["enable_stop_iteration", "experimental", "experimental_logs"] }
 httpmock = "0.6"
 reqwest = "0.11"
 

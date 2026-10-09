@@ -120,7 +120,10 @@ spec:
         With ledgerBackend "node", an optional name (1 to 64 letters, digits,
         dots, underscores, or hyphens) that lets several policy instances on
         the same gateway share one ledger. Empty (default) keeps the ledger
-        private to this policy instance. Instances sharing a namespace must
+        private to this policy instance. A non-empty namespace with an empty
+        scopeDigestKey logs a startup warning: co-located policies using the
+        same namespace can read and write this ledger. Set a secret digest key.
+        Instances sharing a namespace must
         use the same scopeDigestKey, maxScopes, reservationTimeoutMs, window
         and windowMs. Changing scopeDigestKey, window or windowMs starts a
         fresh ledger: every scope starts from zero, and the old ledger's
@@ -277,7 +280,7 @@ spec:
         an exponent (1e3), a negative value, a string, or anything out of
         range is rejected, never rounded. A governed request whose body is
         unparseable or has no valid amount at this path is unpriceable:
-        denied in block mode (onDeny applies), recorded as zero contribution
+        denied in block mode (onDeny applies), forwarded without consuming a scope slot
         in monitor mode so the gap is visible. Ungoverned methods (see
         governedMethods) are never read for an amount.
     spendCurrency:

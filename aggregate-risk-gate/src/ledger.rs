@@ -535,12 +535,9 @@ pub trait LedgerStore {
     /// the budget.
     fn release(&self, reservation: &Reservation, now: u64) -> Settlement;
 
-    /// Records `contribution` directly into `committed`, bypassing both the
-    /// budget check and the reserve/commit two-step. Used for a call whose
-    /// exposure is known only after it already happened and so can no longer be
-    /// denied (e.g. monitor mode's unpriceable-at-request-time cases, or a
-    /// direct audit correction). Refused only for `AtCapacity`, `Contention`
-    /// or `Unavailable`, in which case nothing is recorded.
+    /// Test-only direct charge for exercising ledger transitions without a
+    /// request filter. Production uses reservation/settlement for priced calls.
+    #[cfg(test)]
     fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal>;
 
     /// A read-only view of one scope's current state, for tests.
@@ -897,6 +894,7 @@ impl<C: Fn() -> u64> LedgerStore for Ledger<C> {
         self.settle(reservation, now, false)
     }
 
+    #[cfg(test)]
     fn record(&self, scope: &str, contribution: u64, now: u64) -> Result<(), Refusal> {
         self.with_state(scope, now, |state, _, _| {
             state.record(contribution);
