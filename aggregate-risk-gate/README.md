@@ -205,7 +205,8 @@ batch have no request id to answer and are not echoed.
 | `ledgerBackend` | `node`\|`worker` | `node` | Where the ledger lives. `node` — one ledger per policy instance per gateway replica, in the gateway's node-local shared data, shared by all its Envoy workers; every write is a bounded compare-and-swap (see Scope of the guarantee). `worker` — one in-memory ledger per Envoy worker, as in earlier builds; a caller can multiply it across workers. `cluster` (one budget across replicas) is **not implemented** and is rejected at configure time, as is any other value. |
 | `ledgerNamespace` | string, empty or 1–64 of `A–Z a–z 0–9 . _ -` | `""` | Empty — the node ledger is private to this policy instance. Set — the ledger is stored under that name, so every instance on the replica configured with the same namespace (and the same `scopeDigestKey`) shares one budget per scope. Requires `ledgerBackend: node`. |
 | `maxScopes` | integer, `1`–`1000000` | `10000` | Most scopes the ledger tracks at once (per worker for `worker`, per replica for `node`). At the cap a new scope may take the place of an idle scope (nothing committed or reserved). If none is idle the call is denied in `block` mode with `reason=scope-capacity`, or forwarded in `monitor` mode with that reason stamped. Live totals are never evicted. A refusal at the cap costs constant work, however many scopes are live (see Identity below). |
-| `reservationTimeoutMs` | integer, `1000`–`86400000` | `60000` | How long a reservation may stay unsettled before it is reclaimed and its budget freed. Set it above the longest upstream timeout. See Reservation lifecycle below. |
+| `reservationTimeoutMs` | integer, `1000`–`86400000` | `60000` | How long a reservation may stay unsettled before `onReservationTimeout` applies. Set it above the longest legitimate upstream duration. A failed call arriving after the tombstone window can remain charged. See Reservation lifecycle below. |
+| `onReservationTimeout` | `auto`\|`commit`\|`release` | `auto` | `auto` resolves to `commit` in block mode and `release` in monitor mode. Commit provisionally charges at the deadline; a late failure refunds only within the tombstone window and the same accounting period. Release retains the earlier uncharged reclaim behavior. |
 | `scopeDisclosure` | `digest`\|`none`\|`raw` | `digest` | How the scope appears in `resultHeader` and denial messages. `digest` — `<budgetScope>:hmac-<16 hex>` (HMAC-SHA256 under `scopeDigestKey`, first 8 bytes), or `sha256-…` when no key is set. `none` — just `<budgetScope>`. `raw` — the canonical identity itself; only for trusted, internal consumers. |
 | `scopeDigestKey` | string (sensitive) | `""` | HMAC key for `scopeDisclosure=digest` and, with `ledgerBackend: node`, for the shared-data ledger keys. Without a key the digest is a plain SHA-256 and the ledger keys an unkeyed HMAC, which anyone holding a candidate identity can recompute; the empty default is kept so the default configuration starts, and a warning is logged at startup. Set it from a secret. Changing it gives every identity a fresh budget (see Known edges). |
 | `aggregateBudget` | integer, `0`–`9007199254740991` | `3000` | The exposure budget for the scope's current window, in `contribution`'s units (see Units below). A call is authorized only if committed-plus-reserved exposure for its scope, including its own contribution, would not exceed this. |
@@ -217,7 +218,7 @@ batch have no request id to answer and are not echoed.
 | `spendAmountField` | string | `params.amount` | Dot-separated path into the parsed JSON-RPC request body read for the spend amount when `contribution=spend-amount`. Only governed requests are read. The value must be a JSON integer count of minor units (`1234` = 12.34 USD). Missing, unparseable, a fraction (`12.34`), a float-shaped integer (`1234.0`), an exponent (`1e3`), negative, a string, or too large for a u64: unpriceable. Above `9007199254740991`, or a batch that sums past it: out of range. Both are denied in `block` mode and forwarded without consuming a scope slot in `monitor` mode. |
 | `spendCurrency` | string, ISO 4217 | `USD` | Currency of `spend-amount` values: three uppercase letters, with amounts in that currency's ISO 4217 minor unit. Stamped into `resultHeader` as `unit=<code>-minor`. The policy does no currency conversion. |
 | `estimatedTokens` | integer, `0`–`9007199254740991` | `500` | Pre-flight reservation estimate (tokens) when `contribution=estimated-token-weight`. Set to a conservative upper bound for the traffic this instance governs — this build commits the estimate itself on success (see `contribution` above), so an estimate set too low under-counts real exposure; released outright on upstream failure. |
-| `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. In both modes a reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
+| `mode` | `monitor`\|`block` | `monitor` | `monitor` — reserve, commit, and log the verdict every call would have received, but always forward the request regardless of budget; a call that composes past budget still signals a policy violation even though it is forwarded. `block` — deny a call whose contribution would push its scope over `aggregateBudget`, per `onDeny`, and signal a policy violation on that denial. With `onReservationTimeout: auto`, block mode provisionally charges abandoned calls and monitor mode releases them. An on-time reservation commits on HTTP 2xx/3xx and releases on 4xx/5xx; a JSON-RPC error inside an HTTP 200 is charged. |
 | `onDeny` | `rpc-error`\|`empty-403` | `rpc-error` | How a `block`-mode denial is rendered. `rpc-error` — in-band JSON-RPC response reusing the request's own id(s), error code `-32008`, message naming the scope and the budget that would be exceeded (never other sessions' call content); a denied **batch** gets back a matching JSON array with one `-32008` error per id, never a single collapsed error. `empty-403` — HTTP 403, empty body, no JSON-RPC envelope. Either way: a request the policy cannot confidently parse as JSON-RPC with echoable id(s) — including a body with a duplicate JSON object member, where this policy and the upstream tool could legitimately disagree about which id is "the" id — always falls back to `empty-403`; a JSON-RPC notification (no id) always gets an empty HTTP 202 on deny (JSON-RPC forbids responding to a notification). |
 | `resultHeader` | string | `x-aggregate-risk-gate` | Header stamped on the **client-facing response** recording the verdict and the running total, e.g. `allowed;scope=agent:sha256-b534199b5ab2d7a9;contribution=800;total=2400/3000;unit=points` or, on denial, `denied;scope=agent:sha256-b534199b5ab2d7a9;would-be-total=3200;budget=3000;unit=points` (the `scope=` form follows `scopeDisclosure`). Calls that are not priced carry `reason=` instead of totals: `missing-identity`, `invalid-identity`, `scope-capacity`, `scope-saturated`, `ledger-contention`, `ledger-unavailable`, `stale-admission`, `unpriceable`, or `out-of-range`. Ungoverned traffic carries `pass;reason=ungoverned-method`. Never carries other sessions' call content, and by default never the raw identity. |
 
@@ -233,6 +234,7 @@ batch have no request id to answer and are not echoed.
     ledgerNamespace: ""
     maxScopes: 10000
     reservationTimeoutMs: 60000
+    onReservationTimeout: auto
     scopeDisclosure: digest
     scopeDigestKey: ""        # set from a secret; see scopeDigestKey above
     aggregateBudget: 3000
@@ -266,7 +268,7 @@ Neither format carries another session's call content or the raw identity — on
 digest and the numeric totals — so both are safe to forward downstream to logging, SIEM, or a
 Kill Switch. The gateway log never carries an identity. At policy start-up the gateway log separately carries a plain diagnostic
 line naming the armed configuration, e.g.
-`Aggregate Risk Gate armed: budgetScope=agent, aggregateBudget=3000, contribution=fixed-weight, ledgerBackend=node, mode=block`
+`Aggregate Risk Gate armed: budgetScope=agent, aggregateBudget=3000, contribution=fixed-weight, ledgerBackend=node, mode=block, onReservationTimeout=commit`
 — a one-time informational line, not a per-call structured event; the `resultHeader` above is the
 per-call decision record.
 
@@ -306,7 +308,7 @@ review #49 A). The worker ledger keeps its scopes ordered by when each becomes i
 at the cap looks at one candidate and either evicts it or is refused; a unit test refuses 1,000 new
 scopes against 100,000 live ones without examining any. The node ledger refuses at the cap after
 reading two small records, and only one worker per replica rescans for idle scopes, at most once a
-second; idle scopes are also swept every minute, so stale keys are deleted below the cap too. A stranded reservation stops pinning its scope two
+second; idle scopes are also swept every minute, so stale keys are deleted below the cap too. In `release` mode, a stranded reservation stops pinning its scope two
 timeouts after it was made (see Reservation lifecycle). Committed exposure does not expire; that is
 reset by `window`.
 
@@ -316,66 +318,53 @@ must now set `identitySource: trusted-header` and, to keep raw scopes in the res
 
 ## Reservation lifecycle
 
-Every reservation gets an id that is unique on the replica (a random 64-bit per-worker prefix
-and a counter), so a response handled by another worker settles it by id, a creation time and an expiry time
-of creation + `reservationTimeoutMs`. Time is the gateway's own clock. A call is admitted at the
-time its request body has been fully received; a bodyless or uninspectable call, which is decided
-at the headers, uses the time its headers arrived. The clock is read again when the response
-headers arrive. A reservation ends in exactly one of
-these states, and the response stamps which one as `settlement=`:
+A reservation has a replica-unique id and expires at admission time plus
+`reservationTimeoutMs`, using the gateway clock. Admission starts after the whole request
+body arrives (at headers for a bodyless/uninspectable call), so slow uploads do not shorten
+that lifetime. Both backends refuse an already-expired admission as `stale-admission`.
 
-| `settlement=` | When | Effect on the ledger |
-|---|---|---|
-| `committed` | Success response before the reservation was reclaimed | Reserved amount moves to committed |
-| `released` | Failure response before the reservation was reclaimed | Reserved amount is freed |
-| `late-committed` | Success response after reclaim, while the reservation's tombstone is still held (see below) | Amount is added to committed, with no budget check: the call did happen, and under-counting it is the unsafe direction |
-| `late-released` | Failure response after reclaim, while the tombstone is still held | Nothing; the amount was already freed |
-| `not-active` | The reservation was already settled, or its tombstone was dropped | Nothing |
+**Breaking in rc.5:** `onReservationTimeout: auto` resolves at startup to `commit` in block
+mode and `release` in monitor mode. The armed log includes the resolved value. Explicit
+`commit` or `release` overrides the mode default.
 
-Reclaim is lazy. It runs, under the same lock as admission (on the node backend, inside the same
-compare-and-swap), whenever a call touches the scope, even a call that is then refused, and
-across all scopes when a new scope arrives at a ledger already holding `maxScopes`. A reservation is
-reclaimed by the first such pass at or after its expiry, which frees its budget and leaves a
-tombstone so a slow response can still settle late. The tombstone is kept for at least one more
-timeout and dropped by the first pass at or after `expiry + reservationTimeoutMs`. From then on the
-reservation is counted as abandoned. A response settles before that pass runs, so the
-"one more timeout" is a minimum, not a deadline. If nothing touches the scope, a response arriving
-long after two timeouts still settles `late-committed` and is charged. That errs toward
-over-counting, the safe direction, and was observed on a real gateway
-(`docs/AGGREGATE-RISK-CONNECTED-2026-10-01.md`, case 5b). This covers a client that disconnects, a cancelled request,
-and an upstream that times out without a response reaching this policy: their reservations free up
-after the timeout instead of pinning the budget for the life of the worker.
+- **Commit:** at the deadline, reserved exposure moves to committed as a provisional
+  charge. Reclamation is lazy: the first scope touch or cleanup at/after the deadline
+  makes the transition under the same lock or CAS as admission. The contribution never
+  leaves the total in that accounting period. A late success within the tombstone window
+  is already charged and makes no second charge. A late failure refunds with
+  `saturating_sub` only if the charge's accounting period is unchanged. It never refunds
+  exposure into a newer period. A response after the tombstone window cannot undo or add
+  that charge. The node marker protocol preserves this rule across workers and retries.
+- **Release:** retains the earlier behavior: expiry frees the budget uncharged. A late
+  success while the tombstone is held adds the contribution; a late failure changes
+  nothing. Tombstone removal remains lazy in this mode, so an untouched tombstone can
+  settle beyond two timeouts. A touch that drops it makes later settlement `not-active`.
+  The earlier runtime evidence's case 5 describes this profile.
 
-Settling by id means a duplicate or reordered response cannot commit or release twice, a commit
-after a release changes nothing, and a release after a commit cannot take back committed exposure.
+A tombstone's window ends at `expires_at + reservationTimeoutMs`. Under commit mode it is
+checked before settlement, even if no intervening request touched the scope. Under release
+mode the historical settlement-before-reclaim ordering is retained. Duplicate settlements
+never repeat a charge or refund.
 
-**Choosing the timeout.** The timeout runs from when the gateway has received the whole request
-body, not from when the headers arrived, so a client cannot shorten its own reservation by
-uploading slowly (#56). Set `reservationTimeoutMs` above the longest time a governed call can
-legitimately take from then, including upstream and gateway timeouts. Too short, and a slow call's
-reservation is reclaimed while the call is still running. That frees budget another call can take
-before the slow call commits late, so the scope can briefly overshoot its budget by the late amount.
-Too long, and a stranded reservation holds budget longer than needed. Overshoot only happens past
-the timeout. Within it the budget holds exactly.
+| `settlement=` | Effect |
+|---|---|
+| `committed` / `released` | On-time success charges; failure frees the hold |
+| `late-committed` / `late-released` | Release-mode late success charges; late failure is a no-op |
+| `already-charged` | Provisional charge already exists; no additional charge or cross-period refund |
+| `refunded` | Provisional charge refunded within its original period |
+| `not-active` | Duplicate, unknown, or outside the tombstone window; no change |
+| `deferred` | Node store could not apply settlement; retry/marker rules below apply |
 
-A call that runs for longer than twice the timeout, on a scope that another call touches in the
-meantime, is worse off: its tombstone is dropped before it responds, so it settles `not-active`
-and is **never charged**. Timing from body receipt does not prevent this when the upstream's
-duration depends on what the client sends (a costly query, a large `arguments` payload), so a
-client can still pick calls that outlive their reservation. The undercount lasts until a restart
-with `window: worker-lifetime`, or until the window rolls with `fixed-period`. Set the timeout above
-twice the longest upstream time a client can provoke, not the typical one.
+**Timeout trade-off:** choose a timeout above the longest legitimate call. Commit mode
+prevents repeated uncharged abandoned calls, but an honest slow call can remain charged even
+if it ultimately fails, when its failure arrives after the tombstone window. Release mode
+allows free side effects when a response never arrives, and can overshoot when a late
+success lands after freed budget was reused. With a fixed window, older committed charges
+still reset at the window boundary; worker-lifetime charges persist until restart.
 
-As a guard, both ledger backends refuse to create a reservation whose deadline is already at or
-before the gateway clock, re-read at reserve time (the node ledger reads it from the store, the
-worker ledger from the same gateway clock). Such a call is denied with `reason=stale-admission`
-(`monitor` forwards it and stamps the reason) instead of being admitted with a budget hold that is
-reclaimed at once.
-
-A response that is not one of the normal kinds (`committed`, `released`) writes one log line with
-the ledger counters: active, committed, released, expired, late-committed, late-released, abandoned,
-not-active, deferred and contended. The line carries no identity. `settlement=deferred` appears only
-with the node ledger, when a settlement could not be written (see Scope of the guarantee).
+Unusual settlements log the existing counters plus `provisional-charged` and
+`provisional-refunded`, separately from `late-committed`. No identity is logged. Counters
+on the node backend describe work performed by that worker, not a replica-wide metric.
 
 **Worker restart and config apply.** This paragraph describes `ledgerBackend: worker`; for the
 node ledger see Scope of the guarantee. The worker ledger is in the memory of the worker's wasm VM. When the
@@ -453,17 +442,45 @@ read-then-write fallback and no unconditional overwrite. Concretely:
 - **Settlement is safe by direction.** A commit that cannot be written to its scope record is
   written instead to a per-reservation *commit marker* (a separate shared-data key, created with
   compare-and-swap), queued on the worker and retried on its next calls, stamped
-  `settlement=deferred`. No worker takes a reservation off a record without first claiming its
-  marker by compare-and-swap, so a worker that reclaims the reservation at its deadline, or drops
+  `settlement=deferred`. A worker claims a reservation marker with compare-and-swap before taking it off
+  its record; when marker capacity is exhausted, the scope transition itself is authoritative, so a worker that reclaims the reservation at its deadline, or drops
   its tombstone, charges a marked commit instead of discarding it. A commit made before the
-  tombstone window closes therefore counts in the total at every moment, even if the committing
+  tombstone window closes, when its marker can be persisted, is recoverable even if the committing
   worker never handles another call or its VM restarts and loses the queue. A commit that could not
   be marked either (the tombstone was already dropped, or the store failed) stays only in the
-  queue, which charges it even if its reservation has meanwhile been reclaimed; while 256 or more
+  queue. In release mode it can charge even after reclaim; commit mode never repeats a
+  provisional charge after its tombstone window; while 256 or more
   such commits are queued, new reservations are refused as contended. A commit whose record reads as missing while the reservation could still be on it
   (PDK reports a host read error as "no value") is charged as a late commit rather than dropped. A
-  release that cannot be written leaves the reservation held until it is reclaimed: an over-count
-  that frees itself after `reservationTimeoutMs`.
+  release that cannot be written leaves the reservation held: release mode eventually frees
+  it, while commit mode provisionally charges it at timeout.
+- **Cleanup budget and honest limit.** A sweep processes at most 256 scope/marker keys
+  in sorted order, strictly after the cursor stored in the shared `Sweep` record. It
+  reserves part of that budget for metadata and marker work. An incomplete pass saves
+  its cursor with CAS and schedules continuation after `MIN_RESCAN_MS` (1 s); the final
+  pass resets the cursor and retains the ordinary idle/periodic schedule. Older sweep
+  records without a cursor start at the beginning. **`get_keys()` still lists every key
+  in one call:** PDK has no paged listing. Filtering and sorting that list remain
+  unbounded. The budget limits per-key record processing; reconciliation can perform
+  additional bounded marker/CAS work for the up-to-512 held entries in each record.
+  Node configurations above 100000 scopes warn about listing cost; the schema maximum
+  remains 1000000.
+- **Marker cap.** All reservation marker keys (including expiry/provisional claims)
+  count against a separate cap equal to `maxScopes`, alongside the scope counter.
+  Creation reserves a counter slot with CAS before the put-if-absent. Timeout
+  transitions still proceed on the scope record at marker capacity, so one full
+  marker budget cannot prevent provisional charging or tombstone expiry. At capacity, a
+  deferred commit remains pending and is neither dropped nor charged because of the
+  refusal. It retries when capacity returns; 256 unpersisted commits still refuse new
+  reservations. Periodic collection runs before that refusal so a full queue
+  cannot prevent marker capacity from recovering. The queue is volatile and is lost on worker restart. Marker collection
+  uses a CAS deletion claim so only one collector decrements the counter. Ambiguous
+  writes, failed counter decrements, or a stalled collector can over-count and refuse
+  markers early. There is no downward recount: a listing cannot distinguish a live
+  writer's reserved counter slot from drift. Restart clears the local store and drift,
+  also resetting budgets. Legacy markers are counted when initializing the counter,
+  including when their count already meets/exceeds the cap;
+  co-located writers must run the same version and configuration.
 - **Cleanup never deletes live state.** An idle record becomes a tombstone by compare-and-swap,
   and only the cleanup pass that marked a tombstone for deletion deletes it, at once. Tombstones
   are timed on the gateway clock read at that moment, not on the request's start time. On Flex a
@@ -490,8 +507,8 @@ read-then-write fallback and no unconditional overwrite. Concretely:
     governed call. A PDK timer could drain it, but it is just as per-VM (lost on restart) and
     async, so the commit marker is what keeps a queued commit counted. The retries are immediate:
     PDK has no synchronous sleep to back off with inside a filter callback.
-  - A marked commit that another worker charges at the reservation's deadline is charged to the
-    period that deadline falls in. A commit whose write reported a failure that had in fact landed
+  - A marked commit that another worker charges is charged to that scope touch's current
+    accounting period. A commit whose write reported a failure that had in fact landed
     is charged twice. Both over-count. A committing worker stalled for longer than
     `reservationTimeoutMs` between its marker check and its marker write, past a cleanup pass,
     could leave a marker that nothing charges; each step is a back-to-back host call.
@@ -507,21 +524,26 @@ read-then-write fallback and no unconditional overwrite. Concretely:
     marking a tombstone and deleting it could delete a record re-created meanwhile. Each wasm VM is
     single-threaded and these are back-to-back host calls, so both are very unlikely.
   - Instances that share a `ledgerNamespace` must use the same `scopeDigestKey`,
-    `reservationTimeoutMs`, window and `maxScopes`. Nothing checks this.
+    `reservationTimeoutMs`, resolved `onReservationTimeout`, window and `maxScopes`. Nothing checks this.
   - **Reconfiguring.** Every key sits under a fingerprint of `scopeDigestKey`, `window` and
     `windowMs`, so changing any of them starts a fresh ledger: every identity gets a fresh budget
     at once (rotating the key is a budget reset), and the slot count starts at zero, so old
     records cannot keep `maxScopes` full. The old records are not deleted (another instance in a
     shared namespace may still use them); they sit in shared data until the gateway restarts,
-    bounded by the old `maxScopes`.
+    including markers and metadata. Each fingerprint has its own caps; repeated config
+    changes therefore accumulate state across fingerprints. Sweeps count recognized ledger
+    keys under other fingerprints and emit `aggregate_risk_foreign_prefix_keys` with only
+    the count, at most once per `GC_INTERVAL_MS` (60 s), never key strings. They never
+    delete those keys: another live instance can own them. A gateway restart clears
+    `local()` storage, reclaiming that memory and resetting every affected budget.
   - With `window: worker-lifetime` a scope that has committed anything is never idle, so it keeps
     its slot until a restart: `maxScopes` is then a cap on distinct identities for the life of the
     ledger, and once it is reached new identities are refused with `reason=scope-capacity`. Use
     `fixed-period` (an earlier period counts as idle) when identities churn.
   - A storage status other than success or a CAS conflict panics inside PDK, which fails the call.
   - One hot scope serialises every worker on one record, and a record grows with its in-flight
-    reservations, up to the 512-entry cap. A cleanup pass scans the whole namespace inside the call that runs it, at most
-    once a second per replica.
+    reservations, up to the 512-entry cap. Cleanup still lists and sorts the entire namespace
+    inside the call that runs it; only subsequent per-key processing has a pass budget.
 
 **`ledgerBackend: worker`.** One in-process ledger per Envoy worker, backed by a mutex-serialized
 map, as in earlier builds. It is race-safe within a worker (the concurrent-admission unit test
@@ -544,15 +566,13 @@ shows it holding the budget where a naive read-then-write counter breaches), but
 
 **Both backends:**
 
-- **A client that disconnects after the upstream ran is not charged.** Only the response leg
-  settles a reservation. If the client drops the connection after the call has been forwarded,
-  the response never reaches this policy, the reservation is reclaimed at its timeout (counted
-  `expired`, then `abandoned` once its tombstone is dropped), and the call is never charged,
-  although the upstream did the work. A client can do
-  this on purpose: while each such call holds its contribution until it times out, it can run
-  about `aggregateBudget ÷ contribution` uncharged calls every `reservationTimeoutMs`. This build
-  does not change that: a reclaimed reservation cannot tell a call the upstream ran from one it
-  never received. The `expired` and `abandoned` counters in the settlement log line show it.
+- **Abandoned-call accounting is configurable.** With `auto`, block mode provisionally
+  charges at timeout and monitor mode releases. Explicit `commit`/`release` overrides
+  that default. Release mode leaves a disconnected call uncharged even if the upstream
+  ran it; commit mode trades that undercount for possible over-counting of honest slow
+  failures whose response arrives after the tombstone window. Within that window a
+  failure refunds only in the charge's original accounting period. Neither backend can
+  know whether an upstream side effect actually happened from an absent response.
 - **No signed decision records.** No ledger operation is independently attestable outside the
   gateway. This build makes no claim that its admit/deny decisions are cryptographically
   non-repudiable.
@@ -825,5 +845,6 @@ well as their reservation markers. A deferred commit with a confirmed missing
 record is dropped after three capacity failures, emitting the warning event
 `aggregate_risk_pending_commit_dropped` with reason `missing-record-at-capacity`.
 That commit remains uncharged; storage outages and ordinary CAS contention do
-not trigger this drop. This bounded queue recovery does not resolve the broader
-cleanup and accounting limitations tracked in #64.
+not trigger this drop. The rc.5 marker-cap path is exempt from this missing-record drop: a cap-blocked
+commit stays pending until it can settle. Timeout accounting and cleanup now follow
+the rc.5 rules above.

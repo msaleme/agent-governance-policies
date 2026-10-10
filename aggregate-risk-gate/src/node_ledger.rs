@@ -104,15 +104,15 @@
 //   `RECOVER_MS` between its `Doomed` CAS and its delete could delete a record
 //   re-created after recovery. Single-threaded VMs make both very unlikely.
 // - Workers sharing an explicit `ledgerNamespace` must share the digest key,
-//   `ttl`, `window` and `maxScopes`; nothing checks that. Rotating the key or
+//   `ttl`, timeout disposition, `window` and `maxScopes`; nothing checks that. Rotating the key or
 //   changing the window gives every identity a fresh budget.
 // - With no window, a scope with committed exposure is never idle, so it keeps
 //   its slot until the gateway restarts.
 // - A host storage status other than ok or CAS mismatch panics inside PDK.
 // - One hot scope serialises every worker on one key. A record grows with its
 //   in-flight reservations up to `MAX_HELD` entries (then `Saturated`).
-// - The sweep scans every key of the namespace inline in the call that runs it
-//   (at most once per `MIN_RESCAN_MS`).
+// - Sweeps still list/sort every key inline; only subsequent per-key processing
+//   is bounded by `SWEEP_BUDGET`, with a persisted cursor.
 //
 // Scope of the guarantee: one budget per policy instance per gateway REPLICA,
 // reset when the gateway process restarts. Not shared across replicas, not
@@ -122,7 +122,7 @@
 use crate::ledger::Snapshot;
 use crate::ledger::{
     count_reclaim, count_settlement, expired_on_arrival, period, settle_free, LedgerStats,
-    LedgerStore, Refusal, Reservation, ReservationId, ScopeState, Settlement,
+    LedgerStore, Refusal, Reservation, ReservationId, ScopeState, Settlement, Timeout,
 };
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -156,12 +156,14 @@ const GC_INTERVAL_MS: u64 = 60_000;
 
 /// Read/claim attempts on one reservation's commit marker.
 const MARKER_RETRIES: u32 = 4;
+const SWEEP_BUDGET: usize = 256;
 
 // Every key below sits under the ledger's configuration fingerprint (see
 // `NodeLedger::new`).
 const SCOPE_PREFIX: &str = "s:";
 const MARKER_PREFIX: &str = "c:";
 const COUNT_KEY: &str = "n";
+const MARKER_COUNT_KEY: &str = "m";
 const SWEEP_KEY: &str = "sweep";
 
 /// Why a shared-data operation failed.
@@ -228,6 +230,10 @@ struct Sweep {
     not_before: u64,
     /// No periodic collection before this time.
     next_gc: u64,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    next_foreign_log: u64,
 }
 
 /// A reservation's commit marker, under `c:` + its id: the shared record of a
@@ -244,6 +250,10 @@ enum Mark {
     /// A touch dropped the reservation's tombstone, uncharged. A commit that
     /// finds this is past the tombstone window and is queued on its worker.
     Dropped,
+    /// Deadline charge is recoverable from the scope; never charge a queued commit twice.
+    Provisional,
+    /// Only the collector that wrote this mark may delete/decrement.
+    Collecting,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -283,6 +293,7 @@ struct Pending {
     /// worker never runs again, so the queue only lands it sooner.
     persisted: bool,
     missing_record_attempts: u8,
+    marker_cap_blocked: bool,
 }
 
 /// hex(HMAC-SHA256(`secret`, `parts`...)).
@@ -299,6 +310,26 @@ fn hmac_hex(secret: &[u8], parts: &[&[u8]]) -> String {
         .collect()
 }
 
+fn is_foreign_ledger_key(key: &str, own_prefix: &str) -> bool {
+    if key.starts_with(own_prefix) {
+        return false;
+    }
+    let Some((prefix, suffix)) = key.split_once('/') else {
+        return false;
+    };
+    prefix.len() == 16
+        && prefix.bytes().all(|b| b.is_ascii_hexdigit())
+        && (suffix == COUNT_KEY
+            || suffix == MARKER_COUNT_KEY
+            || suffix == SWEEP_KEY
+            || suffix
+                .strip_prefix(SCOPE_PREFIX)
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            || suffix
+                .strip_prefix(MARKER_PREFIX)
+                .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())))
+}
+
 /// The node-wide ledger. One per policy instance per worker, all sharing one
 /// namespace of the replica's shared data.
 pub struct NodeLedger {
@@ -308,6 +339,8 @@ pub struct NodeLedger {
     prefix: String,
     max_scopes: u64,
     ttl: u64,
+    timeout: Timeout,
+    marker_cap_refused: Cell<bool>,
     window: Option<u64>,
     /// The high 64 bits of every id this worker issues.
     id_prefix: u64,
@@ -341,6 +374,8 @@ impl NodeLedger {
             key_secret,
             max_scopes: u64::try_from(max_scopes).unwrap_or(u64::MAX),
             ttl,
+            timeout: Timeout::Release,
+            marker_cap_refused: Cell::new(false),
             window,
             id_prefix,
             next_id: Cell::new(1),
@@ -348,6 +383,11 @@ impl NodeLedger {
             pending: RefCell::new(VecDeque::new()),
             next_gc_check: Cell::new(0),
         }
+    }
+
+    pub fn with_timeout(mut self, timeout: Timeout) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     fn key(&self, scope: &str) -> String {
@@ -374,10 +414,88 @@ impl NodeLedger {
         })
     }
 
+    fn marker_count_key(&self) -> String {
+        format!("{}{MARKER_COUNT_KEY}", self.prefix)
+    }
+
+    fn marker_slot(&self) -> Result<(), StoreError> {
+        let key = self.marker_count_key();
+        for _ in 0..MARKER_RETRIES {
+            let (count, cas) = match self.store.get(&key)? {
+                Some((bytes, cas)) => (decode::<u64>(&bytes)?, Some(cas)),
+                // Existing ledgers predate the counter. Count the listing before
+                // creating it; no current writer can create a marker without it.
+                None => (
+                    self.store
+                        .keys()?
+                        .iter()
+                        .filter(|k| k.starts_with(&format!("{}{MARKER_PREFIX}", self.prefix)))
+                        .count() as u64,
+                    None,
+                ),
+            };
+            if count >= self.max_scopes {
+                // Publish a legacy recount even at capacity, so collectors can
+                // decrement it and blocked queues can observe recovered room.
+                if cas.is_none() {
+                    match self.store.put(&key, Put::Absent, &encode(&count)?) {
+                        Ok(()) => {}
+                        Err(StoreError::CasMismatch) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
+                self.marker_cap_refused.set(true);
+                return Err(StoreError::Failed);
+            }
+            match self.store.put(
+                &key,
+                cas.as_deref().map_or(Put::Absent, Put::Cas),
+                &encode(&(count + 1))?,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(StoreError::CasMismatch) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(StoreError::CasMismatch)
+    }
+
+    fn release_marker_slot(&self) {
+        let key = self.marker_count_key();
+        for _ in 0..SETTLE_RETRIES {
+            let Ok(Some((bytes, cas))) = self.store.get(&key) else {
+                return;
+            };
+            let Ok(count) = decode::<u64>(&bytes) else {
+                return;
+            };
+            let Ok(bytes) = encode(&count.saturating_sub(1)) else {
+                return;
+            };
+            match self.store.put(&key, Put::Cas(&cas), &bytes) {
+                Err(StoreError::CasMismatch) => continue,
+                _ => return,
+            }
+        }
+    }
+
     fn put_marker(&self, marker: &Marker, cas: Option<&str>) -> Result<(), StoreError> {
-        let mode = cas.map_or(Put::Absent, Put::Cas);
-        self.store
-            .put(&self.marker_key(marker.id), mode, &encode(marker)?)
+        self.marker_cap_refused.set(false);
+        let bytes = encode(marker)?;
+        if cas.is_none() {
+            self.marker_slot()?;
+        }
+        let result = self.store.put(
+            &self.marker_key(marker.id),
+            cas.map_or(Put::Absent, Put::Cas),
+            &bytes,
+        );
+        // A failed write may have landed. Only a definite CAS mismatch releases
+        // its slot; unknown failures over-count, never admit beyond the cap.
+        if cas.is_none() && result == Err(StoreError::CasMismatch) {
+            self.release_marker_slot();
+        }
+        result
     }
 
     /// Before a touch takes reservation `id` off record `key` uncharged, at
@@ -396,14 +514,20 @@ impl NodeLedger {
         for _ in 0..MARKER_RETRIES {
             let cas = match self.read_marker(id)? {
                 Some((marker, _)) if marker.mark == Mark::Commit => return Ok(true),
-                Some((marker, _)) if marker.mark == Mark::Dropped || !tombstone => {
+                Some((marker, _))
+                    if marker.mark == Mark::Provisional
+                        || marker.mark == Mark::Dropped
+                        || (!tombstone && self.timeout == Timeout::Release) =>
+                {
                     return Ok(false)
                 }
                 Some((_, cas)) => Some(cas),
                 None => None,
             };
             let marker = Marker {
-                mark: if tombstone {
+                mark: if self.timeout == Timeout::Commit {
+                    Mark::Provisional
+                } else if tombstone {
                     Mark::Dropped
                 } else {
                     Mark::Expired
@@ -414,6 +538,12 @@ impl NodeLedger {
             };
             match self.put_marker(&marker, cas.as_deref()) {
                 Ok(()) => return Ok(false),
+                // No new commit marker can be admitted at this cap either.
+                // Keep the timeout transition on the scope record authoritative:
+                // provisional tombstones suppress duplicate commits, and commit
+                // mode never recharges a missing tombstone after its window.
+                // Release mode retains its queued, unpersisted commit fallback.
+                Err(StoreError::Failed) if self.marker_cap_refused.get() => return Ok(false),
                 Err(StoreError::CasMismatch) => continue,
                 Err(err) => return Err(err),
             }
@@ -427,8 +557,12 @@ impl NodeLedger {
     fn reconcile(&self, key: &str, state: &mut ScopeState, now: u64) -> Result<u64, StoreError> {
         let mut charged = 0;
         for (id, expires_at, tombstone) in state.due(now, self.ttl) {
-            if self.claim(key, id, expires_at, tombstone)? {
-                state.settle(id, true);
+            if self.claim(key, id, expires_at, tombstone)?
+                && matches!(
+                    state.settle(id, true),
+                    Settlement::Committed | Settlement::LateCommitted
+                )
+            {
                 charged += 1;
             }
         }
@@ -440,6 +574,7 @@ impl NodeLedger {
     /// the tombstone window has passed on the store clock (a sweep may then
     /// collect markers), nor once a touch has dropped the tombstone.
     fn persist_commit(&self, reservation: &Reservation, now: u64) -> bool {
+        self.marker_cap_refused.set(false);
         let clock = now.max(self.store.now());
         if clock >= reservation.expires_at.saturating_add(self.ttl) {
             return false;
@@ -453,7 +588,9 @@ impl NodeLedger {
         for _ in 0..MARKER_RETRIES {
             let cas = match self.read_marker(reservation.id) {
                 Ok(None) => None,
-                Ok(Some((found, _))) if found.mark == Mark::Commit => return true,
+                Ok(Some((found, _))) if matches!(found.mark, Mark::Commit | Mark::Provisional) => {
+                    return true
+                }
                 Ok(Some((found, cas))) if found.mark == Mark::Expired => Some(cas),
                 _ => return false,
             };
@@ -470,10 +607,10 @@ impl NodeLedger {
     /// past `expires_at + 2 × ttl + GRACE_MS` on the store clock, and gone
     /// from its scope record.
     fn collect_marker(&self, key: &str, clock: u64) {
-        let Ok(Some((bytes, _))) = self.store.get(key) else {
+        let Ok(Some((bytes, cas))) = self.store.get(key) else {
             return;
         };
-        let Ok(marker) = decode::<Marker>(&bytes) else {
+        let Ok(mut marker) = decode::<Marker>(&bytes) else {
             return;
         };
         let due = marker
@@ -486,14 +623,37 @@ impl NodeLedger {
         match self.read(&marker.key) {
             Ok(Read::Live(state, _)) if state.holds(marker.id) => {}
             Ok(_) => {
-                let _ = self.store.delete(key);
+                if marker.mark == Mark::Collecting {
+                    return;
+                }
+                let previous = marker.mark;
+                marker.mark = Mark::Collecting;
+                if self.put_marker(&marker, Some(&cas)).is_err() {
+                    return;
+                }
+                if self.store.delete(key).is_ok() {
+                    self.release_marker_slot();
+                    return;
+                }
+                // Like `delete_vacant`: a failed delete puts the previous mark
+                // back so a later sweep can collect it; a `Collecting` mark
+                // left behind would hold its slot until restart.
+                match self.store.get(key) {
+                    Ok(Some((_, cas))) => {
+                        marker.mark = previous;
+                        let _ = self.put_marker(&marker, Some(&cas));
+                    }
+                    // The delete landed after all.
+                    Ok(None) => self.release_marker_slot(),
+                    Err(_) => {}
+                }
             }
             Err(_) => {}
         }
     }
 
     /// Counts a touch whose write landed.
-    fn count_touch(&self, reclaimed: (u64, u64), charged: u64) {
+    fn count_touch(&self, reclaimed: (u64, u64, u64), charged: u64) {
         let mut stats = self.stats.borrow_mut();
         count_reclaim(&mut stats, reclaimed);
         stats.late_committed += charged;
@@ -554,11 +714,13 @@ impl NodeLedger {
         now: u64,
         f: &mut impl FnMut(&mut ScopeState) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
+        // Collection must still run when a marker-cap queue is full; otherwise
+        // every admission would refuse before any worker could free its slots.
+        self.maybe_collect(now);
         self.drain_pending(now);
         if self.unpersisted() >= PENDING_LIMIT {
             return Err(Refusal::Contention);
         }
-        self.maybe_collect(now);
         self.mutate_core(&self.key(scope), now, RESERVE_RETRIES, f)
     }
 
@@ -589,14 +751,14 @@ impl NodeLedger {
                 Err(StoreError::CasMismatch) => continue,
                 Err(StoreError::Failed) => return Err(Refusal::Unavailable),
             };
-            let reclaimed = state.reclaim(now, self.ttl);
+            let reclaimed = state.reclaim(now, self.ttl, self.timeout);
             let result = match f(&mut state) {
                 Ok(result) => result,
                 // Refused, but the touch still counts: like the worker
                 // ledger, save the roll and reclaim (which may drop an old
                 // tombstone, so a later settlement of it is `NotActive`).
                 Err(refusal) => {
-                    if new || (!rolled && charged == 0 && reclaimed == (0, 0)) {
+                    if new || (!rolled && charged == 0 && reclaimed == (0, 0, 0)) {
                         return Err(refusal);
                     }
                     match self.put_record(key, cas.as_deref(), &Record::Scope(state)) {
@@ -657,6 +819,8 @@ impl NodeLedger {
             let claim = Sweep {
                 not_before: now.saturating_add(MIN_RESCAN_MS),
                 next_gc: now.saturating_add(GC_INTERVAL_MS),
+                cursor: sweep.cursor,
+                next_foreign_log: sweep.next_foreign_log,
             };
             let Ok(cas) = self.put_sweep(&claim, sweep_cas.as_deref()) else {
                 return Err(Refusal::AtCapacity);
@@ -733,6 +897,8 @@ impl NodeLedger {
         let claim = Sweep {
             not_before: sweep.not_before,
             next_gc: now.saturating_add(GC_INTERVAL_MS),
+            cursor: sweep.cursor,
+            next_foreign_log: sweep.next_foreign_log,
         };
         if let Ok(cas) = self.put_sweep(&claim, cas.as_deref()) {
             self.sweep(now, cas);
@@ -745,18 +911,66 @@ impl NodeLedger {
     /// record can still need are deleted. Never touches live state.
     /// Correctness never depends on the claim being exclusive: every change
     /// is a CAS, and only a sweep's own successful conversions free slots.
-    fn sweep(&self, now: u64, claim_cas: String) {
+    fn sweep(&self, now: u64, mut claim_cas: String) {
         // Tombstones are stamped and aged on the store's clock, read now:
         // the request's `now` may be stale. Scheduling stays on `now`.
         let clock = now.max(self.store.now());
         let Ok(keys) = self.store.keys() else {
             return;
         };
+        let Ok((mut sweep, sweep_cas)) = self.read_sweep() else {
+            return;
+        };
+        if clock >= sweep.next_foreign_log {
+            let count = keys
+                .iter()
+                .filter(|key| is_foreign_ledger_key(key, &self.prefix))
+                .count();
+            if count > 0 {
+                // Claim the interval before emitting; a losing worker emits
+                // nothing. The shared throttle survives worker replacement.
+                sweep.next_foreign_log = clock.saturating_add(GC_INTERVAL_MS);
+                let Ok(cas) = self.put_sweep(&sweep, sweep_cas.as_deref()) else {
+                    return;
+                };
+                claim_cas = cas;
+                pdk::logger::warn!(
+                    "{}",
+                    serde_json::json!({"event":"aggregate_risk_foreign_prefix_keys","count":count})
+                );
+            }
+        }
+        let next_foreign_log = sweep.next_foreign_log;
         let mut freed: i64 = 0;
         let mut next_idle = u64::MAX;
         let scope_prefix = format!("{}{SCOPE_PREFIX}", self.prefix);
         let marker_prefix = format!("{}{MARKER_PREFIX}", self.prefix);
-        for key in &keys {
+        let mut keys: Vec<_> = keys
+            .into_iter()
+            .filter(|k| k.starts_with(&scope_prefix) || k.starts_with(&marker_prefix))
+            .collect();
+        keys.sort();
+        let remaining: Vec<_> = keys
+            .iter()
+            .filter(|k| sweep.cursor.as_ref().is_none_or(|cursor| *k > cursor))
+            .collect();
+        // Reserve room for sweep/count metadata reads. Marker collection may
+        // read its scope and counter as well; spend three units for that key.
+        let mut budget = SWEEP_BUDGET - 4;
+        let mut cursor = None;
+        let mut processed = 0;
+        for key in &remaining {
+            let cost = if key.starts_with(&marker_prefix) {
+                3
+            } else {
+                1
+            };
+            if budget < cost {
+                break;
+            }
+            budget -= cost;
+            processed += 1;
+            cursor = Some((*key).clone());
             if key.starts_with(&marker_prefix) {
                 self.collect_marker(key, clock);
                 continue;
@@ -778,8 +992,8 @@ impl NodeLedger {
                         let Ok(charged) = self.reconcile(key, &mut state, now) else {
                             break;
                         };
-                        let reclaimed = state.reclaim(now, self.ttl);
-                        if !rolled && charged == 0 && reclaimed == (0, 0) && !state.is_idle() {
+                        let reclaimed = state.reclaim(now, self.ttl, self.timeout);
+                        if !rolled && charged == 0 && reclaimed == (0, 0, 0) && !state.is_idle() {
                             next_idle = next_idle.min(state.idle_at(self.ttl, self.window));
                             break;
                         }
@@ -849,10 +1063,22 @@ impl NodeLedger {
         let not_before = next_idle
             .max(now.saturating_add(MIN_RESCAN_MS))
             .min(now.saturating_add(MAX_RESCAN_MS));
+        let partial = processed < remaining.len();
         let done = Sweep {
-            not_before,
-            next_gc: now.saturating_add(GC_INTERVAL_MS),
+            not_before: if partial {
+                now.saturating_add(MIN_RESCAN_MS)
+            } else {
+                not_before
+            },
+            next_gc: now.saturating_add(if partial {
+                MIN_RESCAN_MS
+            } else {
+                GC_INTERVAL_MS
+            }),
+            cursor: if partial { cursor } else { None },
+            next_foreign_log,
         };
+        self.next_gc_check.set(done.next_gc);
         let _ = self.put_sweep(&done, Some(&claim_cas));
     }
 
@@ -890,12 +1116,20 @@ impl NodeLedger {
                 Read::New(..) | Read::Doomed => return Ok(None),
             };
             let rolled = state.roll_to(period(self.window, now));
+            let mut before = (0, 0, 0);
+            let mut before_charged = 0;
+            if self.timeout == Timeout::Commit {
+                before_charged = self.reconcile(&key, &mut state, now)?;
+                before = state.reclaim(now, self.ttl, self.timeout);
+            }
             let outcome = state.settle(reservation.id, commit);
-            let charged = self.reconcile(&key, &mut state, now)?;
-            let reclaimed = state.reclaim(now, self.ttl);
+            let charged = before_charged + self.reconcile(&key, &mut state, now)?;
+            let after = state.reclaim(now, self.ttl, self.timeout);
+            let reclaimed = (before.0 + after.0, before.1 + after.1, before.2 + after.2);
             // Nothing changed: no write. Otherwise the roll and reclaim are
             // saved even for `NotActive`, as the worker ledger does.
-            if outcome == Settlement::NotActive && !rolled && charged == 0 && reclaimed == (0, 0) {
+            if outcome == Settlement::NotActive && !rolled && charged == 0 && reclaimed == (0, 0, 0)
+            {
                 return Ok(Some(outcome));
             }
             let idle = state.is_idle();
@@ -929,6 +1163,8 @@ impl NodeLedger {
             let hinted = Sweep {
                 not_before: soonest,
                 next_gc: sweep.next_gc,
+                cursor: sweep.cursor,
+                next_foreign_log: sweep.next_foreign_log,
             };
             let _ = self.put_sweep(&hinted, Some(&cas));
         }
@@ -946,6 +1182,24 @@ impl NodeLedger {
         now: u64,
         retries: u32,
     ) -> Result<Settlement, Refusal> {
+        if (self.timeout == Timeout::Commit
+            && now >= reservation.expires_at.saturating_add(self.ttl))
+            || matches!(
+                self.read_marker(reservation.id),
+                Ok(Some((
+                    Marker {
+                        mark: Mark::Provisional,
+                        ..
+                    },
+                    _
+                )))
+            )
+        {
+            return self
+                .try_settle(reservation, now, true, retries)
+                .map(|outcome| outcome.unwrap_or(Settlement::NotActive))
+                .map_err(unavailable);
+        }
         let key = self.key(&reservation.scope);
         self.mutate_core(&key, now, retries, &mut |state| {
             Ok(match state.settle(reservation.id, true) {
@@ -967,6 +1221,22 @@ impl NodeLedger {
             let Some(mut entry) = self.pending.borrow_mut().pop_front() else {
                 return;
             };
+            if entry.marker_cap_blocked {
+                if self.persist_commit(&entry.reservation, now) {
+                    entry.persisted = true;
+                    entry.marker_cap_blocked = false;
+                } else {
+                    // Once its marker window has ended, retry the record only
+                    // after capacity is available. Keep the cap flag until the
+                    // commit lands: missing-record capacity must not drop it.
+                    let room = matches!(self.store.get(&self.marker_count_key()),
+                        Ok(Some((bytes,_))) if decode::<u64>(&bytes).is_ok_and(|n| n < self.max_scopes));
+                    if now < entry.reservation.expires_at.saturating_add(self.ttl) || !room {
+                        self.pending.borrow_mut().push_back(entry);
+                        continue;
+                    }
+                }
+            }
             let result = if entry.persisted {
                 match self.try_settle(&entry.reservation, now, true, DRAIN_RETRIES) {
                     Ok(outcome) => Ok(outcome.filter(|o| *o != Settlement::NotActive)),
@@ -988,10 +1258,11 @@ impl NodeLedger {
                 // Bound only confirmed missing-record capacity failures. An
                 // outage or ordinary CAS contention must never discard a commit.
                 Err(Refusal::AtCapacity)
-                    if matches!(
-                        self.read(&self.key(&entry.reservation.scope)),
-                        Ok(Read::New(_, _))
-                    ) =>
+                    if !entry.marker_cap_blocked
+                        && matches!(
+                            self.read(&self.key(&entry.reservation.scope)),
+                            Ok(Read::New(_, _))
+                        ) =>
                 {
                     entry.missing_record_attempts += 1;
                     if entry.missing_record_attempts >= MISSING_RECORD_ATTEMPTS {
@@ -1025,6 +1296,7 @@ impl NodeLedger {
                 reservation: reservation.clone(),
                 persisted,
                 missing_record_attempts: 0,
+                marker_cap_blocked: on_record && self.marker_cap_refused.get(),
             });
         }
         Settlement::Deferred
@@ -1281,6 +1553,7 @@ pub mod fake {
         contended: Option<String>,
         clock: u64,
         ops: u64,
+        gets: Vec<String>,
     }
 
     #[derive(Clone, Default)]
@@ -1329,6 +1602,10 @@ pub mod fake {
             self.0.borrow().ops
         }
 
+        pub fn take_gets(&self) -> Vec<String> {
+            std::mem::take(&mut self.0.borrow_mut().gets)
+        }
+
         fn enter(&self) -> Result<(), StoreError> {
             let mut inner = self.0.borrow_mut();
             inner.ops += 1;
@@ -1343,6 +1620,7 @@ pub mod fake {
         fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>, StoreError> {
             self.enter()?;
             let mut inner = self.0.borrow_mut();
+            inner.gets.push(key.to_string());
             if inner.hidden_gets > 0 {
                 inner.hidden_gets -= 1;
                 return Ok(None);
@@ -2235,5 +2513,274 @@ mod test {
         assert_eq!(b.snapshot("busy").reserved, 1);
         a.drain_pending(TTL + 1);
         assert_eq!(b.snapshot("busy").committed, 800);
+    }
+
+    #[test]
+    fn rc5_marker_cap_keeps_commit_pending_and_uncharged() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let first = a.reserve("s", 1, 1000, 0).unwrap();
+        let second = a.reserve("s", 2, 1000, 0).unwrap();
+        assert!(a.persist_commit(&first, 1));
+        assert!(!a.persist_commit(&second, 1));
+        store.contend(Some(a.key("s")));
+        assert_eq!(a.commit(&second, 1), Settlement::Deferred);
+        store.contend(None);
+        for _ in 0..10 {
+            a.drain_pending(2);
+        }
+        assert_eq!(a.pending(), 1);
+        assert_eq!(a.snapshot("s").committed, 0);
+        // Resolve the first reservation directly, then collect its marker.
+        a.try_settle(&first, 2, true, SETTLE_RETRIES).unwrap();
+        a.collect_marker(&a.marker_key(first.id), 4 * TTL);
+        a.drain_pending(4 * TTL);
+        assert_eq!(a.pending(), 0);
+        assert_eq!(a.snapshot("s").committed, 3);
+    }
+    #[test]
+    fn rc5_legacy_sweep_gets_a_serialized_cursor() {
+        let old: Sweep = decode(br#"{"not_before":0,"next_gc":0}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&encode(&old).unwrap()).unwrap();
+        assert!(value.get("cursor").is_some());
+        assert!(value["cursor"].is_null());
+        let store = FakeStore::default();
+        let a = worker(&store, 1);
+        a.put_record(
+            &a.key("legacy-idle"),
+            None,
+            &Record::Scope(ScopeState::default()),
+        )
+        .unwrap();
+        a.put_count(1, None).unwrap();
+        store
+            .put(
+                &a.sweep_key(),
+                Put::Absent,
+                br#"{"not_before":0,"next_gc":0}"#,
+            )
+            .unwrap();
+        let (_, cas) = a.read_sweep().unwrap();
+        a.sweep(0, cas.unwrap());
+        assert_eq!(a.read_count().unwrap().0, 0);
+    }
+
+    #[test]
+    fn rc5_sweep_budget_cursor_and_complete_cycle() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 10000, None);
+        for i in 0..2560 {
+            a.put_record(
+                &a.key(&format!("idle-{i}")),
+                None,
+                &Record::Scope(ScopeState::default()),
+            )
+            .unwrap();
+        }
+        a.put_count(2560, None).unwrap();
+        for id in 1..=16 {
+            a.put_marker(
+                &Marker {
+                    mark: Mark::Commit,
+                    key: a.key("gone"),
+                    id,
+                    expires_at: u64::MAX,
+                },
+                None,
+            )
+            .unwrap();
+        }
+        let mut claim = a.put_sweep(&Sweep::default(), None).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut passes = 0;
+        loop {
+            store.take_gets();
+            a.sweep(0, claim);
+            let reads = store.take_gets();
+            assert!(
+                reads.len() <= 256,
+                "{} store gets in one idle-scope pass",
+                reads.len()
+            );
+            for key in reads.iter().filter(|k| {
+                k.starts_with(&format!("{}s:", a.prefix))
+                    || k.starts_with(&format!("{}c:", a.prefix))
+            }) {
+                assert!(seen.insert(key.clone()), "key revisited before cursor wrap");
+            }
+            passes += 1;
+            let (sweep, cas) = a.read_sweep().unwrap();
+            let value = serde_json::to_value(&sweep).unwrap();
+            if value["cursor"].is_null() {
+                break;
+            }
+            assert_eq!(sweep.next_gc, MIN_RESCAN_MS);
+            assert!(passes < 40);
+            claim = cas.unwrap();
+        }
+        assert!(passes > 1);
+        assert_eq!(seen.len(), 2576);
+        assert_eq!(a.read_count().unwrap().0, 0);
+        let (_, cas) = a.read_sweep().unwrap();
+        a.sweep(0, cas.unwrap());
+        assert_eq!(a.read_count().unwrap().0, 0);
+    }
+    #[test]
+    fn rc5_marker_counter_decrements_only_after_collection() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let r = a.reserve("s", 1, 1000, 0).unwrap();
+        assert!(a.persist_commit(&r, 1));
+        let counter = format!("{}m", a.prefix);
+        assert_eq!(
+            store
+                .get(&counter)
+                .unwrap()
+                .map(|(b, _)| decode::<u64>(&b).unwrap()),
+            Some(1)
+        );
+        a.commit(&r, 2);
+        a.collect_marker(&a.marker_key(r.id), 4 * TTL);
+        assert_eq!(
+            store
+                .get(&counter)
+                .unwrap()
+                .map(|(b, _)| decode::<u64>(&b).unwrap()),
+            Some(0)
+        );
+        let next = a.reserve("s", 1, 1000, 4 * TTL).unwrap();
+        assert!(a.persist_commit(&next, 4 * TTL + 1));
+    }
+    #[test]
+    fn rc5_foreign_prefix_event_counts_and_throttles_without_deletion() {
+        // Run the sweep inside a real pdk-unit request's backend callback so
+        // the production logger is captured by that request's host.
+        use pdk_unit::{UnitHttpRequest, UnitHttpResponse, UnitTestBuilder};
+        let store = FakeStore::default();
+        let own = Rc::new(worker(&store, 1));
+        let foreign = NodeLedger::new(
+            Box::new(store.clone()),
+            b"other-test-key".to_vec(),
+            10,
+            TTL,
+            None,
+            2,
+        );
+        foreign
+            .put_record(
+                &foreign.key("old"),
+                None,
+                &Record::Scope(ScopeState::default()),
+            )
+            .unwrap();
+        foreign.put_count(1, None).unwrap();
+        store.put("unrelated", Put::Absent, b"unrelated").unwrap();
+        let expected = store.keys().unwrap();
+        let sweep = Rc::clone(&own);
+        let mut tester = UnitTestBuilder::default()
+            .with_config(crate::test::config(serde_json::json!({})))
+            .with_backend(move |_request| {
+                let (state, cas) = sweep.read_sweep().unwrap();
+                let claim = sweep.put_sweep(&state, cas.as_deref()).unwrap();
+                sweep.sweep(0, claim);
+                UnitHttpResponse::new(200)
+            })
+            .with_entrypoint(crate::configure);
+        for _ in 0..2 {
+            tester.request(UnitHttpRequest::get());
+        }
+        let logs: Vec<_> = tester
+            .logs()
+            .into_iter()
+            .filter(|s| s.contains("aggregate_risk_foreign_prefix_keys"))
+            .collect();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("\"count\":2"));
+        for key in expected {
+            assert!(store.get(&key).unwrap().is_some());
+        }
+    }
+    #[test]
+    fn rc5_full_marker_blocked_queue_can_collect_before_admission() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let first = a.reserve("s", 1, 1000, 0).unwrap();
+        let blocked: Vec<_> = (0..256)
+            .map(|_| a.reserve("s", 1, 1000, 0).unwrap())
+            .collect();
+        assert!(a.persist_commit(&first, 1));
+        assert!(!a.persist_commit(&blocked[0], 1));
+        store.contend(Some(a.key("s")));
+        for r in &blocked {
+            assert_eq!(a.commit(r, 1), Settlement::Deferred);
+        }
+        store.contend(None);
+        assert_eq!(a.pending(), 256);
+        // First pass reconciles the scope; the next pass can collect the marker.
+        assert_eq!(a.reserve("s", 0, 1000, 5 * TTL), Err(Refusal::Contention));
+        assert!(a.reserve("s", 0, 1000, 6 * TTL).is_ok());
+        for _ in 0..16 {
+            a.drain_pending(6 * TTL);
+        }
+        assert_eq!(a.pending(), 0);
+        assert_eq!(a.snapshot("s").committed, 257);
+    }
+    #[test]
+    fn rc5_legacy_marker_counter_initializes_even_when_full() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let first = a.reserve("s", 1, 1000, 0).unwrap();
+        let second = a.reserve("s", 1, 1000, 0).unwrap();
+        let marker = Marker {
+            mark: Mark::Commit,
+            key: a.key("s"),
+            id: first.id,
+            expires_at: first.expires_at,
+        };
+        store
+            .put(
+                &a.marker_key(first.id),
+                Put::Absent,
+                &encode(&marker).unwrap(),
+            )
+            .unwrap();
+        assert!(!a.persist_commit(&second, 1));
+        let counter = format!("{}m", a.prefix);
+        assert_eq!(
+            store
+                .get(&counter)
+                .unwrap()
+                .map(|(b, _)| decode::<u64>(&b).unwrap()),
+            Some(1)
+        );
+        a.commit(&first, 2);
+        a.collect_marker(&a.marker_key(first.id), 4 * TTL);
+        assert_eq!(
+            store
+                .get(&counter)
+                .unwrap()
+                .map(|(b, _)| decode::<u64>(&b).unwrap()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rc5_failed_marker_delete_restores_mark_and_slot() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let r = a.reserve("s", 1, 1000, 0).unwrap();
+        assert!(a.persist_commit(&r, 1));
+        a.try_settle(&r, 2, true, SETTLE_RETRIES).unwrap();
+        let mk = a.marker_key(r.id);
+        store.set_failing_deletes(true);
+        a.collect_marker(&mk, 4 * TTL);
+        store.set_failing_deletes(false);
+        a.collect_marker(&mk, 5 * TTL);
+        assert!(
+            store.get(&mk).unwrap().is_none(),
+            "marker stuck after one failed delete"
+        );
+        let r2 = a.reserve("s", 1, 1000, 5 * TTL).unwrap();
+        assert!(a.persist_commit(&r2, 5 * TTL + 1), "marker slot leaked");
     }
 }
