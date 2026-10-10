@@ -626,9 +626,26 @@ impl NodeLedger {
                 if marker.mark == Mark::Collecting {
                     return;
                 }
+                let previous = marker.mark;
                 marker.mark = Mark::Collecting;
-                if self.put_marker(&marker, Some(&cas)).is_ok() && self.store.delete(key).is_ok() {
+                if self.put_marker(&marker, Some(&cas)).is_err() {
+                    return;
+                }
+                if self.store.delete(key).is_ok() {
                     self.release_marker_slot();
+                    return;
+                }
+                // Like `delete_vacant`: a failed delete puts the previous mark
+                // back so a later sweep can collect it; a `Collecting` mark
+                // left behind would hold its slot until restart.
+                match self.store.get(key) {
+                    Ok(Some((_, cas))) => {
+                        marker.mark = previous;
+                        let _ = self.put_marker(&marker, Some(&cas));
+                    }
+                    // The delete landed after all.
+                    Ok(None) => self.release_marker_slot(),
+                    Err(_) => {}
                 }
             }
             Err(_) => {}
@@ -2745,5 +2762,25 @@ mod test {
                 .map(|(b, _)| decode::<u64>(&b).unwrap()),
             Some(0)
         );
+    }
+
+    #[test]
+    fn rc5_failed_marker_delete_restores_mark_and_slot() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let r = a.reserve("s", 1, 1000, 0).unwrap();
+        assert!(a.persist_commit(&r, 1));
+        a.try_settle(&r, 2, true, SETTLE_RETRIES).unwrap();
+        let mk = a.marker_key(r.id);
+        store.set_failing_deletes(true);
+        a.collect_marker(&mk, 4 * TTL);
+        store.set_failing_deletes(false);
+        a.collect_marker(&mk, 5 * TTL);
+        assert!(
+            store.get(&mk).unwrap().is_none(),
+            "marker stuck after one failed delete"
+        );
+        let r2 = a.reserve("s", 1, 1000, 5 * TTL).unwrap();
+        assert!(a.persist_commit(&r2, 5 * TTL + 1), "marker slot leaked");
     }
 }
