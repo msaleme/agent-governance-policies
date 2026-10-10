@@ -378,7 +378,7 @@ async fn reclaim_case(
     disposition_if_met: &str,
 ) -> anyhow::Result<()> {
     let (_c, url, httpmock) = start(vec![gate(json!({
-        "reservationTimeoutMs": 1000, "aggregateBudget": 1600
+        "reservationTimeoutMs": 1000, "aggregateBudget": 1600, "onReservationTimeout": "release"
     }))])
     .await?;
     let server = httpmock::MockServer::connect_async(httpmock.socket()).await;
