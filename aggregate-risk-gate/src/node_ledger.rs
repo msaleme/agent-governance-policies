@@ -435,6 +435,15 @@ impl NodeLedger {
                 ),
             };
             if count >= self.max_scopes {
+                // Publish a legacy recount even at capacity, so collectors can
+                // decrement it and blocked queues can observe recovered room.
+                if cas.is_none() {
+                    match self.store.put(&key, Put::Absent, &encode(&count)?) {
+                        Ok(()) => {}
+                        Err(StoreError::CasMismatch) => continue,
+                        Err(err) => return Err(err),
+                    }
+                }
                 self.marker_cap_refused.set(true);
                 return Err(StoreError::Failed);
             }
@@ -688,11 +697,13 @@ impl NodeLedger {
         now: u64,
         f: &mut impl FnMut(&mut ScopeState) -> Result<R, Refusal>,
     ) -> Result<R, Refusal> {
+        // Collection must still run when a marker-cap queue is full; otherwise
+        // every admission would refuse before any worker could free its slots.
+        self.maybe_collect(now);
         self.drain_pending(now);
         if self.unpersisted() >= PENDING_LIMIT {
             return Err(Refusal::Contention);
         }
-        self.maybe_collect(now);
         self.mutate_core(&self.key(scope), now, RESERVE_RETRIES, f)
     }
 
@@ -2671,5 +2682,68 @@ mod test {
         for key in expected {
             assert!(store.get(&key).unwrap().is_some());
         }
+    }
+    #[test]
+    fn rc5_full_marker_blocked_queue_can_collect_before_admission() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let first = a.reserve("s", 1, 1000, 0).unwrap();
+        let blocked: Vec<_> = (0..256)
+            .map(|_| a.reserve("s", 1, 1000, 0).unwrap())
+            .collect();
+        assert!(a.persist_commit(&first, 1));
+        assert!(!a.persist_commit(&blocked[0], 1));
+        store.contend(Some(a.key("s")));
+        for r in &blocked {
+            assert_eq!(a.commit(r, 1), Settlement::Deferred);
+        }
+        store.contend(None);
+        assert_eq!(a.pending(), 256);
+        // First pass reconciles the scope; the next pass can collect the marker.
+        assert_eq!(a.reserve("s", 0, 1000, 5 * TTL), Err(Refusal::Contention));
+        assert!(a.reserve("s", 0, 1000, 6 * TTL).is_ok());
+        for _ in 0..16 {
+            a.drain_pending(6 * TTL);
+        }
+        assert_eq!(a.pending(), 0);
+        assert_eq!(a.snapshot("s").committed, 257);
+    }
+    #[test]
+    fn rc5_legacy_marker_counter_initializes_even_when_full() {
+        let store = FakeStore::default();
+        let a = worker_with(&store, 1, 1, None);
+        let first = a.reserve("s", 1, 1000, 0).unwrap();
+        let second = a.reserve("s", 1, 1000, 0).unwrap();
+        let marker = Marker {
+            mark: Mark::Commit,
+            key: a.key("s"),
+            id: first.id,
+            expires_at: first.expires_at,
+        };
+        store
+            .put(
+                &a.marker_key(first.id),
+                Put::Absent,
+                &encode(&marker).unwrap(),
+            )
+            .unwrap();
+        assert!(!a.persist_commit(&second, 1));
+        let counter = format!("{}m", a.prefix);
+        assert_eq!(
+            store
+                .get(&counter)
+                .unwrap()
+                .map(|(b, _)| decode::<u64>(&b).unwrap()),
+            Some(1)
+        );
+        a.commit(&first, 2);
+        a.collect_marker(&a.marker_key(first.id), 4 * TTL);
+        assert_eq!(
+            store
+                .get(&counter)
+                .unwrap()
+                .map(|(b, _)| decode::<u64>(&b).unwrap()),
+            Some(0)
+        );
     }
 }

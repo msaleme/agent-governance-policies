@@ -472,12 +472,14 @@ read-then-write fallback and no unconditional overwrite. Concretely:
   marker budget cannot prevent provisional charging or tombstone expiry. At capacity, a
   deferred commit remains pending and is neither dropped nor charged because of the
   refusal. It retries when capacity returns; 256 unpersisted commits still refuse new
-  reservations. The queue is volatile and is lost on worker restart. Marker collection
+  reservations. Periodic collection runs before that refusal so a full queue
+  cannot prevent marker capacity from recovering. The queue is volatile and is lost on worker restart. Marker collection
   uses a CAS deletion claim so only one collector decrements the counter. Ambiguous
   writes, failed counter decrements, or a stalled collector can over-count and refuse
   markers early. There is no downward recount: a listing cannot distinguish a live
   writer's reserved counter slot from drift. Restart clears the local store and drift,
-  also resetting budgets. Legacy markers are counted when initializing the counter;
+  also resetting budgets. Legacy markers are counted when initializing the counter,
+  including when their count already meets/exceeds the cap;
   co-located writers must run the same version and configuration.
 - **Cleanup never deletes live state.** An idle record becomes a tombstone by compare-and-swap,
   and only the cleanup pass that marked a tombstone for deletion deletes it, at once. Tombstones
