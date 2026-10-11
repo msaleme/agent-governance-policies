@@ -141,10 +141,27 @@ spec:
         the headers of a call with a body arrived. A request
         whose response never reaches this policy (client disconnect,
         cancellation, upstream timeout without a response) leaves its
-        reservation held; after this timeout the reservation is reclaimed and
-        its budget freed. Set it above the longest upstream timeout. A response
-        that arrives within one further timeout still settles: a success is
-        charged, a failure changes nothing. Later responses are ignored.
+        reservation held until onReservationTimeout applies. With auto (default),
+        block mode commits provisionally at the deadline and monitor mode releases.
+        Set the timeout above the longest legitimate call. A late success is never
+        charged twice; a late failure refunds a provisional charge only within the
+        tombstone window and its original accounting period. A slower honest call
+        can remain charged even if it fails after that window.
+    onReservationTimeout:
+      type: string
+      default: auto
+      enum:
+        - auto
+        - commit
+        - release
+      description: >-
+        auto resolves to commit in block mode and release in monitor mode.
+        commit provisionally charges an unsettled reservation at its deadline.
+        A late commit is a no-op; a late release refunds only within the tombstone
+        window and unchanged accounting period. After that window the charge stays.
+        release frees the reservation uncharged, including calls that ran upstream
+        but whose response never reaches the policy. Use commit to prevent that
+        undercount, accepting that a sufficiently late failed call remains charged.
     scopeDisclosure:
       type: string
       default: digest
@@ -318,7 +335,9 @@ spec:
         regardless of budget. Use to characterize composition before enforcing.
         "block" — deny a call whose contribution would push committed-plus-
         reserved exposure for its scope over aggregateBudget, per onDeny.
-        In both modes a reservation settles on the upstream's HTTP status
+        onReservationTimeout auto charges abandoned calls in block mode and
+        releases them in monitor mode; a late failure can remain charged after
+        the tombstone window. In both modes a reservation settles on the upstream's HTTP status
         only: 2xx and 3xx commit it, 4xx and 5xx release it. The response body
         is never read, so a JSON-RPC error or an "isError": true tool result
         inside an HTTP 200 is still charged.

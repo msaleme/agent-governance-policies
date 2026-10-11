@@ -68,7 +68,9 @@ use std::convert::TryFrom;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::generated::config::Config;
-use crate::ledger::{Denial, Ledger, LedgerStats, LedgerStore, Refusal, Reservation, Settlement};
+use crate::ledger::{
+    Denial, Ledger, LedgerStats, LedgerStore, Refusal, Reservation, Settlement, Timeout,
+};
 use crate::node_ledger::{KvStore, NodeLedger, PdkStore};
 use pdk::data_storage::DataStorageBuilder;
 
@@ -477,6 +479,7 @@ struct Gate {
     on_deny: OnDeny,
     result_header: String,
     ledger: Box<dyn LedgerStore>,
+    timeout: Timeout,
 }
 
 /// The store name of the node ledger in a policy instance's own namespace.
@@ -637,6 +640,22 @@ impl Gate {
             .ok()
             .filter(|ms| (1_000..=86_400_000).contains(ms))
             .ok_or_else(|| anyhow!("reservationTimeoutMs must be between 1000 and 86400000"))?;
+        let timeout = match config.on_reservation_timeout.as_deref().unwrap_or("auto") {
+            "auto" => {
+                if mode == Mode::Block {
+                    Timeout::Commit
+                } else {
+                    Timeout::Release
+                }
+            }
+            "commit" => Timeout::Commit,
+            "release" => Timeout::Release,
+            _ => {
+                return Err(anyhow!(
+                    "onReservationTimeout must be auto, commit or release"
+                ))
+            }
+        };
         let namespace = ledger_namespace(&config.ledger_namespace)?;
         let node = match config.ledger_backend.as_str() {
             "node" => true,
@@ -701,18 +720,23 @@ impl Gate {
             mode,
             on_deny,
             result_header,
+            timeout,
             ledger: if node {
-                Box::new(NodeLedger::new(
-                    node_store(namespace.as_deref()),
-                    config.scope_digest_key.as_bytes().to_vec(),
-                    max_scopes,
-                    reservation_timeout_ms,
-                    window,
-                    node_ledger::random_prefix(),
-                ))
+                Box::new(
+                    NodeLedger::new(
+                        node_store(namespace.as_deref()),
+                        config.scope_digest_key.as_bytes().to_vec(),
+                        max_scopes,
+                        reservation_timeout_ms,
+                        window,
+                        node_ledger::random_prefix(),
+                    )
+                    .with_timeout(timeout),
+                )
             } else {
                 Box::new(
                     Ledger::with_limits(max_scopes, reservation_timeout_ms, window)
+                        .with_timeout(timeout)
                         .with_clock(gateway_clock),
                 )
             },
@@ -1287,7 +1311,7 @@ pub(crate) fn epoch_ms(time: SystemTime) -> u64 {
 fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
     logger::info!(
         "aggregate-risk-gate: settlement={} active={} committed={} released={} expired={} \
-         late-committed={} late-released={} abandoned={} not-active={} deferred={} contended={}",
+         late-committed={} late-released={} provisional-charged={} provisional-refunded={} abandoned={} not-active={} deferred={} contended={}",
         settlement.label(),
         stats.active,
         stats.committed,
@@ -1295,6 +1319,8 @@ fn log_unusual_settlement(settlement: Settlement, stats: LedgerStats) {
         stats.expired,
         stats.late_committed,
         stats.late_released,
+        stats.provisional_charged,
+        stats.provisional_refunded,
         stats.abandoned,
         stats.not_active,
         stats.deferred,
@@ -1414,9 +1440,12 @@ async fn configure(
     if !config.ledger_namespace.is_empty() && config.scope_digest_key.is_empty() {
         logger::warn!("Aggregate Risk Gate: ledgerNamespace is set and scopeDigestKey is empty; co-located policies using the same namespace can read and write this ledger. Set a secret scopeDigestKey.");
     }
+    if config.ledger_backend == "node" && config.max_scopes > 100_000 {
+        logger::warn!("Aggregate Risk Gate: node maxScopes exceeds 100000; shared-data listing cost grows with the namespace even though per-pass key processing is bounded");
+    }
     logger::info!(
         "Aggregate Risk Gate armed: budgetScope={}, aggregateBudget={}, contribution={}, \
-         ledgerBackend={}, mode={}",
+         ledgerBackend={}, mode={}, onReservationTimeout={}",
         gate.budget_scope,
         gate.aggregate_budget,
         config.contribution,
@@ -1425,7 +1454,8 @@ async fn configure(
             "block"
         } else {
             "monitor"
-        }
+        },
+        gate.timeout.label()
     );
 
     let filter =
@@ -1445,7 +1475,7 @@ mod test {
     use serde_json::json;
     use std::rc::Rc;
 
-    fn config(overrides: Value) -> String {
+    pub(crate) fn config(overrides: Value) -> String {
         let mut base = json!({
             "budgetScope": "agent",
             // The arithmetic tests below drive identity through a header and
@@ -1458,6 +1488,7 @@ mod test {
             "ledgerBackend": "node",
             "ledgerNamespace": "",
             "reservationTimeoutMs": 60000,
+            "onReservationTimeout": "auto",
             "scopeDisclosure": "raw",
             "scopeDigestKey": "",
             "aggregateBudget": 3000,
@@ -2573,6 +2604,7 @@ mod test {
             ledger_namespace: String::new(),
             max_scopes: 10000,
             reservation_timeout_ms: 60000,
+            on_reservation_timeout: Some("auto".to_string()),
             mode: "block".to_string(),
             on_deny: "rpc-error".to_string(),
             result_header: "x-aggregate-risk-gate".to_string(),
@@ -4161,5 +4193,185 @@ mod test {
             .logs()
             .iter()
             .any(|line| line.contains("Warn:") && line.contains("read and write")));
+    }
+
+    #[test]
+    fn rc5_timeout_mode_matrix_and_deadline_headroom() {
+        for backend in ["worker", "node"] {
+            for (mode, timeout, charged) in [
+                ("block", "auto", true),
+                ("monitor", "auto", false),
+                ("block", "release", false),
+                ("monitor", "commit", true),
+            ] {
+                let (gate, _) = node_gate(
+                    json!({"ledgerBackend":backend,"mode":mode,"onReservationTimeout":timeout}),
+                );
+                gate.ledger.reserve("s", 800, 1000, 0).unwrap();
+                let next = gate.ledger.reserve("s", 300, 1000, 60000);
+                assert_eq!(next.is_err(), charged, "{} {} {}", backend, mode, timeout);
+                assert_eq!(
+                    gate.ledger.snapshot("s").committed,
+                    if charged { 800 } else { 0 }
+                );
+            }
+        }
+    }
+    #[test]
+    fn rc5_timeout_configuration_rejects_unknown_values() {
+        let cfg: Config =
+            serde_json::from_str(&config(json!({"onReservationTimeout":"discard"}))).unwrap();
+        assert!(Gate::from_config(&cfg).is_err());
+    }
+    #[test]
+    fn rc5_large_node_namespace_warning_boundary() {
+        for (backend, cap, warn) in [
+            ("node", 100001, true),
+            ("node", 100000, false),
+            ("worker", 100001, false),
+        ] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({"ledgerBackend":backend,"maxScopes":cap})))
+                .with_backend(ok_backend)
+                .with_entrypoint(super::configure);
+            tester.request(rpc_request(1, "broker-7"));
+            assert_eq!(
+                tester
+                    .logs()
+                    .iter()
+                    .any(|s| s.contains("Warn:") && s.contains("listing cost")),
+                warn
+            );
+        }
+    }
+    #[test]
+    fn rc5_armed_log_reports_resolved_timeout() {
+        for (mode, resolved) in [("block", "commit"), ("monitor", "release")] {
+            let mut tester = UnitTestBuilder::default()
+                .with_config(config(json!({"mode":mode,"onReservationTimeout":"auto"})))
+                .with_backend(ok_backend)
+                .with_entrypoint(super::configure);
+            tester.request(rpc_request(1, "broker-7"));
+            assert!(tester.logs().iter().any(|s| s.contains("armed:")
+                && s.contains(&format!("onReservationTimeout={}", resolved))));
+        }
+    }
+    #[test]
+    fn rc5_late_settlement_after_provisional_charge_on_both_backends() {
+        for backend in ["worker", "node"] {
+            for (release, roll) in [(false, false), (true, false), (true, true)] {
+                let (gate, _) = node_gate(
+                    json!({"ledgerBackend":backend,"mode":"block","onReservationTimeout":"auto","windowMs":60000,"reservationTimeoutMs":10000}),
+                );
+                let r = gate.ledger.reserve("s", 800, 1000, 45000).unwrap();
+                gate.ledger.reserve("s", 0, 1000, 55000).unwrap();
+                assert_eq!(gate.ledger.snapshot("s").committed, 800);
+                assert!(format!("{:?}", gate.ledger.stats()).contains("provisional_charged: 1"));
+                let now = if roll { 60000 } else { 55001 };
+                if roll {
+                    gate.ledger.record("s", 100, now).unwrap();
+                }
+                if release {
+                    gate.ledger.release(&r, now);
+                } else {
+                    gate.ledger.commit(&r, now);
+                }
+                assert_eq!(
+                    gate.ledger.snapshot("s").committed,
+                    if roll {
+                        100
+                    } else if release {
+                        0
+                    } else {
+                        800
+                    }
+                );
+                assert!(format!("{:?}", gate.ledger.stats()).contains(&format!(
+                    "provisional_refunded: {}",
+                    u8::from(release && !roll)
+                )));
+                gate.ledger.commit(&r, now + 1);
+                assert_eq!(
+                    gate.ledger.snapshot("s").committed,
+                    if roll {
+                        100
+                    } else if release {
+                        0
+                    } else {
+                        800
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn rc5_after_tombstone_window_provisional_charge_is_final() {
+        for backend in ["worker", "node"] {
+            let (gate, _) = node_gate(
+                json!({"ledgerBackend":backend,"mode":"block","onReservationTimeout":"auto"}),
+            );
+            let r = gate.ledger.reserve("s", 800, 1000, 0).unwrap();
+            gate.ledger.reserve("s", 0, 1000, 120000).unwrap();
+            assert_eq!(gate.ledger.snapshot("s").committed, 800);
+            gate.ledger.release(&r, 120001);
+            gate.ledger.commit(&r, 120002);
+            assert_eq!(gate.ledger.snapshot("s").committed, 800);
+        }
+    }
+
+    #[test]
+    fn rc5_node_deferred_marker_and_deadline_charge_agree() {
+        let (a, store) = node_gate(json!({"mode":"block","onReservationTimeout":"auto"}));
+        let cfg: Config = serde_json::from_str(&config(
+            json!({"mode":"block","onReservationTimeout":"auto"}),
+        ))
+        .unwrap();
+        let clone = store.clone();
+        let b = Gate::from_config_with(&cfg, move |_| Box::new(clone), || 0).unwrap();
+        let abandoned = a.ledger.reserve("s", 800, 3000, 0).unwrap();
+        let deferred = a.ledger.reserve("s", 800, 3000, 0).unwrap();
+        store.force_mismatches(64);
+        assert_eq!(a.ledger.commit(&deferred, 1), Settlement::Deferred);
+        b.ledger.reserve("s", 0, 3000, 60000).unwrap();
+        assert_eq!(b.ledger.snapshot("s").committed, 1600);
+        assert!(format!("{:?}", b.ledger.stats()).contains("provisional_charged: 1"));
+        a.ledger.commit(&abandoned, 60001);
+        a.ledger.reserve("s", 0, 3000, 60002).unwrap();
+        assert_eq!(b.ledger.snapshot("s").committed, 1600);
+    }
+    #[test]
+    fn rc5_timeout_charges_even_when_marker_slots_are_full() {
+        let (gate, _) =
+            node_gate(json!({"mode":"block","maxScopes":1,"reservationTimeoutMs":1000}));
+        let a = gate.ledger.reserve("s", 200, 1000, 0).unwrap();
+        let b = gate.ledger.reserve("s", 200, 1000, 0).unwrap();
+        gate.ledger.reserve("s", 0, 1000, 1000).unwrap();
+        assert_eq!(gate.ledger.snapshot("s").committed, 400);
+        gate.ledger.reserve("s", 0, 1000, 2000).unwrap();
+        gate.ledger.commit(&a, 2001);
+        gate.ledger.release(&b, 2002);
+        assert_eq!(gate.ledger.snapshot("s").committed, 400);
+        // Both callbacks are deferred: one gets the only marker, the other
+        // stays cap-blocked. Cleanup later frees that marker; neither callback
+        // may charge its already-accounted contribution again.
+        let (gate, store) =
+            node_gate(json!({"mode":"block","maxScopes":1,"reservationTimeoutMs":1000}));
+        let a = gate.ledger.reserve("s", 200, 1000, 0).unwrap();
+        let b = gate.ledger.reserve("s", 200, 1000, 0).unwrap();
+        let key = node_ledger::KvStore::keys(&store)
+            .unwrap()
+            .into_iter()
+            .find(|key| key.contains("/s:"))
+            .unwrap();
+        store.contend(Some(key));
+        assert_eq!(gate.ledger.commit(&a, 1), Settlement::Deferred);
+
+        assert_eq!(gate.ledger.commit(&b, 1), Settlement::Deferred);
+        store.contend(None);
+        gate.ledger.reserve("s", 0, 1000, 1000).unwrap();
+        assert_eq!(gate.ledger.snapshot("s").committed, 400);
+        gate.ledger.reserve("s", 0, 1000, 60000).unwrap();
+        gate.ledger.reserve("s", 0, 1000, 60001).unwrap();
+        assert_eq!(gate.ledger.snapshot("s").committed, 400);
     }
 }

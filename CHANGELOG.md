@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — rc.5 planned
+
+### Aggregate-Risk Gate (Refs #64)
+
+- Bound each node sweep to at most 256 scope/marker keys in sorted order, with a
+  CAS-persisted cursor and prompt continuation. Legacy sweep records still decode.
+  The host's full key listing and sorting remain unbounded; node configurations
+  above 100000 scopes warn about that cost.
+- **Breaking:** `onReservationTimeout: auto` now resolves to `commit` in block mode
+  and `release` in monitor mode. Both backends provisionally charge at the deadline
+  under `commit`; late commits never charge twice, and late failures refund only
+  within the tombstone window and the original accounting period. Explicit `release`
+  retains the previous behavior. Log the resolved option and separate provisional
+  charge/refund counters.
+- Cap node reservation markers at `maxScopes` using a separate conservative counter.
+  Marker-cap refusals retain pending commits without dropping or charging them;
+  collection releases slots. Counter drift can refuse early and requires a restart
+  to reset; no unsafe downward recount is attempted.
+- Report foreign-fingerprint ledger key counts as
+  `aggregate_risk_foreign_prefix_keys` at most once per minute, without deleting
+  another configuration's state. Document accumulation and restart reclamation.
+
+
 ## 0.1.0-rc.4 — 2026-10-09
 
 ### Approval-to-Execution Binding (#62, #63)

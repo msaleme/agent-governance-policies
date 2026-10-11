@@ -75,11 +75,28 @@ pub type ReservationId = u128;
 /// worker) than that is refused until some settle or expire.
 pub const MAX_HELD: usize = 512;
 
+/// Resolved timeout disposition; the filter maps auto from its mode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Timeout {
+    Commit,
+    Release,
+}
+impl Timeout {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Commit => "commit",
+            Self::Release => "release",
+        }
+    }
+}
+
 /// One in-flight reservation's ledger record.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Held {
     contribution: u64,
     expires_at: u64,
+    #[serde(default)]
+    provisional_period: Option<u64>,
 }
 
 /// One scope's running exposure. `committed` is exposure from calls that already
@@ -205,26 +222,36 @@ impl ScopeState {
     }
 
     /// Moves every reservation whose deadline has passed out of `active` (its
-    /// contribution leaves `reserved`; `committed` is untouched) and drops
-    /// tombstones older than one further `ttl`. Returns how many reservations
-    /// expired and how many tombstones were dropped unsettled.
-    pub(crate) fn reclaim(&mut self, now: u64, ttl: u64) -> (u64, u64) {
+    /// contribution leaves `reserved`, and commit mode provisionally charges it)
+    /// and drops tombstones older than one further `ttl`. Returns expired,
+    /// abandoned and provisional-charge counts.
+    pub(crate) fn reclaim(&mut self, now: u64, ttl: u64, timeout: Timeout) -> (u64, u64, u64) {
         let expired: Vec<ReservationId> = self
             .active
             .iter()
             .filter(|(_, held)| now >= held.expires_at)
             .map(|(id, _)| *id)
             .collect();
+        let mut provisional = 0;
         for id in &expired {
-            if let Some(held) = self.active.remove(id) {
+            if let Some(mut held) = self.active.remove(id) {
                 self.reserved = self.reserved.saturating_sub(held.contribution);
+                if timeout == Timeout::Commit {
+                    self.committed = self.committed.saturating_add(held.contribution);
+                    held.provisional_period = Some(self.period);
+                    provisional += 1;
+                }
                 self.reclaimed.insert(*id, held);
             }
         }
         let before = self.reclaimed.len();
         self.reclaimed
             .retain(|_, held| now < held.expires_at.saturating_add(ttl));
-        (expired.len() as u64, (before - self.reclaimed.len()) as u64)
+        (
+            expired.len() as u64,
+            (before - self.reclaimed.len()) as u64,
+            provisional,
+        )
     }
 
     /// The budget check, without mutating anything.
@@ -265,6 +292,7 @@ impl ScopeState {
                 Held {
                     contribution,
                     expires_at,
+                    provisional_period: None,
                 },
             );
         }
@@ -278,10 +306,9 @@ impl ScopeState {
         })
     }
 
-    /// Settles reservation `id` on this state: settlement first, so a
-    /// response that lands before the scope is next touched still settles
-    /// normally even if its deadline has technically passed. The caller
-    /// reclaims afterwards.
+    /// Settles reservation `id` on this state. Commit-mode callers reclaim
+    /// before settlement to enforce the deadline/tombstone window; release-mode
+    /// callers retain the historical settlement-before-reclaim ordering.
     pub(crate) fn settle(&mut self, id: ReservationId, commit: bool) -> Settlement {
         if let Some(held) = self.active.remove(&id) {
             self.reserved = self.reserved.saturating_sub(held.contribution);
@@ -292,6 +319,13 @@ impl ScopeState {
                 Settlement::Released
             }
         } else if let Some(held) = self.reclaimed.remove(&id) {
+            if let Some(charged_period) = held.provisional_period {
+                if !commit && charged_period == self.period {
+                    self.committed = self.committed.saturating_sub(held.contribution);
+                    return Settlement::Refunded;
+                }
+                return Settlement::AlreadyCharged;
+            }
             if commit {
                 self.committed = self.committed.saturating_add(held.contribution);
                 Settlement::LateCommitted
@@ -341,6 +375,10 @@ pub enum Settlement {
     LateCommitted,
     /// The reservation had expired and been reclaimed; nothing to undo.
     LateReleased,
+    /// Provisional exposure was refunded in its original period.
+    Refunded,
+    /// Provisional exposure was already charged; settlement changes no total.
+    AlreadyCharged,
     /// Already settled, or unknown to this ledger (for example a settlement
     /// that arrived more than `2 × ttl` after the reservation was made). A
     /// no-op, so a duplicate or reordered settlement never double-counts.
@@ -361,6 +399,8 @@ impl Settlement {
             Settlement::Released => "released",
             Settlement::LateCommitted => "late-committed",
             Settlement::LateReleased => "late-released",
+            Settlement::Refunded => "refunded",
+            Settlement::AlreadyCharged => "already-charged",
             Settlement::NotActive => "not-active",
             Settlement::Deferred => "deferred",
         }
@@ -380,6 +420,8 @@ pub struct LedgerStats {
     pub expired: u64,
     pub late_committed: u64,
     pub late_released: u64,
+    pub provisional_charged: u64,
+    pub provisional_refunded: u64,
     /// Expired reservations whose tombstone was dropped with no settlement
     /// ever arriving: the request was cancelled or its response hook never ran.
     pub abandoned: u64,
@@ -585,7 +627,14 @@ impl Inner {
     /// Makes room for one new scope by evicting the scope that becomes idle
     /// first, if it is idle by `now`. Examines at most one scope state, so a
     /// refusal at the cap costs one ordered-set lookup, never a scan.
-    fn evict_one(&mut self, now: u64, period: u64, ttl: u64, window: Option<u64>) -> bool {
+    fn evict_one(
+        &mut self,
+        now: u64,
+        period: u64,
+        ttl: u64,
+        window: Option<u64>,
+        timeout: Timeout,
+    ) -> bool {
         let Some((at, key)) = self.idle_index.first() else {
             return false;
         };
@@ -600,7 +649,7 @@ impl Inner {
         let idle = match self.scopes.get_mut(&entry.1) {
             Some(state) => {
                 state.roll(period);
-                count_reclaim(&mut self.stats, state.reclaim(now, ttl));
+                count_reclaim(&mut self.stats, state.reclaim(now, ttl, timeout));
                 state.is_idle()
             }
             None => true,
@@ -634,6 +683,7 @@ pub struct Ledger<C = fn() -> u64> {
     inner: Mutex<Inner>,
     max_scopes: usize,
     ttl: u64,
+    timeout: Timeout,
     /// Fixed window length in ms; `None` accumulates for the worker's life.
     window: Option<u64>,
     /// The gateway clock in epoch ms, re-read at reserve time; `0` means "no
@@ -680,9 +730,16 @@ impl Ledger {
             }),
             max_scopes,
             ttl,
+            timeout: Timeout::Release,
             window,
             clock: no_clock,
         }
+    }
+
+    /// Standalone constructors retain release; the filter always supplies its resolved mode.
+    pub fn with_timeout(mut self, timeout: Timeout) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// The same ledger, reading the gateway clock through `clock`.
@@ -691,6 +748,7 @@ impl Ledger {
             inner: self.inner,
             max_scopes: self.max_scopes,
             ttl: self.ttl,
+            timeout: self.timeout,
             window: self.window,
             clock,
         }
@@ -728,13 +786,13 @@ impl<C: Fn() -> u64> Ledger<C> {
         let period = self.period(now);
         if !inner.scopes.contains_key(scope)
             && inner.scopes.len() >= self.max_scopes
-            && !inner.evict_one(now, period, self.ttl, self.window)
+            && !inner.evict_one(now, period, self.ttl, self.window, self.timeout)
         {
             return Err(Refusal::AtCapacity);
         }
         let state = inner.scopes.entry(scope.to_string()).or_default();
         state.roll(period);
-        count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
+        count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl, self.timeout));
         let result = f(state, &mut inner.next_id, &mut inner.stats);
         inner.reindex(scope, self.ttl, self.window);
         result
@@ -780,8 +838,11 @@ impl<C: Fn() -> u64> Ledger<C> {
             Some(state) => {
                 // A commit lands in the current window period.
                 state.roll(self.period(now));
+                if self.timeout == Timeout::Commit {
+                    count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl, self.timeout));
+                }
                 let outcome = state.settle(reservation.id, commit);
-                count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl));
+                count_reclaim(&mut inner.stats, state.reclaim(now, self.ttl, self.timeout));
                 outcome
             }
         };
@@ -821,9 +882,13 @@ pub(crate) fn settle_free(
     })
 }
 
-pub(crate) fn count_reclaim(stats: &mut LedgerStats, (expired, abandoned): (u64, u64)) {
+pub(crate) fn count_reclaim(
+    stats: &mut LedgerStats,
+    (expired, abandoned, provisional): (u64, u64, u64),
+) {
     stats.active = stats.active.saturating_sub(expired);
     stats.expired += expired;
+    stats.provisional_charged += provisional;
     stats.abandoned += abandoned;
 }
 
@@ -839,6 +904,8 @@ pub(crate) fn count_settlement(stats: &mut LedgerStats, outcome: Settlement) {
         }
         Settlement::LateCommitted => stats.late_committed += 1,
         Settlement::LateReleased => stats.late_released += 1,
+        Settlement::Refunded => stats.provisional_refunded += 1,
+        Settlement::AlreadyCharged => {}
         Settlement::NotActive => stats.not_active += 1,
         Settlement::Deferred => stats.deferred += 1,
     }
