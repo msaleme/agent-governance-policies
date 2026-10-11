@@ -44,7 +44,7 @@ corpus defines what a correct check means, and the policy performs it at runtime
 
 | | |
 | --- | --- |
-| Repository release | [`v0.1.0-rc.4`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
+| Repository release | [`v0.1.0-rc.5`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
 | Policy versions | Both policies are `1.0.0` in their `Cargo.toml`. The repository version is separate from them. |
 | Exchange | Both policies have been dev-published to Exchange under disposable ids and deleted again. No ready-for-production Exchange asset is published from this repository. |
 | P4A marketplace | Reviewer findings on both policies are resolved and merged. No marketplace acceptance or listing is claimed here. See the [P4A submission pack](P4A-SUBMISSION.md). |
@@ -58,7 +58,7 @@ Exchange deployment.
 | Policy | The problem it answers | What it does |
 | --- | --- | --- |
 | [Approval-to-Execution Binding](approval-execution-binding/README.md) | "The agent got approval for one action and executed a different one." | On MCP `tools/call` only (other methods pass through), checks five ABV v0.1 predicates against the approval record: **P1** action, **P2** canonical argument bytes, **P4** valid at execution, **P5** separate attester, and opt-in **P6** single use. Denies with JSON-RPC `-32008` or an empty `403`, in block or monitor mode. |
-| [Cross-Session Aggregate-Risk Gate](aggregate-risk-gate/README.md) | "Every call passed its per-session cap, but together they blew past our exposure budget." | On MCP `tools/call` only by default (`governedMethods`; the handshake, pings, notifications and transport requests pass through uncharged), reserves each call's contribution against a shared budget before forwarding it, and refuses the call that would push the total over. The budget is keyed on a verified identity and counted as exact integers, and it uses a fixed accounting window. Reservations whose responses never arrive are reclaimed. Block or monitor mode. |
+| [Cross-Session Aggregate-Risk Gate](aggregate-risk-gate/README.md) | "Every call passed its per-session cap, but together they blew past our exposure budget." | On MCP `tools/call` only by default (`governedMethods`; the handshake, pings, notifications and transport requests pass through uncharged), reserves each call's contribution against a shared budget before forwarding it, and refuses the call that would push the total over. The budget is keyed on a verified identity and counted as exact integers, and it uses a fixed accounting window. A reservation whose response never arrives is charged at its deadline in block mode and released in monitor mode (`onReservationTimeout`). Block or monitor mode. |
 
 Each policy README covers that policy's configuration, admission rules, protocol
 behavior, framework mapping and honesty boundaries. The two are **independent**
@@ -159,7 +159,7 @@ Every pull request and every push to `main` runs the
 The packaging and runtime jobs need repository secrets, so pull requests from
 forks skip them.
 
-Current library test counts: **125** for Approval-to-Execution Binding and **214**
+Current library test counts: **125** for Approval-to-Execution Binding and **230**
 for the aggregate-risk gate.
 
 To run the CI's `policies` checks locally, from a policy directory:

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — rc.5 planned
+## 0.1.0-rc.5 — 2026-10-11
 
 ### Aggregate-Risk Gate (Refs #64)
 
@@ -21,6 +21,9 @@
 - Report foreign-fingerprint ledger key counts as
   `aggregate_risk_foreign_prefix_keys` at most once per minute, without deleting
   another configuration's state. Document accumulation and restart reclamation.
+- A marker whose collection delete fails is restored to its previous mark, so a
+  later sweep can still collect it and free its marker slot. It previously stayed
+  `Collecting` and held the slot until restart.
 
 
 ## 0.1.0-rc.4 — 2026-10-09
