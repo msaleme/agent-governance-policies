@@ -44,11 +44,11 @@ corpus defines what a correct check means, and the policy performs it at runtime
 
 | | |
 | --- | --- |
-| Repository release | [`v0.1.0-rc.5`](https://github.com/msaleme/agent-governance-policies/releases), a **source prerelease** |
+| Repository release | [`v0.1.0`](https://github.com/msaleme/agent-governance-policies/releases/tag/v0.1.0), a **source release** |
 | Policy versions | Both policies are `1.0.0` in their `Cargo.toml`. The repository version is separate from them. |
 | Exchange | Both policies have been dev-published to Exchange under disposable ids and deleted again. No ready-for-production Exchange asset is published from this repository. |
-| P4A marketplace | Reviewer findings on both policies are resolved and merged. No marketplace acceptance or listing is claimed here. See the [P4A submission pack](P4A-SUBMISSION.md). |
-| Open issues | None |
+| P4A marketplace | Both policies were approved and listed on 2026-10-08, at `v0.1.0-rc.3`: [Approval-to-Execution Binding](https://www.p4a.ai/p/approval-to-execution-binding) and [Cross-Session Aggregate-Risk Gate](https://www.p4a.ai/p/cross-session-aggregate-risk-gate). Catalog copy is frozen at submission, so a listing describes the source it was approved at, not `main`. See the [P4A submission pack](P4A-SUBMISSION.md). |
+| Open issues | None that block use. [#72](https://github.com/msaleme/agent-governance-policies/issues/72) is a deferred framing refinement; see the [issue list](https://github.com/msaleme/agent-governance-policies/issues) for roadmap items. |
 
 The release ships source only. It includes no compiled WASM, no credentials and no
 Exchange deployment.

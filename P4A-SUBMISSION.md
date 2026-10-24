@@ -4,7 +4,7 @@ Prepared 2026-09-24. Updated 2026-09-25: the visibility blocker was resolved,
 reviewer findings #1–#7 were resolved and merged, and connected verification was
 complete. Updated 2026-10-03: aggregate-risk findings #14–#18 were resolved and
 closed, and source prerelease `v0.1.0-rc.1` was cut. Updated 2026-10-04: the re-review at
-`v0.1.0-rc.1` opened #47–#52; the fixes are described per policy below. #47–#52 were fixed, merged and closed, and source prerelease `v0.1.0-rc.2` was cut. Updated 2026-10-05: a runtime review opened #56–#58; all three were fixed, merged and closed, and source prerelease `v0.1.0-rc.3` was cut. Updated 2026-10-09: his rc.3 re-review opened #62–#65; #62 and #65 are fixed and closed, #63 is fixed except one deferred item (N7a), and #64 (before GA) is open; source prerelease `v0.1.0-rc.4` was cut. Updated 2026-10-11: #64 was fixed, merged and closed, and source prerelease `v0.1.0-rc.5` was cut; #63 N7a remains open. Turnkey pack for submitting the two policies in this repo to the
+`v0.1.0-rc.1` opened #47–#52; the fixes are described per policy below. #47–#52 were fixed, merged and closed, and source prerelease `v0.1.0-rc.2` was cut. Updated 2026-10-05: a runtime review opened #56–#58; all three were fixed, merged and closed, and source prerelease `v0.1.0-rc.3` was cut. Updated 2026-10-09: his rc.3 re-review opened #62–#65; #62 and #65 are fixed and closed, #63 is fixed except one deferred item (N7a), and #64 (before GA) is open; source prerelease `v0.1.0-rc.4` was cut. Updated 2026-10-11: #64 was fixed, merged and closed, and source prerelease `v0.1.0-rc.5` was cut; #63 N7a remains open. Updated 2026-10-24: both policies were **approved and listed on 2026-10-08** at rc.3 (verified from P4A's public catalog API, below); #63 was closed with N7a moved to #72; `v0.1.0` was cut for the reviewer-requested **resubmission pinned to a release tag** (see *Resubmission at v0.1.0*). Turnkey pack for submitting the two policies in this repo to the
 **P4A (Policies for Agents)** marketplace, mirroring the path the three published
 `agent-decoy-policies` siblings took. Submission itself is **UI-gated** (the P4A wizard) —
 this doc is everything a human needs to drive it; nothing here submits automatically.
@@ -37,7 +37,7 @@ excludes all Flex identity material). No further visibility action is required t
 ## Per-policy submission facts
 
 ### 1. Approval-to-Execution Binding
-- **Project path:** `/approval-execution-binding` (point the wizard at `/tree/main/approval-execution-binding`)
+- **Project path:** `/approval-execution-binding` (point the wizard at `/tree/v0.1.0/approval-execution-binding`; `source_ref` = `v0.1.0`)
 - **Category / injection point / scope:** Security / inbound / `api,resource`; `metadata/capabilities/assetTypes: mcp` → applicability **MCP `tools/call` only**. All other JSON-RPC methods, well-formed client JSON-RPC responses (`roots/list`, sampling and elicitation replies; #57, with `clientResponses: forward`, the default — these are not bound by the approval, and `clientResponses: deny` refuses them), and bodyless non-POST transport requests (the SSE `GET`, the session `DELETE`), pass through untouched as out-of-scope (#50).
 - **Catalog copy:** use `definition/gcl.yaml` `metadata.labels.description` verbatim (publish-ready;
   P4A catalog copy is **frozen at submission time**, so get it right up front — the description is now
@@ -86,10 +86,10 @@ excludes all Flex identity material). No further visibility action is required t
   under P4 but off by default; it checks `not_after` against the gateway clock (there is no `iat`),
   and `not_after` is authenticated only when P5 is required. In `rpc-param` mode, the approval
   envelope is stripped from forwarded single-object bodies, with `content-length` rewritten; batch
-  and malformed bodies are never forwarded with a rewrite. `clockSkewSeconds` is capped at one hour. No `.on_response` handler.
+  and malformed bodies are never forwarded with a rewrite. `clockSkewSeconds` is capped at one hour. Startup rejects P6 without P4, and a nonce over 128 UTF-8 bytes is malformed (rc.4). No `.on_response` handler.
 
 ### 2. Cross-Session Aggregate-Risk Gate
-- **Project path:** `/aggregate-risk-gate` (point the wizard at `/tree/main/aggregate-risk-gate`)
+- **Project path:** `/aggregate-risk-gate` (point the wizard at `/tree/v0.1.0/aggregate-risk-gate`; `source_ref` = `v0.1.0`)
 - **Category / injection point / scope:** Security / inbound / `api,resource`; `metadata/capabilities/assetTypes: mcp` → applicability **MCP only**. Only methods in `governedMethods`
   (default `["tools/call"]`) are priced; the handshake, `tools/list`, `ping`, notifications, client responses and
   bodyless transport requests pass through uncharged, so an exhausted budget never blocks reconnecting, keepalive,
@@ -120,7 +120,8 @@ excludes all Flex identity material). No further visibility action is required t
   `FLEX_SERVICE_ENVOY_CONCURRENCY=1`. A cross-replica, durable ledger (`cluster`) is not implemented
   and is rejected at configure time. Response leg is headers-only:
   settlement is by HTTP status (2xx/3xx commit, 4xx/5xx release), so a JSON-RPC error inside an HTTP 200
-  is charged (#49).
+  is charged (#49). A reservation whose response never arrives is charged at its deadline in block mode and
+  released in monitor mode (`onReservationTimeout: auto`, rc.5; set `release` to opt out).
 
 ## Wizard steps (HUMAN)
 1. No visibility blocker — the repo is public (see above). Proceed.
@@ -140,6 +141,28 @@ excludes all Flex identity material). No further visibility action is required t
    (none blocks catalog approval); `v0.1.0-rc.4` fixes #62, #65 and all of #63 except N7a. #64 is
    tracked for before GA. `v0.1.0-rc.5` fixes #64.
 
+## Listing status (verified 2026-10-24)
+
+From P4A's public catalog endpoint (`GET https://www.p4a.ai/api/policies`, no auth), which returns
+each listing's `lifecycle_status`, `source_ref` and `review_feedback`:
+
+| Listing | Status | Approved | `source_ref` | Reviewer note |
+|---|---|---|---|---|
+| [approval-to-execution-binding](https://www.p4a.ai/p/approval-to-execution-binding) | approved | 2026-10-08 | `main` | Approved at `6d414d1` (rc.3); follow-ups #62, #63 — both since closed |
+| [cross-session-aggregate-risk-gate](https://www.p4a.ai/p/cross-session-aggregate-risk-gate) | approved | 2026-10-08 | `main` | Approved at rc.3; address #64 before GA (done in rc.5), #65 polish (done in rc.4); **resubmit with `source_ref` pinned to the release tag and sync the updated docs here** |
+
+## Resubmission at v0.1.0 (HUMAN, P4A dashboard)
+
+Both listings point at `main` and carry rc.3-era catalog copy. For each policy:
+1. Open the existing listing in the P4A dashboard and start a resubmission (do not create a new listing).
+2. Set the source to `/tree/v0.1.0/<policy-dir>` with `source_ref` = `v0.1.0`.
+3. Refresh the Description, Configuration and FAQ tabs from the policy's current `definition/gcl.yaml`
+   and README. Copy the honesty boundary above verbatim; it now includes rc.4's P6-requires-P4 rule
+   and rc.5's block-mode `onReservationTimeout: auto` = `commit`.
+4. In the reviewer note, link the `v0.1.0` release notes and state that #62–#65 are closed and #72 is
+   a deferred, non-blocking refinement.
+
 ## Not claimed
-No P4A submission, acceptance, dashboard ID, or publication is asserted here — those come from an actual
-wizard run and reviewer action. Framework references are supporting-measure context, not certifications.
+Framework references are supporting-measure context, not certifications. The listing status above is
+what P4A's catalog reported on the date shown; a resubmission's outcome is recorded only after the
+reviewer acts.

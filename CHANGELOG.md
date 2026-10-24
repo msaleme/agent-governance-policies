@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.0 — 2026-10-24
+
+First general-availability source release. The policy code is identical to
+`v0.1.0-rc.5`; this release changes documentation only.
+
+- Both policies were approved and listed on the P4A marketplace on 2026-10-08,
+  against `v0.1.0-rc.3`. This release is the tag the listings will be repinned to.
+- The before-GA item from the reviewer (#64) shipped in rc.5. Closed since: #62–#65.
+- Deferred, non-blocking: #72 (approval binding: let the host frame the body after
+  a rewrite; the explicit `content-length` rewrite stays, and both policies require
+  Flex Gateway 1.14.0 or later).
+- **Upgrading from rc.3 or earlier:** read the breaking notes for
+  [rc.4](#010-rc4--2026-10-09) (P6 now requires P4; nonces over 128 bytes are
+  malformed; the P6 key format changed, so let outstanding approvals expire first)
+  and [rc.5](#010-rc5--2026-10-11) (in block mode, `onReservationTimeout: auto`
+  now charges abandoned calls; set `release` to keep the old behavior).
+
 ## 0.1.0-rc.5 — 2026-10-11
 
 ### Aggregate-Risk Gate (Refs #64)
